@@ -1,0 +1,4 @@
+[env]
+# WavPack 0.4.0 builds its bundled legacy CMake project, which needs this
+# compatibility floor when invoked under CMake 4.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

@@ -1,0 +1,129 @@
+// Design tokens for the Orange-style UI shell (`§5.1`-`§5.4`). `Theme` holds every color, font
+// size and control size the UI uses; `Icons` exposes every SVG under `ui/icons/` as an `image` so
+// no component references a path directly. No `font-size:` literal is allowed outside this file —
+// every text element uses one of the `fs-*` tokens below (`§5.2`, enforced by
+// `typography_tokens_are_exact_and_used_everywhere` in `src/view_model.rs`).
+//
+// One deliberate rename from the spec text: `§5.1` and `§5.3` both name a token `icon-transport`
+// (a color there, a length here). Slint globals are a single namespace, so the size token is
+// `icon-transport-size` instead; every other name matches `§5.1`-`§5.3` exactly.
+
+export global Theme {
+    // Colors (`§5.1`), sampled from the Orange reference screenshots.
+    out property <color> bg-sidebar: #312f2e;
+    out property <color> bg-content: #292827;
+    out property <color> bg-topbar: #373636;
+    out property <color> bg-header: #373636;
+    out property <color> bg-panel: #373636;
+    out property <color> table-header-bg: #312f2f;
+    out property <color> bg-bar: #2b2a2a;
+    out property <color> bg-field: #454342;
+    out property <color> bg-hover: #3a3837;
+    out property <color> bg-selected: #45423f;
+    out property <color> bg-nav-active: #534f4d;
+    out property <color> divider: #403e3d;
+    out property <color> text-primary: #f2f1f0;
+    out property <color> text-secondary: #aba7a4;
+    out property <color> text-tertiary: #7f7a77;
+    out property <color> accent: #ff8c4a;
+    out property <color> accent-icon: #ff8739;
+    out property <color> accent-hover: #ff9d63;
+    out property <color> accent-strong: #ff7f02;
+    out property <color> accent-soft: #4a3527;
+    out property <color> button-secondary: #464545;
+    out property <color> button-secondary-hover: #504f4f;
+    out property <color> slider-track: #4d4b4a;
+    out property <color> slider-track-disabled: #3a3837;
+    out property <color> knob: #f2f1f0;
+    out property <color> play-bg: #f2f1f0;
+    out property <color> play-bg-disabled: #6b6866;
+    out property <color> play-glyph: #2b2a2a;
+    out property <color> icon-transport: #e8e6e5;
+    out property <color> icon-transport-hover: #ffffff;
+    out property <color> icon-transport-disabled: #5f5c5a;
+    out property <color> art-placeholder-bg: #4e4946;
+    out property <color> art-placeholder-icon: #7a7572;
+
+    // Typography (`§5.2`).
+    out property <length> fs-caption: 10px;
+    out property <length> fs-label: 11px;
+    out property <length> fs-meta: 12px;
+    out property <length> fs-body: 13px;
+    out property <length> fs-title: 15px;
+    out property <length> fs-subtitle: 16px;
+    out property <length> fs-panel-title: 17px;
+    out property <length> fs-section: 20px;
+    out property <length> fs-hero: 30px;
+
+    // Sizes (`§5.3`).
+    out property <length> sidebar-w: 220px;
+    out property <length> panel-w: 300px;
+    out property <length> panel-content-w: 260px;
+    out property <length> topbar-h: 52px;
+    out property <length> playerbar-h: 72px;
+    out property <length> nav-row-h: 30px;
+    out property <length> table-row-h: 34px;
+    out property <length> table-header-h: 28px;
+    out property <length> button-h: 32px;
+    out property <length> button-lg-h: 44px;
+    out property <length> chip-h: 26px;
+    out property <length> icon-nav: 18px;
+    out property <length> icon-transport-size: 20px;
+    out property <length> play-button: 36px;
+    out property <length> icon-small: 18px;
+    out property <length> icon-inline: 14px;
+    out property <length> icon-action: 16px;
+    out property <length> bar-art: 48px;
+    out property <length> panel-art: 260px;
+    out property <length> detail-art: 200px;
+    out property <length> tile-art: 176px;
+    out property <length> tile-h: 234px;
+    out property <length> page-pad: 28px;
+    out property <length> search-w: 300px;
+    out property <length> search-h: 30px;
+    // The right panel shows only when the window is at least this wide (`§5.3`).
+    out property <length> panel-threshold: 1400px;
+}
+
+// Every icon in `§5.4`, as `@image-url` resources resolved relative to this file (so they resolve
+// under `ui/icons/` regardless of who imports `Icons`). Filled icons are original to this repo;
+// stroke icons are Lucide-derived (`ui/icons/LICENSE-lucide.txt`, ISC).
+export global Icons {
+    // Filled.
+    out property <image> home-fill: @image-url("icons/home-fill.svg");
+    out property <image> artists-fill: @image-url("icons/artists-fill.svg");
+    out property <image> albums-fill: @image-url("icons/albums-fill.svg");
+    out property <image> songs-fill: @image-url("icons/songs-fill.svg");
+    out property <image> folders-fill: @image-url("icons/folders-fill.svg");
+    out property <image> recently-added-fill: @image-url("icons/recently-added-fill.svg");
+    out property <image> heart-fill: @image-url("icons/heart-fill.svg");
+    out property <image> statistics-fill: @image-url("icons/statistics-fill.svg");
+    out property <image> star-fill: @image-url("icons/star-fill.svg");
+    out property <image> play: @image-url("icons/play.svg");
+    out property <image> pause: @image-url("icons/pause.svg");
+    out property <image> skip-forward: @image-url("icons/skip-forward.svg");
+    out property <image> skip-back: @image-url("icons/skip-back.svg");
+    out property <image> volume: @image-url("icons/volume.svg");
+    out property <image> volume-off: @image-url("icons/volume-off.svg");
+    out property <image> disc: @image-url("icons/disc.svg");
+    // Stroke.
+    out property <image> browser: @image-url("icons/browser.svg");
+    out property <image> recently-opened: @image-url("icons/recently-opened.svg");
+    out property <image> scripts: @image-url("icons/scripts.svg");
+    out property <image> plus: @image-url("icons/plus.svg");
+    out property <image> heart: @image-url("icons/heart.svg");
+    out property <image> search: @image-url("icons/search.svg");
+    out property <image> chevron-left: @image-url("icons/chevron-left.svg");
+    out property <image> folder-open: @image-url("icons/folder-open.svg");
+    out property <image> folder-plus: @image-url("icons/folder-plus.svg");
+    out property <image> shuffle: @image-url("icons/shuffle.svg");
+    out property <image> repeat: @image-url("icons/repeat.svg");
+    out property <image> queue: @image-url("icons/queue.svg");
+    out property <image> panel-right: @image-url("icons/panel-right.svg");
+    out property <image> circle-plus: @image-url("icons/circle-plus.svg");
+    out property <image> list-next: @image-url("icons/list-next.svg");
+    out property <image> now-playing: @image-url("icons/now-playing.svg");
+    out property <image> calendar: @image-url("icons/calendar.svg");
+    out property <image> lyrics: @image-url("icons/lyrics.svg");
+    out property <image> artists: @image-url("icons/artists.svg");
+}

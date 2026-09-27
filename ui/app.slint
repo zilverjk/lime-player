@@ -1,0 +1,1250 @@
+// UI shell (`§5`, `§6` Stages 5/6): tokens, icons and widgets come from `theme.slint`/
+// `widgets.slint`; this file holds the views (Sidebar, TopBar, PlayerBar, NowPlayingPanel,
+// QueueView, UnavailableView, and the library views — Home, Albums, Artists, Songs, Recently
+// Added, album detail) and `MainWindow`, which is the full `§3.5` data contract. Every mock
+// literal from the earlier hard-coded UI (`§2.4`) is gone: nothing here is sample data, and the
+// session library (`§3.3`) is the only source of what the views show.
+
+import { ComboBox, Palette, ScrollView } from "std-widgets.slint";
+import { Theme, Icons } from "theme.slint";
+import {
+    ActionButton, AlbumGrid, ArtworkView, Badge, ButtonKind, EmptyState, Icon, IconButton, NavItem, Scrubber, SectionLabel,
+    TrackTable, VDivider, VirtualizedTrackTable,
+    View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData,
+} from "widgets.slint";
+
+export { View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData }
+    from "widgets.slint";
+
+component Sidebar inherits Rectangle {
+    in property <View> nav-view;
+    in property <bool> unified-title-bar: false;
+    callback selected(View);
+    background: Theme.bg-sidebar;
+
+    VerticalLayout {
+        padding-top: root.unified-title-bar ? 52px : 12px;
+        content := ScrollView {
+            vertical-scrollbar-policy: as-needed;
+            horizontal-scrollbar-policy: always-off;
+            VerticalLayout {
+                // See `NowPlayingPanel`'s identical fix: without this, the default `stretch`
+                // alignment handed this `ScrollView`'s leftover viewport height to the unbounded
+                // `SectionLabel`s, opening large gaps under "Library", "Discover", "Tools" and
+                // "Playlists" (`§6` Stage 5 fix).
+                alignment: start;
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 1px;
+
+                SectionLabel { text: "Library"; }
+                NavItem { icon: Icons.home-fill; label: "Home"; active: root.nav-view == View.home; clicked => { root.selected(View.home); } }
+                NavItem { icon: Icons.artists-fill; label: "Artists"; active: root.nav-view == View.artists; clicked => { root.selected(View.artists); } }
+                NavItem { icon: Icons.albums-fill; label: "Albums"; active: root.nav-view == View.albums; clicked => { root.selected(View.albums); } }
+                NavItem { icon: Icons.songs-fill; label: "Songs"; active: root.nav-view == View.songs; clicked => { root.selected(View.songs); } }
+                NavItem { icon: Icons.browser; label: "Browser"; available: false; active: root.nav-view == View.browser; clicked => { root.selected(View.browser); } }
+                NavItem { icon: Icons.folders-fill; label: "Folders"; available: false; active: root.nav-view == View.folders; clicked => { root.selected(View.folders); } }
+
+                SectionLabel { text: "Discover"; }
+                NavItem { icon: Icons.recently-added-fill; label: "Recently Added"; active: root.nav-view == View.recently-added; clicked => { root.selected(View.recently-added); } }
+                NavItem { icon: Icons.heart-fill; label: "Liked Songs"; available: false; active: root.nav-view == View.liked; clicked => { root.selected(View.liked); } }
+                NavItem { icon: Icons.statistics-fill; label: "Statistics"; available: false; active: root.nav-view == View.statistics; clicked => { root.selected(View.statistics); } }
+
+                SectionLabel { text: "Tools"; }
+                NavItem { icon: Icons.recently-opened; label: "Recently Opened"; available: false; active: root.nav-view == View.recently-opened; clicked => { root.selected(View.recently-opened); } }
+                NavItem { icon: Icons.scripts; label: "Scripts"; available: false; active: root.nav-view == View.scripts; clicked => { root.selected(View.scripts); } }
+
+                SectionLabel { text: "Playlists"; }
+                NavItem { icon: Icons.star-fill; label: "Favorites"; available: false; active: root.nav-view == View.favorites; clicked => { root.selected(View.favorites); } }
+                NavItem { icon: Icons.plus; label: "New Playlist…"; available: false; active: root.nav-view == View.new-playlist; clicked => { root.selected(View.new-playlist); } }
+            }
+        }
+    }
+}
+
+component TopBar inherits Rectangle {
+    in property <bool> can-go-back: false;
+    in property <bool> unified-title-bar: false;
+    in-out property <string> search-query: "";
+    callback back-requested();
+    callback open-files();
+    callback open-folder();
+    callback search-edited(string);
+    callback window-drag-requested();
+    background: Theme.bg-topbar;
+
+    if root.unified-title-bar: TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.down {
+                root.window-drag-requested();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 20px;
+        spacing: 12px;
+        cross-axis-alignment: center;
+
+        if root.can-go-back: Rectangle {
+            width: 30px;
+            height: 30px;
+            border-radius: 15px;
+            background: Theme.button-secondary;
+            Icon { source: Icons.chevron-left; size: 18px; tint: Theme.text-primary; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
+            TouchArea { clicked => { root.back-requested(); } }
+        }
+        if root.unified-title-bar: Text { text: "Lime Player"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text-primary; vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        ActionButton { text: "Open Files…"; icon: Icons.folder-open; primary: true; clicked => { root.open-files(); } }
+        ActionButton { text: "Open Folder…"; icon: Icons.folder-plus; clicked => { root.open-folder(); } }
+        Rectangle {
+            width: Theme.search-w;
+            height: Theme.search-h;
+            background: Theme.bg-field;
+            border-radius: 8px;
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 6px;
+                cross-axis-alignment: center;
+                Icon { source: Icons.search; size: 16px; tint: Theme.text-secondary; }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: 100%;
+                    clip: true;
+                    search-input := TextInput {
+                        text <=> root.search-query;
+                        font-size: Theme.fs-body;
+                        color: Theme.text-primary;
+                        input-type: search;
+                        width: 100%;
+                        height: 100%;
+                        vertical-alignment: center;
+                        edited => { root.search-edited(self.text); }
+                    }
+                    if root.search-query == "": Text {
+                        text: "Search tracks, albums, artists…";
+                        width: 100%;
+                        height: 100%;
+                        font-size: Theme.fs-body;
+                        color: Theme.text-secondary;
+                        vertical-alignment: center;
+                    }
+                    if root.search-query == "": TouchArea { clicked => { search-input.focus(); } }
+                }
+            }
+        }
+    }
+}
+
+component PlayerBar inherits Rectangle {
+    in property <bool> is-playing: false;
+    in property <string> now-playing-title: "";
+    in property <string> now-playing-artist: "";
+    in property <string> now-playing-badge: "";
+    in property <image> now-playing-art;
+    in property <bool> now-playing-has-art: false;
+    in property <int> queue-count: 0;
+    in property <string> playback-elapsed: "0:00";
+    in property <string> playback-duration: "—:—";
+    in property <float> playback-progress: 0.0;
+    in property <bool> can-seek: false;
+    in property <int> duration-ms: 0;
+    in-out property <float> volume-level: 1.0;
+    in property <bool> volume-available: false;
+    in property <string> volume-detail: "";
+    in-out property <bool> right-panel-visible: true;
+    in property <bool> panel-shown: true;
+    in property <bool> panel-toggle-enabled: true;
+    // Below `Theme.panel-threshold` (or with the panel hidden), `NowPlayingPanel`'s own copy of
+    // these is invisible, so this bar becomes the only place left to show the one-line status
+    // (`§1.4`/`§4.6.4`: underruns and refusals must stay visible) and to reach Output/Hog mode
+    // (otherwise a first-run user on a narrow window has no way to ever select an output device).
+    in property <string> playback-status: "";
+    in-out property <[string]> output-device-options;
+    in-out property <int> selected-output-index: 0;
+    in-out property <bool> hog-mode-enabled: true;
+
+    callback play-pause-requested();
+    callback previous-track-requested();
+    callback next-track-requested();
+    callback seek-requested(float);
+    callback volume-requested(float, bool);
+    callback now-playing-album-requested();
+    callback queue-opened();
+    callback output-chosen(int);
+    callback hog-mode-changed(bool);
+
+    height: Theme.playerbar-h;
+    background: Theme.bg-bar;
+    Rectangle { y: 0; width: 100%; height: 1px; background: Theme.divider; }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 12px;
+        cross-axis-alignment: center;
+
+        Rectangle {
+            width: Theme.bar-art;
+            height: Theme.bar-art;
+            ArtworkView { art: root.now-playing-art; has-art: root.now-playing-has-art; size: Theme.bar-art; radius: 6px; }
+            TouchArea { clicked => { root.now-playing-album-requested(); } }
+        }
+
+        VerticalLayout {
+            min-width: 160px;
+            preferred-width: 220px;
+            max-width: 240px;
+            horizontal-stretch: 0;
+            alignment: center;
+            spacing: 3px;
+            Text {
+                text: root.now-playing-title == "" ? "Not playing" : root.now-playing-title;
+                font-size: Theme.fs-body;
+                font-weight: 600;
+                color: Theme.text-primary;
+                overflow: elide;
+            }
+            // Rendered only when there is content: an idle bar (`Not playing`, no artist, no
+            // badge) must not reserve this row's line height, which pushed the title above the
+            // bar's centerline by about half a line (`§6` Stage 5 fix).
+            if root.now-playing-artist != "" || root.now-playing-badge != "": HorizontalLayout {
+                alignment: start;
+                spacing: 8px;
+                cross-axis-alignment: center;
+                Text { text: root.now-playing-artist; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; horizontal-stretch: 1; }
+                if root.now-playing-badge != "": Badge { text: root.now-playing-badge; horizontal-stretch: 0; }
+            }
+            // The right panel's own `playback-status` (`NowPlayingPanel`) is invisible below
+            // `Theme.panel-threshold` and whenever the user hides it: without an always-visible
+            // copy, decoder errors, output-format mismatches, "Seek failed…" and buffer underruns
+            // would be reported nowhere at that width (`§1.4`/`§4.6.4`, `§6`). Always present
+            // (`visible`, never `if`): gating this row's very existence on `panel-shown` — which is
+            // itself derived from `root.width` — closed a horizontal-layoutinfo cycle back through
+            // `root.width` that Slint 1.18 only warns about today but may refuse at runtime
+            // tomorrow. Zero-height instead of merely invisible when unused, so it never grows this
+            // fixed-height bar's content past `Theme.playerbar-h`.
+            status-label := Text {
+                text: root.playback-status;
+                font-size: Theme.fs-meta;
+                color: Theme.text-secondary;
+                overflow: elide;
+                property <bool> show: !root.panel-shown && root.playback-status != "";
+                visible: self.show;
+                height: self.show ? self.preferred-height : 0px;
+                Tooltip { Text { text: root.playback-status; font-size: Theme.fs-meta; color: Theme.text-primary; wrap: word-wrap; } }
+            }
+        }
+
+        IconButton { source: Icons.heart; size: 18px; enabled: false; tooltip: "Not available yet"; }
+        VDivider { }
+        IconButton { source: Icons.shuffle; size: 18px; enabled: false; tooltip: "Not available yet"; }
+        IconButton { source: Icons.skip-back; size: 20px; enabled: root.now-playing-title != ""; clicked => { root.previous-track-requested(); } }
+        Rectangle {
+            width: Theme.play-button;
+            height: Theme.play-button;
+            border-radius: Theme.play-button / 2;
+            background: (root.now-playing-title != "" || root.queue-count > 0) ? Theme.play-bg : Theme.play-bg-disabled;
+            Icon {
+                source: root.is-playing ? Icons.pause : Icons.play;
+                size: 16px;
+                tint: Theme.play-glyph;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+            TouchArea { enabled: root.now-playing-title != "" || root.queue-count > 0; clicked => { root.play-pause-requested(); } }
+        }
+        IconButton { source: Icons.skip-forward; size: 20px; enabled: root.queue-count > 0; clicked => { root.next-track-requested(); } }
+        IconButton { source: Icons.repeat; size: 18px; enabled: false; tooltip: "Not available yet"; }
+
+        elapsed := Text {
+            property <float> drag-seconds: progress.drag-value * root.duration-ms / 1000;
+            text: progress.dragging
+                ? floor(self.drag-seconds / 60) + ":" + (mod(self.drag-seconds, 60) < 10 ? "0" : "") + floor(mod(self.drag-seconds, 60))
+                : root.playback-elapsed;
+            width: 44px;
+            font-size: Theme.fs-label;
+            color: Theme.text-secondary;
+            horizontal-alignment: right;
+        }
+        progress := Scrubber {
+            horizontal-stretch: 1;
+            min-width: 120px;
+            value: root.playback-progress;
+            enabled: root.can-seek;
+            released(f) => { root.seek-requested(f); }
+        }
+        Text { text: root.playback-duration; width: 44px; font-size: Theme.fs-label; color: Theme.text-secondary; }
+        VDivider { }
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            accessible-role: image;
+            accessible-label: root.volume-detail;
+            Icon { source: root.volume-available ? Icons.volume : Icons.volume-off; size: 18px; tint: Theme.icon-transport; }
+            // `§5.6` item 14: "Tooltip = volume-detail". The right panel's own copy of this text
+            // (`NowPlayingPanel`) is invisible below `Theme.panel-threshold` and whenever the panel
+            // is toggled off, so without this the disabled slider had no visible explanation at all
+            // at any width under 1400 px (`§6` Stage 5 fix).
+            if root.volume-detail != "": Tooltip { Text { text: root.volume-detail; font-size: Theme.fs-meta; color: Theme.text-primary; } }
+        }
+        volume := Scrubber {
+            width: 100px;
+            value: root.volume-level;
+            enabled: root.volume-available;
+            changed(v) => { root.volume-level = v; root.volume-requested(v, false); }
+            released(v) => { root.volume-level = v; root.volume-requested(v, true); }
+        }
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            accessible-role: button;
+            // `§5.6` item 16: below 1400 px the toggle can no longer show the details panel itself
+            // (too narrow), so it opens `output-popup` instead — Output and Hog mode must stay
+            // reachable at every allowed window width (`§1.4`, R6), not just disabled with an
+            // explanatory tooltip (`§6` Stage 5 fix started this; this finishes it).
+            accessible-label: root.panel-toggle-enabled
+                ? (root.panel-shown ? "Hide details panel" : "Show details panel")
+                : "Open output and Hog mode";
+            Icon {
+                source: Icons.panel-right;
+                size: 18px;
+                tint: root.panel-shown ? Theme.accent : Theme.icon-transport;
+            }
+            if root.panel-toggle-enabled: TouchArea { clicked => { root.right-panel-visible = !root.right-panel-visible; } }
+            if !root.panel-toggle-enabled: TouchArea { clicked => { output-popup.show(); } }
+            if !root.panel-toggle-enabled: Tooltip { Text { text: "Widen the window to show the details panel, or click for output and Hog mode"; font-size: Theme.fs-meta; color: Theme.text-primary; wrap: word-wrap; } }
+            output-popup := PopupWindow {
+                // The default close policy (`close-on-click`) closes this popup on the very same
+                // click/release that the `ComboBox` below uses to open its own dropdown, dropping
+                // this popup's own instance and orphaning the dropdown before a selection can reach
+                // it (Slint 1.18.1 `window.rs` closes the popup in the same `process_mouse_input`
+                // pass that dispatched the click to the combo box). `close-on-click-outside` still
+                // dismisses this popup on an outside click, but leaves clicks on its own contents
+                // alone.
+                close-policy: close-on-click-outside;
+                x: -260px + parent.width;
+                y: parent.height + 6px;
+                Rectangle {
+                    width: 260px;
+                    background: Theme.bg-panel;
+                    border-radius: 8px;
+                    drop-shadow-blur: 12px;
+                    drop-shadow-color: #000000.with-alpha(0.35);
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 8px;
+                        SectionLabel { text: "Output"; }
+                        ComboBox {
+                            height: 30px;
+                            model: root.output-device-options;
+                            current-index <=> root.selected-output-index;
+                            // `selected-output-index` is two-way bound all the way up to
+                            // `MainWindow` and back down into `NowPlayingPanel`'s own `ComboBox`,
+                            // so both combo boxes alias the same storage. `selected(value)` (from
+                            // `ComboBoxBase`) fires only through `ComboBoxBase.select()` — a user
+                            // click or arrow-key move — never from a programmatic write to
+                            // `current-index`/`selected-output-index` (Rust writes it at startup
+                            // and on every device-list refresh), so it sends `output-chosen`
+                            // exactly once per real user choice regardless of which output control
+                            // is currently visible. A `changed current-index` handler would also
+                            // fire on those Rust-side writes, which is why it must not be used here.
+                            selected(value) => {
+                                root.output-chosen(root.selected-output-index);
+                            }
+                        }
+                        HorizontalLayout {
+                            cross-axis-alignment: center;
+                            Text { text: "Hog mode"; font-size: Theme.fs-body; color: Theme.text-primary; horizontal-stretch: 1; }
+                            Rectangle {
+                                width: 34px;
+                                height: 20px;
+                                border-radius: 10px;
+                                background: root.hog-mode-enabled ? Theme.accent : Theme.slider-track;
+                                Rectangle {
+                                    width: 16px;
+                                    height: 16px;
+                                    border-radius: 8px;
+                                    y: 2px;
+                                    x: root.hog-mode-enabled ? 16px : 2px;
+                                    background: Theme.knob;
+                                }
+                                TouchArea {
+                                    clicked => {
+                                        root.hog-mode-enabled = !root.hog-mode-enabled;
+                                        root.hog-mode-changed(root.hog-mode-enabled);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            width: 18px;
+            height: 18px;
+            Icon { source: Icons.queue; size: 18px; tint: Theme.icon-transport; }
+            // Positioned directly, not centered inside an unsized wrapper `Rectangle` (which
+            // defaulted to 18x18 and centered the badge over the icon's note head): the badge
+            // belongs at the icon's top-right corner (`§6` Stage 5 fix).
+            if root.queue-count > 0: Badge { x: parent.width - 6px; y: -8px; text: "" + root.queue-count; }
+            TouchArea { clicked => { root.queue-opened(); } }
+        }
+    }
+}
+
+component NowPlayingPanel inherits Rectangle {
+    in property <string> now-playing-key: "";
+    in property <string> now-playing-title: "";
+    in property <string> now-playing-artist: "";
+    in property <string> now-playing-album: "";
+    in property <string> now-playing-year: "";
+    in property <string> now-playing-genre: "";
+    in property <string> now-playing-badge: "";
+    in property <image> now-playing-art;
+    in property <bool> now-playing-has-art: false;
+    in property <string> format-line: "";
+    in property <string> file-size-line: "";
+    in property <string> lyrics: "";
+    in property <bool> has-lyrics: false;
+    in-out property <[string]> output-device-options;
+    in-out property <int> selected-output-index: 0;
+    in-out property <bool> hog-mode-enabled: true;
+    in property <string> volume-detail: "";
+    in property <bool> volume-available: false;
+    in property <string> playback-status: "";
+    in property <string> output-name: "";
+    // Set only from a `Started` event's own `output` and cleared whenever nothing is actively
+    // routing (`Stopped`/`Inactive`/a failed start or seek) — unlike `output-name`, which also
+    // updates from the ComboBox selection alone, before anything necessarily plays there (`§6`).
+    in property <string> active-output-name: "";
+    callback output-chosen(int);
+    callback hog-mode-changed(bool);
+    background: Theme.bg-panel;
+
+    ScrollView {
+        vertical-scrollbar-policy: as-needed;
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            // Packs every child at its own preferred size instead of stretching it to fill this
+            // `ScrollView`'s viewport height (`§6` Stage 5 fix): with the default `stretch`
+            // alignment, a plain `Text`/`SectionLabel` has an unbounded max-height, so leftover
+            // viewport space was handed to whichever ones sat in this layout, opening 25-50 px gaps
+            // between the title, artist, album, format line, "Output" label and the ComboBox.
+            alignment: start;
+            padding: 20px;
+            spacing: 8px;
+
+            ArtworkView { art: root.now-playing-art; has-art: root.now-playing-has-art; width: 100%; size: Theme.panel-content-w; radius: 8px; }
+            Text {
+                text: root.now-playing-title == "" ? "Not playing" : root.now-playing-title;
+                font-size: Theme.fs-panel-title;
+                font-weight: 700;
+                color: Theme.text-primary;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                overflow: elide;
+                // Bounds `elide` to actually engage past two lines (`§5.8` item 2): unbounded, a
+                // long tag title just kept wrapping and pushing the Output controls down.
+                max-height: 2.6 * Theme.fs-panel-title;
+            }
+            // Each conditional on its own value being non-empty (`§6` Stage 6 fix), the same way the
+            // year/genre row below already was: unconditional, an idle panel's empty artist/album/
+            // format/file-size `Text`s each still reserved a line height plus `spacing: 8px`, adding
+            // up to a roughly 95 px gap between "Not playing" and the divider.
+            if root.now-playing-artist != "": Text { text: root.now-playing-artist; font-size: Theme.fs-body; color: Theme.text-secondary; horizontal-alignment: center; overflow: elide; }
+            if root.now-playing-album != "": Text { text: root.now-playing-album; font-size: Theme.fs-meta; font-italic: true; color: Theme.text-secondary; horizontal-alignment: center; overflow: elide; }
+
+            if root.now-playing-year != "" || root.now-playing-genre != "": HorizontalLayout {
+                alignment: center;
+                cross-axis-alignment: center;
+                spacing: 10px;
+                if root.now-playing-year != "": HorizontalLayout {
+                    spacing: 4px;
+                    cross-axis-alignment: center;
+                    Icon { source: Icons.calendar; size: Theme.icon-inline; tint: Theme.text-tertiary; }
+                    // No `overflow: elide` here on purpose: `Clip`+`NoWrap` (the default) keeps
+                    // this short value's min-width equal to its own full text width, a floor the
+                    // layout cannot shrink past. That forces all of this row's squeeze onto the
+                    // genre `Text` below instead of splitting it between both — eliding the
+                    // three-or-so-character year first would be absurd, and it briefly did exactly
+                    // that when this `Text` was elide-able too.
+                    Text { text: root.now-playing-year; font-size: Theme.fs-label; color: Theme.text-tertiary; }
+                }
+                // `overflow: elide` shrinks this Text's reported min-width down to a single
+                // ellipsis instead of its full unwrapped text width (`§6` Stage 5 fix): a long
+                // genre tag was otherwise widening this `ScrollView`'s content past the 300 px
+                // panel, clipping the centered title and the Output `ComboBox` on the right.
+                if root.now-playing-genre != "": HorizontalLayout {
+                    spacing: 4px;
+                    cross-axis-alignment: center;
+                    Icon { source: Icons.songs-fill; size: Theme.icon-inline; tint: Theme.text-tertiary; }
+                    Text { text: root.now-playing-genre; font-size: Theme.fs-label; color: Theme.text-tertiary; overflow: elide; }
+                }
+            }
+
+            if root.format-line != "": Text {
+                text: root.format-line;
+                font-family: "Menlo";
+                font-size: Theme.fs-label;
+                color: Theme.text-secondary;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+                overflow: elide;
+                max-height: 2.6 * Theme.fs-label;
+            }
+            if root.file-size-line != "": Text { text: root.file-size-line; font-size: Theme.fs-meta; color: Theme.text-tertiary; horizontal-alignment: center; }
+
+            Rectangle { height: 1px; width: 100%; background: Theme.divider; }
+            SectionLabel { text: "Output"; }
+            ComboBox {
+                height: 30px;
+                width: 100%;
+                model: root.output-device-options;
+                current-index <=> root.selected-output-index;
+                // See the matching `ComboBox` in `PlayerBar`'s `output-popup`: both alias the same
+                // `selected-output-index` storage through chained `<=>` bindings via `MainWindow`.
+                // `selected(value)` fires only on a user click/arrow-key selection
+                // (`ComboBoxBase.select()`), never on a programmatic write to `current-index` from
+                // either side of the binding (Rust writes it at startup and on every device-list
+                // refresh), so no visibility guard is needed to keep `output-chosen` firing exactly
+                // once per user choice.
+                selected(value) => {
+                    root.output-chosen(root.selected-output-index);
+                }
+            }
+            // The device the active stream is actually on (`Started.output`, via
+            // `active-output-name`, never the merely-*selected* device `output-name` also tracks):
+            // a mid-track output change applies only at the next track, and nothing plays at all
+            // right after startup or a failed start/seek, so this must not claim an active route
+            // from the selection alone (`§6` Stage 5 fix; `§3.5` keeps `output-name` in the Output
+            // contract group).
+            if root.active-output-name != "": Text {
+                text: "Playing on " + root.active-output-name;
+                font-size: Theme.fs-meta;
+                color: Theme.text-tertiary;
+                overflow: elide;
+            }
+            HorizontalLayout {
+                cross-axis-alignment: center;
+                Text { text: "Hog mode"; font-size: Theme.fs-body; color: Theme.text-primary; horizontal-stretch: 1; }
+                Rectangle {
+                    width: 34px;
+                    height: 20px;
+                    border-radius: 10px;
+                    background: root.hog-mode-enabled ? Theme.accent : Theme.slider-track;
+                    Rectangle {
+                        width: 16px;
+                        height: 16px;
+                        border-radius: 8px;
+                        y: 2px;
+                        x: root.hog-mode-enabled ? 16px : 2px;
+                        background: Theme.knob;
+                    }
+                    TouchArea {
+                        clicked => {
+                            root.hog-mode-enabled = !root.hog-mode-enabled;
+                            root.hog-mode-changed(root.hog-mode-enabled);
+                        }
+                    }
+                }
+            }
+            Text { text: root.volume-detail; font-size: Theme.fs-meta; color: Theme.text-tertiary; wrap: word-wrap; }
+            if root.volume-available: Text {
+                text: "Device volume is applied by the DAC or its driver; below 100 % it may be applied digitally.";
+                font-size: Theme.fs-caption;
+                color: Theme.text-tertiary;
+                wrap: word-wrap;
+            }
+            Text { text: root.playback-status; font-size: Theme.fs-meta; color: Theme.text-secondary; wrap: word-wrap; max-height: 52px; overflow: elide; }
+
+            if root.has-lyrics: Rectangle { height: 1px; width: 100%; background: Theme.divider; }
+            if root.has-lyrics: HorizontalLayout {
+                spacing: 6px;
+                cross-axis-alignment: center;
+                Icon { source: Icons.lyrics; size: Theme.icon-inline; tint: Theme.accent; }
+                Text { text: "Lyrics"; font-size: Theme.fs-body; font-weight: 700; color: Theme.text-primary; }
+            }
+            if root.has-lyrics: Text {
+                text: root.lyrics;
+                font-size: Theme.fs-body;
+                color: Theme.text-primary.with-alpha(0.85);
+                wrap: word-wrap;
+                line-height-factor: 1.5;
+                horizontal-alignment: left;
+            }
+        }
+    }
+}
+
+component QueueView inherits Rectangle {
+    in property <TrackRowData> queue-current;
+    in property <bool> has-queue-current: false;
+    in property <[TrackRowData]> queue-rows;
+    // The worker's true pending-queue count (`§3.7` `QueueSnapshot`), independent of
+    // `queue-rows`'s own `QUEUE_UP_NEXT_LIMIT` cap (`view_model::project_queue_rows`) — used for
+    // both the section header count and the "...and N more" row below.
+    in property <int> queue-count: 0;
+    in property <string> now-playing-key: "";
+    callback track-activated(int);
+    background: Theme.bg-content;
+
+    ScrollView {
+        vertical-scrollbar-policy: as-needed;
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            // `TrackTable` (widgets.slint) already binds its own `min`/`preferred`/`max-height`
+            // from its row count, so this layout's true, exact size is now the sum of its
+            // children's own preferred sizes — packed with `alignment: start`, the same fix as
+            // `Sidebar`/`NowPlayingPanel`, instead of estimating a `content-height` from
+            // `Theme.fs-*` tokens treated as line heights (`§6` Stage 5 fix). That estimate ran
+            // about 16 px short on the `VerticalLayout`'s own 16 px `spacing` and another ~10 px
+            // short on real font line-height versus font-size, eating into the bottom padding and
+            // clipping the last row on any font with slightly taller metrics.
+            alignment: start;
+            padding: Theme.page-pad;
+            spacing: 16px;
+
+            Text { text: "Queue"; font-size: Theme.fs-hero; font-weight: 700; color: Theme.text-primary; }
+
+            if root.has-queue-current: Text { text: "Now Playing"; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-tertiary; }
+            if root.has-queue-current: TrackTable { rows: [root.queue-current]; now-playing-key: root.now-playing-key; show-format: true; }
+
+            Text {
+                text: root.queue-count > 0 ? "Up Next · " + root.queue-count : "Up Next";
+                font-size: Theme.fs-label;
+                font-weight: 600;
+                color: Theme.text-tertiary;
+            }
+            if root.queue-rows.length == 0: Text {
+                text: "No tracks are waiting in the queue.";
+                font-size: Theme.fs-body;
+                color: Theme.text-secondary;
+            }
+            if root.queue-rows.length > 0: TrackTable {
+                rows: root.queue-rows;
+                now-playing-key: root.now-playing-key;
+                show-format: true;
+                activated(i) => { root.track-activated(i); }
+            }
+            // `queue-rows` is capped (`QUEUE_UP_NEXT_LIMIT`) so a huge queue never instantiates one
+            // `TrackRow` per track; `queue-count` is the worker's true, uncapped total.
+            if root.queue-count > root.queue-rows.length: Text {
+                text: "...and " + (root.queue-count - root.queue-rows.length) + " more";
+                font-size: Theme.fs-body;
+                color: Theme.text-secondary;
+            }
+        }
+    }
+}
+
+component UnavailableView inherits Rectangle {
+    in property <image> icon;
+    in property <string> title;
+    background: Theme.bg-content;
+    EmptyState {
+        width: 100%;
+        height: 100%;
+        icon: root.icon;
+        title: root.title;
+        body: "This view isn't available yet.";
+    }
+}
+
+// Shown for Home/Albums/Artists/Songs/Recently Added while the library has no tracks at all
+// (`§5.7` "Home | Empty library: ..."; "Albums | An empty library shows the same EmptyState as
+// Home."): the same honest, no-mock-data placeholder for all five, gated by `library-empty` so the
+// claim stops the moment a file is opened (`§6` Stage 5 fix, carried into Stage 6).
+component LibraryEmptyState inherits Rectangle {
+    callback open-files();
+    background: Theme.bg-content;
+    EmptyState {
+        width: 100%;
+        height: 100%;
+        icon: Icons.disc;
+        title: "Your library is empty";
+        body: "Open FLAC, WavPack, WAV or MP3 files from your Mac or a mounted NAS share.";
+        action-label: "Open Files…";
+        action => { root.open-files(); }
+    }
+}
+
+// Home (`§5.7`): a chip to shuffle the whole library, "Jump back in" (only while the session has
+// played something, max-rows 1) and "Recently Added" (newest-first albums, max-rows 2) with a
+// "Show all" link to the full Albums view.
+component HomeView inherits Rectangle {
+    in property <[AlbumCardData]> jump-back-albums;
+    in property <[AlbumCardData]> recent-albums;
+    in property <string> search-query: "";
+    callback album-opened(string);
+    callback shuffle-all();
+    callback show-all-albums();
+    background: Theme.bg-content;
+    ScrollView {
+        vertical-scrollbar-policy: as-needed;
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            // Same fix as `Sidebar`/`NowPlayingPanel`/`QueueView`: pack every shelf at its own
+            // preferred height instead of stretching the last one to fill the `ScrollView`'s
+            // viewport (`§6` Stage 5 fix, carried into every `ScrollView`-based page below).
+            alignment: start;
+            padding: Theme.page-pad;
+            spacing: 28px;
+
+            // `HorizontalLayout { alignment: start; ... }` (`§6` Stage 6 fix): a chip is a direct
+            // child of a `VerticalLayout` here, and box layouts stretch cross-axis children to the
+            // full width by default (`i-slint-core layout.rs`), so a bare `ActionButton` rendered as
+            // a full-width bar instead of the `chip-h` 26 px pill `§5.3`/`§5.7` call for.
+            HorizontalLayout {
+                alignment: start;
+                ActionButton { text: "Shuffle all"; kind: ButtonKind.chip; clicked => { root.shuffle-all(); } }
+            }
+
+            if root.jump-back-albums.length > 0: VerticalLayout {
+                spacing: 12px;
+                Text { text: "Jump back in"; font-size: Theme.fs-section; font-weight: 700; color: Theme.text-primary; }
+                AlbumGrid { albums: root.jump-back-albums; max-rows: 1; opened(key) => { root.album-opened(key); } }
+            }
+
+            // Guarded the same way as "Jump back in" above (`§6` Stage 6 fix): both shelves are
+            // filtered by the search query (`view_model::project_jump_back_albums`/`albums_recent`),
+            // so a search with no matches used to leave a bare "Recently Added" header and "Show
+            // all" link over nothing.
+            if root.recent-albums.length > 0: VerticalLayout {
+                spacing: 12px;
+                HorizontalLayout {
+                    cross-axis-alignment: center;
+                    Text { text: "Recently Added"; font-size: Theme.fs-section; font-weight: 700; color: Theme.text-primary; horizontal-stretch: 1; }
+                    Rectangle {
+                        width: show-all-label.preferred-width;
+                        height: show-all-label.preferred-height;
+                        show-all-label := Text { text: "Show all"; font-size: Theme.fs-body; font-weight: 600; color: Theme.accent; }
+                        TouchArea { clicked => { root.show-all-albums(); } }
+                    }
+                }
+                AlbumGrid { albums: root.recent-albums; max-rows: 2; opened(key) => { root.album-opened(key); } }
+            }
+
+            if root.jump-back-albums.length == 0 && root.recent-albums.length == 0 && root.search-query != "": EmptyState {
+                icon: Icons.disc;
+                title: "No matches";
+                body: "Nothing matches \u{201c}" + root.search-query + "\u{201d}.";
+            }
+        }
+    }
+}
+
+// Albums (`§5.7`): every album, or a search's "No matches" state.
+component AlbumsView inherits Rectangle {
+    in property <[AlbumCardData]> albums;
+    in property <string> artist-filter: "";
+    in property <string> search-query: "";
+    callback opened(string);
+    background: Theme.bg-content;
+    ScrollView {
+        vertical-scrollbar-policy: as-needed;
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            alignment: start;
+            padding: Theme.page-pad;
+            spacing: 20px;
+            Text {
+                text: root.artist-filter != "" ? "Albums by " + root.artist-filter : "Albums";
+                font-size: Theme.fs-hero;
+                font-weight: 700;
+                color: Theme.text-primary;
+                overflow: elide;
+            }
+            if root.albums.length == 0: EmptyState {
+                icon: Icons.disc;
+                title: "No matches";
+                // An artist filter with no query is not a search miss (`§6` Stage 6 fix): the
+                // compilation/album-artist link (`artist-opened`) can legitimately land on zero
+                // albums, and "Nothing matches ""." over an empty query read as a bug.
+                body: root.search-query != ""
+                    ? "Nothing matches \u{201c}" + root.search-query + "\u{201d}."
+                    : root.artist-filter != ""
+                        ? "No albums by " + root.artist-filter + "."
+                        : "Nothing matches \u{201c}" + root.search-query + "\u{201d}.";
+            }
+            if root.albums.length > 0: AlbumGrid { albums: root.albums; opened(key) => { root.opened(key); } }
+        }
+    }
+}
+
+// Artists (`§5.7`): a plain list, each row a click away from that artist's albums.
+component ArtistsView inherits Rectangle {
+    in property <[ArtistRowData]> artists;
+    in property <string> search-query: "";
+    callback opened(string);
+    background: Theme.bg-content;
+    ScrollView {
+        vertical-scrollbar-policy: as-needed;
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            alignment: start;
+            padding: Theme.page-pad;
+            spacing: 4px;
+            Text { text: "Artists"; font-size: Theme.fs-hero; font-weight: 700; color: Theme.text-primary; }
+            Rectangle { height: 8px; }
+            // Consistent with Albums'/Songs' own "No matches" state (`§6` Stage 6 fix): only
+            // Albums had one, so a search with no matching artist used to show just the hero.
+            if root.artists.length == 0: EmptyState {
+                icon: Icons.artists;
+                title: "No matches";
+                body: "Nothing matches \u{201c}" + root.search-query + "\u{201d}.";
+            }
+            for artist[i] in root.artists: Rectangle {
+                height: 52px;
+                border-radius: 6px;
+                background: row-touch.has-hover ? Theme.bg-hover : transparent;
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 12px;
+                    cross-axis-alignment: center;
+                    Rectangle {
+                        width: 36px;
+                        height: 36px;
+                        border-radius: 18px;
+                        background: Theme.bg-field;
+                        Icon { source: Icons.artists; size: 18px; tint: Theme.text-secondary; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 2px;
+                        Text { text: artist.name; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
+                        Text { text: artist.subtitle; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; }
+                    }
+                }
+                row-touch := TouchArea { clicked => { root.opened(artist.name); } }
+            }
+        }
+    }
+}
+
+// Songs / Recently Added (`§5.7`): a hero, a summary line, then a virtualized table filling the
+// rest of the page. No page `ScrollView` here: `VirtualizedTrackTable`'s own `ListView` scrolls
+// instead, so the hero/summary stay fixed at the top while only the rows scroll.
+component TrackListPage inherits Rectangle {
+    in property <string> hero;
+    in property <string> summary;
+    in property <[TrackRowData]> rows;
+    in property <string> now-playing-key: "";
+    in property <string> search-query: "";
+    callback activated(int);
+    background: Theme.bg-content;
+    VerticalLayout {
+        // Explicit, not inherited from a single-layout-child default: `VirtualizedTrackTable`'s own
+        // reported size is elastic (its `ListView` allows any height down to 0), so without this
+        // the default-geometry pass would size this layout — and therefore the whole page — to its
+        // *minimum*, not to `root`'s actual size, leaving the table with no room to scroll in.
+        width: 100%;
+        height: 100%;
+        padding: Theme.page-pad;
+        spacing: 12px;
+        Text { text: root.hero; font-size: Theme.fs-hero; font-weight: 700; color: Theme.text-primary; }
+        Text { text: root.summary; font-size: Theme.fs-meta; color: Theme.text-secondary; }
+        // Consistent with Albums'/Artists' own "No matches" state (`§6` Stage 6 fix): without this,
+        // a search with no matching track left just the header and an empty table over "0 songs".
+        if root.rows.length == 0: EmptyState {
+            icon: Icons.disc;
+            title: "No matches";
+            body: "Nothing matches \u{201c}" + root.search-query + "\u{201d}.";
+        }
+        if root.rows.length > 0: VirtualizedTrackTable {
+            vertical-stretch: 1;
+            min-height: 0px;
+            rows: root.rows;
+            now-playing-key: root.now-playing-key;
+            show-format: true;
+            activated(i) => { root.activated(i); }
+        }
+    }
+}
+
+// Album detail (`§5.7`): a header band (art, title, artist, meta, the four large action buttons)
+// over a full-width `TrackTable`, both inside one `ScrollView` with no page padding — only the
+// table gets its own 28 px side padding, so the header band spans edge to edge.
+component AlbumDetailView inherits Rectangle {
+    in property <AlbumHeaderData> header;
+    in property <[TrackRowData]> tracks;
+    in property <string> now-playing-key: "";
+    callback artist-opened(string);
+    callback action(AlbumAction);
+    callback activated(int);
+    background: Theme.bg-content;
+    ScrollView {
+        vertical-scrollbar-policy: as-needed;
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            alignment: start;
+            spacing: 0px;
+
+            Rectangle {
+                background: Theme.bg-header;
+                HorizontalLayout {
+                    padding-left: 28px;
+                    padding-right: 28px;
+                    padding-top: 24px;
+                    padding-bottom: 28px;
+                    spacing: 24px;
+                    ArtworkView { art: root.header.art; has-art: root.header.has-art; size: Theme.detail-art; radius: 8px; }
+                    VerticalLayout {
+                        alignment: start;
+                        spacing: 10px;
+                        Text { text: root.header.title; font-size: Theme.fs-hero; font-weight: 700; color: Theme.text-primary; overflow: elide; }
+                        Rectangle {
+                            // `min-width: 0px; max-width: ...preferred-width;` (`§6` Stage 6 fix), not
+                            // a fixed `width`: a fixed width pins this at the artist text's *natural*
+                            // (unwrapped) width, which is also then the whole header column's
+                            // min-width — a long classical-style artist credit (many performers) could
+                            // widen the page past the viewport instead of eliding, since `overflow:
+                            // elide` never gets a chance to shrink a fixed-width `Text`. A
+                            // `VerticalLayout` cross-axis child is sized to `min(layout width,
+                            // max-width)` and placed at the start, so this still shrink-wraps a short
+                            // artist and only elides once the column is narrower than the max.
+                            min-width: 0px;
+                            max-width: artist-label.preferred-width;
+                            height: artist-label.preferred-height;
+                            artist-label := Text { width: 100%; text: root.header.artist; font-size: Theme.fs-subtitle; color: Theme.accent; overflow: elide; }
+                            TouchArea { clicked => { root.artist-opened(root.header.artist); } }
+                        }
+                        Text { text: root.header.meta; font-size: Theme.fs-meta; color: Theme.text-secondary; }
+                        Rectangle { height: 4px; }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            cross-axis-alignment: center;
+                            // Without `alignment: start`, all four `ActionButton`s share the row's
+                            // default stretch and grow to fill the header column instead of sizing to
+                            // their content, leaving a lopsided empty area on the right (`§5.7`; the
+                            // same bug the Home "Shuffle all" chip already fixed, see above).
+                            alignment: start;
+                            ActionButton { text: "Play"; icon: Icons.play; primary: true; kind: ButtonKind.large; clicked => { root.action(AlbumAction.play); } }
+                            ActionButton { text: "Shuffle"; icon: Icons.shuffle; kind: ButtonKind.large; clicked => { root.action(AlbumAction.shuffle); } }
+                            ActionButton { text: "Add to Queue"; icon: Icons.circle-plus; kind: ButtonKind.large; clicked => { root.action(AlbumAction.add-to-queue); } }
+                            ActionButton { text: "Play Next"; icon: Icons.list-next; kind: ButtonKind.large; clicked => { root.action(AlbumAction.play-next); } }
+                        }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                padding-left: 28px;
+                padding-right: 28px;
+                // No top padding (`§6` Stage 6 fix): `§5.7` calls for 28 px side padding only, and a
+                // `padding-top` here left a 20 px `bg-content` gap between the header band and the
+                // table header instead of the table sitting flush under the band.
+                padding-bottom: 20px;
+                TrackTable {
+                    rows: root.tracks;
+                    now-playing-key: root.now-playing-key;
+                    show-album: true;
+                    show-format: false;
+                    activated(i) => { root.activated(i); }
+                }
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Lime Player";
+    preferred-width: 1440px;
+    preferred-height: 900px;
+    min-width: 1100px;
+    min-height: 700px;
+    background: Theme.bg-content;
+    default-font-size: Theme.fs-body;
+
+    // This UI is dark-only; the one `std-widgets` control it uses (`ComboBox`) otherwise follows
+    // `prefers-color-scheme` and renders in the light Fluent palette on a Light-appearance system,
+    // a light-grey box with dark text inside this dark panel (`§6` Stage 5 fix).
+    init => { Palette.color-scheme = ColorScheme.dark; }
+
+    // Navigation (`§3.5`, `§3.6`).
+    in-out property <View> view: View.home;
+    in-out property <View> nav-view: View.home;
+    in property <bool> can-go-back: false;
+    in-out property <string> search-query: "";
+
+    // Window chrome (`§3.5`). Stage 5b (unified title bar) is skipped; the native title bar stays,
+    // so this is always false and only exists so the contract matches the spec exactly.
+    in property <bool> unified-title-bar: false;
+
+    // Library (`§3.5`). Feeds HomeView, AlbumsView, ArtistsView, TrackListPage and
+    // AlbumDetailView (`§6` Stage 6) below.
+    in property <bool> library-empty: true;
+    in property <[AlbumCardData]> jump-back-albums: [];
+    in property <[AlbumCardData]> recent-albums: [];
+    in property <[AlbumCardData]> albums: [];
+    in property <[ArtistRowData]> artists: [];
+    in property <[TrackRowData]> songs: [];
+    in property <[TrackRowData]> recent-songs: [];
+    in property <[TrackRowData]> album-tracks: [];
+    in property <string> songs-summary: "";
+    in property <string> recent-summary: "";
+    in property <AlbumHeaderData> album-header;
+    in property <string> artist-filter: "";
+
+    // Queue (`§3.5`).
+    in property <TrackRowData> queue-current;
+    in property <bool> has-queue-current: false;
+    in property <[TrackRowData]> queue-rows: [];
+    in property <int> queue-count: 0;
+
+    // Unavailable view.
+    in property <string> unavailable-title: "";
+
+    // Now playing (`§3.5`, `§5.10`).
+    in property <string> now-playing-key: "";
+    in property <string> now-playing-title: "";
+    in property <string> now-playing-artist: "";
+    in property <string> now-playing-album: "";
+    in property <string> now-playing-year: "";
+    in property <string> now-playing-genre: "";
+    in property <string> now-playing-badge: "";
+    in property <string> format-line: "";
+    in property <string> file-size-line: "";
+    in property <image> now-playing-art;
+    in property <bool> now-playing-has-art: false;
+    in property <string> lyrics: "";
+    in property <bool> has-lyrics: false;
+
+    // Playback.
+    in-out property <bool> is-playing: false;
+    in-out property <string> playback-elapsed: "0:00";
+    in-out property <string> playback-duration: "—:—";
+    in-out property <float> playback-progress: 0.0;
+    in property <bool> can-seek: false;
+    in property <int> duration-ms: 0;
+
+    // Output.
+    in-out property <[string]> output-device-options: ["Select output device…"];
+    in-out property <int> selected-output-index: 0;
+    in-out property <bool> hog-mode-enabled: true;
+    in property <string> output-name: "Not selected";
+    in property <string> active-output-name: "";
+    in property <string> playback-status: "Choose an output DAC, then open audio.";
+
+    // Volume.
+    in-out property <float> volume-level: 1.0;
+    in property <bool> volume-available: false;
+    in-out property <string> volume-detail: "";
+
+    // Layout.
+    in-out property <bool> right-panel-visible: true;
+    private property <bool> panel-shown: root.right-panel-visible && root.width >= Theme.panel-threshold;
+    private property <bool> is-library-view: root.view == View.home || root.view == View.albums
+        || root.view == View.artists || root.view == View.songs || root.view == View.recently-added;
+    private property <image> unavailable-icon: root.nav-view == View.browser ? Icons.browser
+        : root.nav-view == View.folders ? Icons.folders-fill
+        : root.nav-view == View.liked ? Icons.heart-fill
+        : root.nav-view == View.statistics ? Icons.statistics-fill
+        : root.nav-view == View.recently-opened ? Icons.recently-opened
+        : root.nav-view == View.scripts ? Icons.scripts
+        : root.nav-view == View.favorites ? Icons.star-fill
+        : root.nav-view == View.new-playlist ? Icons.plus
+        : Icons.disc;
+
+    callback open-files();
+    callback open-folder();
+    callback nav-selected(View);
+    callback back-requested();
+    callback search-edited(string);
+    callback album-opened(string);
+    callback artist-opened(string);
+    callback album-action(string, AlbumAction);
+    callback shuffle-all();
+    callback track-activated(TrackListKind, int);
+    callback play-pause-requested();
+    callback next-track-requested();
+    callback previous-track-requested();
+    callback seek-requested(float);
+    callback volume-requested(float, bool);
+    callback now-playing-album-requested();
+    callback output-chosen(int);
+    callback hog-mode-changed(bool);
+    callback window-drag-requested();
+
+    VerticalLayout {
+        spacing: 0px;
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            min-height: 0px;
+
+            Sidebar {
+                width: Theme.sidebar-w;
+                nav-view: root.nav-view;
+                unified-title-bar: root.unified-title-bar;
+                selected(v) => { root.nav-selected(v); }
+            }
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+
+                TopBar {
+                    height: Theme.topbar-h;
+                    can-go-back: root.can-go-back;
+                    unified-title-bar: root.unified-title-bar;
+                    search-query <=> root.search-query;
+                    back-requested => { root.back-requested(); }
+                    open-files => { root.open-files(); }
+                    open-folder => { root.open-folder(); }
+                    search-edited(q) => { root.search-edited(q); }
+                    window-drag-requested => { root.window-drag-requested(); }
+                }
+
+                // Plain geometry (`x`/`width`), not a `HorizontalLayout`: `panel-shown` reads
+                // `root.width`, so a *layout* child whose width depends on `panel-shown` would
+                // feed this row's own preferred width back into `root`'s, and from there into
+                // `root.width` itself — a binding loop Slint 1.18 flags (and may panic on).
+                // Manual geometry never asks for a preferred size from its children, so it can't
+                // join that cycle.
+                Rectangle {
+                    vertical-stretch: 1;
+                    min-height: 0px;
+
+                    content-area := Rectangle {
+                        x: 0;
+                        y: 0;
+                        width: parent.width - (root.panel-shown ? Theme.panel-w : 0px);
+                        height: 100%;
+                        background: Theme.bg-content;
+
+                        if root.is-library-view && root.library-empty: LibraryEmptyState {
+                            open-files => { root.open-files(); }
+                        }
+                        if root.view == View.home && !root.library-empty: HomeView {
+                            jump-back-albums: root.jump-back-albums;
+                            recent-albums: root.recent-albums;
+                            search-query: root.search-query;
+                            album-opened(key) => { root.album-opened(key); }
+                            shuffle-all => { root.shuffle-all(); }
+                            show-all-albums => { root.nav-selected(View.albums); }
+                        }
+                        if root.view == View.albums && !root.library-empty: AlbumsView {
+                            albums: root.albums;
+                            artist-filter: root.artist-filter;
+                            search-query: root.search-query;
+                            opened(key) => { root.album-opened(key); }
+                        }
+                        if root.view == View.artists && !root.library-empty: ArtistsView {
+                            artists: root.artists;
+                            search-query: root.search-query;
+                            opened(name) => { root.artist-opened(name); }
+                        }
+                        if root.view == View.songs && !root.library-empty: TrackListPage {
+                            hero: "Songs";
+                            summary: root.songs-summary;
+                            rows: root.songs;
+                            now-playing-key: root.now-playing-key;
+                            search-query: root.search-query;
+                            activated(i) => { root.track-activated(TrackListKind.songs, i); }
+                        }
+                        if root.view == View.recently-added && !root.library-empty: TrackListPage {
+                            hero: "Recently Added";
+                            summary: root.recent-summary;
+                            rows: root.recent-songs;
+                            now-playing-key: root.now-playing-key;
+                            search-query: root.search-query;
+                            activated(i) => { root.track-activated(TrackListKind.recently-added, i); }
+                        }
+                        if root.view == View.album-detail: AlbumDetailView {
+                            header: root.album-header;
+                            tracks: root.album-tracks;
+                            now-playing-key: root.now-playing-key;
+                            artist-opened(name) => { root.artist-opened(name); }
+                            action(action) => { root.album-action(root.album-header.key, action); }
+                            activated(i) => { root.track-activated(TrackListKind.album, i); }
+                        }
+                        if root.view == View.queue: QueueView {
+                            queue-current: root.queue-current;
+                            has-queue-current: root.has-queue-current;
+                            queue-rows: root.queue-rows;
+                            queue-count: root.queue-count;
+                            now-playing-key: root.now-playing-key;
+                            track-activated(i) => { root.track-activated(TrackListKind.queue, i); }
+                        }
+                        if !root.is-library-view && root.view != View.queue && root.view != View.album-detail: UnavailableView {
+                            icon: root.unavailable-icon;
+                            title: root.unavailable-title;
+                        }
+                    }
+
+                    NowPlayingPanel {
+                        x: content-area.width;
+                        y: 0;
+                        width: root.panel-shown ? Theme.panel-w : 0px;
+                        height: 100%;
+                        visible: root.panel-shown;
+                        now-playing-key: root.now-playing-key;
+                        now-playing-title: root.now-playing-title;
+                        now-playing-artist: root.now-playing-artist;
+                        now-playing-album: root.now-playing-album;
+                        now-playing-year: root.now-playing-year;
+                        now-playing-genre: root.now-playing-genre;
+                        now-playing-badge: root.now-playing-badge;
+                        now-playing-art: root.now-playing-art;
+                        now-playing-has-art: root.now-playing-has-art;
+                        format-line: root.format-line;
+                        file-size-line: root.file-size-line;
+                        lyrics: root.lyrics;
+                        has-lyrics: root.has-lyrics;
+                        output-device-options <=> root.output-device-options;
+                        selected-output-index <=> root.selected-output-index;
+                        hog-mode-enabled <=> root.hog-mode-enabled;
+                        volume-detail: root.volume-detail;
+                        volume-available: root.volume-available;
+                        playback-status: root.playback-status;
+                        output-name: root.output-name;
+                        active-output-name: root.active-output-name;
+                        output-chosen(index) => { root.output-chosen(index); }
+                        hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
+                    }
+                }
+            }
+        }
+
+        PlayerBar {
+            is-playing: root.is-playing;
+            now-playing-title: root.now-playing-title;
+            now-playing-artist: root.now-playing-artist;
+            now-playing-badge: root.now-playing-badge;
+            now-playing-art: root.now-playing-art;
+            now-playing-has-art: root.now-playing-has-art;
+            queue-count: root.queue-count;
+            playback-elapsed: root.playback-elapsed;
+            playback-duration: root.playback-duration;
+            playback-progress: root.playback-progress;
+            can-seek: root.can-seek;
+            duration-ms: root.duration-ms;
+            volume-level <=> root.volume-level;
+            volume-available: root.volume-available;
+            volume-detail: root.volume-detail;
+            right-panel-visible <=> root.right-panel-visible;
+            panel-shown: root.panel-shown;
+            panel-toggle-enabled: root.width >= Theme.panel-threshold;
+            playback-status: root.playback-status;
+            output-device-options <=> root.output-device-options;
+            selected-output-index <=> root.selected-output-index;
+            hog-mode-enabled <=> root.hog-mode-enabled;
+            play-pause-requested => { root.play-pause-requested(); }
+            previous-track-requested => { root.previous-track-requested(); }
+            next-track-requested => { root.next-track-requested(); }
+            seek-requested(f) => { root.seek-requested(f); }
+            volume-requested(v, is-final) => { root.volume-requested(v, is-final); }
+            now-playing-album-requested => { root.now-playing-album-requested(); }
+            queue-opened => { root.nav-selected(View.queue); }
+            output-chosen(index) => { root.output-chosen(index); }
+            hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
+        }
+    }
+}

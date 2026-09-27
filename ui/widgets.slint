@@ -1,0 +1,555 @@
+// Shared widgets for the UI shell (`§5.5`), plus the Slint data contract structs/enums (`§3.5`).
+//
+// The contract types live here, not in `app.slint`, because `TrackTable`/`AlbumTile`/`AlbumGrid`
+// below need them and `app.slint` needs `TrackTable`/`AlbumTile`/`AlbumGrid`: declaring the types
+// in the file the widgets already live in avoids a cycle between `app.slint` and `widgets.slint`.
+// `app.slint` re-exports them with `export { ... } from "widgets.slint";`, so they still generate
+// as part of its own Rust bindings (`slint::include_modules!()` sees them there), matching `§3.5`'s
+// "exported from `ui/app.slint`" from Rust's point of view.
+
+import { ListView } from "std-widgets.slint";
+import { Theme, Icons } from "theme.slint";
+
+export enum View {
+    home, artists, albums, songs, browser, folders, recently-added, liked, statistics,
+    recently-opened, scripts, favorites, new-playlist, queue, album-detail,
+}
+export enum TrackListKind { songs, recently-added, album, queue }
+export enum AlbumAction { play, shuffle, add-to-queue, play-next }
+export enum ButtonKind { normal, large, chip }
+
+export struct TrackRowData {
+    key: string,
+    number: string,
+    title: string, artist: string, album: string, year: string,
+    duration: string,
+    badge: string,
+    hi-res: bool,
+}
+export struct AlbumCardData { key: string, title: string, artist: string, subtitle: string, art: image, has-art: bool }
+export struct ArtistRowData { name: string, subtitle: string }
+export struct AlbumHeaderData { key: string, title: string, artist: string, meta: string, art: image, has-art: bool }
+
+// `Icon`. Renders `source` through `colorize`, sized to a square of `size` (`§5.5`).
+export component Icon inherits Image {
+    in property <brush> tint;
+    in property <length> size;
+    colorize: root.tint;
+    width: root.size;
+    height: root.size;
+    image-fit: contain;
+}
+
+// `IconButton`: a clickable `Icon` with a hover tint, a disabled state (35% opacity, no
+// interaction) and an optional tooltip (`§5.5`).
+export component IconButton inherits Rectangle {
+    in property <image> source;
+    in property <length> size: Theme.icon-action;
+    in property <bool> enabled: true;
+    in property <string> tooltip: "";
+    callback clicked();
+    width: root.size;
+    height: root.size;
+    background: transparent;
+    opacity: root.enabled ? 1.0 : 0.35;
+    accessible-role: button;
+    accessible-label: root.tooltip;
+
+    Icon {
+        source: root.source;
+        size: root.size;
+        tint: touch.has-hover ? Theme.icon-transport-hover : Theme.icon-transport;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    if root.tooltip != "": Tooltip {
+        Text { text: root.tooltip; font-size: Theme.fs-meta; color: Theme.text-primary; }
+    }
+}
+
+export component VDivider inherits Rectangle {
+    width: 1px;
+    height: 20px;
+    background: Theme.divider;
+}
+
+// Shared by the progress and volume controls (R1, R2): a single-direction fill anchored at
+// `x: 0`, with an 18x12 capsule knob, drag and click support (`§5.5`).
+export component Scrubber inherits Rectangle {
+    in property <float> value;
+    in property <bool> enabled: true;
+    in property <brush> fill: Theme.accent;
+    callback changed(float);
+    callback released(float);
+    out property <bool> dragging: touch.pressed;
+    out property <float> drag-value: 0;
+    property <float> shown: root.dragging ? root.drag-value : clamp(root.value, 0, 1);
+    height: 16px;
+    background: transparent;
+    track := Rectangle {
+        x: 0; y: (root.height - 4px) / 2; width: root.width; height: 4px; border-radius: 2px;
+        background: root.enabled ? Theme.slider-track : Theme.slider-track-disabled;
+    }
+    Rectangle {
+        x: 0; y: (root.height - 4px) / 2; width: root.width * root.shown; height: 4px; border-radius: 2px;
+        background: root.enabled ? root.fill : transparent;
+    }
+    Rectangle {
+        visible: root.enabled;
+        x: clamp(root.width * root.shown - 9px, 0, root.width - 18px); y: (root.height - 12px) / 2;
+        width: 18px; height: 12px; border-radius: 6px; background: Theme.knob;
+        drop-shadow-blur: 2px; drop-shadow-color: #00000066;
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.down {
+                root.drag-value = clamp(self.mouse-x / self.width, 0, 1);
+                root.changed(root.drag-value);
+            }
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.up {
+                root.released(root.drag-value);
+            }
+        }
+        moved => {
+            if self.pressed { root.drag-value = clamp(self.mouse-x / self.width, 0, 1); root.changed(root.drag-value); }
+        }
+    }
+}
+
+export component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    in property <ButtonKind> kind: ButtonKind.normal;
+    callback clicked();
+
+    height: root.kind == ButtonKind.large ? Theme.button-lg-h : root.kind == ButtonKind.chip ? Theme.chip-h : Theme.button-h;
+    // A button sizes to its own content; it must never grow to fill a `HorizontalLayout` that
+    // forgets `alignment: start` (`§5.7`, the album-detail action row bug this once caused).
+    horizontal-stretch: 0;
+    border-radius: 6px;
+    background: root.primary ? Theme.accent : (touch.has-hover ? Theme.button-secondary-hover : Theme.button-secondary);
+    opacity: root.enabled ? 1.0 : 0.35;
+
+    HorizontalLayout {
+        cross-axis-alignment: center;
+        padding-left: root.kind == ButtonKind.large ? 22px : root.kind == ButtonKind.chip ? 12px : 14px;
+        padding-right: root.kind == ButtonKind.large ? 22px : root.kind == ButtonKind.chip ? 12px : 14px;
+        spacing: 8px;
+        if root.icon.width > 0: Icon {
+            source: root.icon;
+            size: root.kind == ButtonKind.large ? 18px : Theme.icon-action;
+            tint: root.primary ? white : Theme.text-primary;
+        }
+        Text {
+            text: root.text;
+            font-size: root.kind == ButtonKind.large ? Theme.fs-title : Theme.fs-body;
+            font-weight: 600;
+            color: root.primary ? white : Theme.text-primary;
+            vertical-alignment: center;
+        }
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => { root.clicked(); } }
+}
+
+export component NavItem inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> active: false;
+    in property <bool> available: true;
+    callback clicked();
+    height: Theme.nav-row-h;
+    border-radius: 6px;
+    background: root.active ? Theme.bg-nav-active : (touch.has-hover ? Theme.bg-hover : transparent);
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+        cross-axis-alignment: center;
+        // `§5.4` dims only the icon and label of an unavailable item, not the whole row: applied to
+        // `root` instead, the 45% opacity also faded the active pill's own background, so an
+        // unavailable item that happened to be active (highlighted from an earlier sidebar click)
+        // looked dimmer than an active available one (`§6` Stage 5 fix).
+        Icon { source: root.icon; size: Theme.icon-nav; tint: Theme.accent-icon; opacity: root.available ? 1.0 : 0.45; }
+        Text {
+            text: root.label;
+            font-size: Theme.fs-body;
+            font-weight: 600;
+            // Always `text-primary`, matching the reference: the active pill and the icon/label
+            // opacity above already carry the active/unavailable distinction, so a dimmer
+            // `text-secondary` on every inactive-but-available label just made it look closer to a
+            // disabled one than intended (`§6` Stage 5 fix).
+            color: Theme.text-primary;
+            opacity: root.available ? 1.0 : 0.45;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+    touch := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Title-case section heading, `text-tertiary`, with the section's 14px top gap folded in so
+// callers just stack `SectionLabel`s in a `VerticalLayout` (`§5.5`).
+export component SectionLabel inherits VerticalLayout {
+    in property <string> text;
+    padding-top: 14px;
+    Text {
+        text: root.text;
+        color: Theme.text-tertiary;
+        font-size: Theme.fs-label;
+        font-weight: 600;
+    }
+}
+
+export component Badge inherits Rectangle {
+    in property <string> text;
+    background: Theme.accent-soft;
+    border-radius: 4px;
+    // Explicit, content-based size: a plain `Rectangle` placed with no size of its own fills
+    // whatever parent it lands in (a 110px table column, a full-width chip slot, ...) instead of
+    // shrink-wrapping its text like the pill in `§5.5`.
+    width: label.preferred-width + 12px;
+    height: label.preferred-height + 2px;
+    HorizontalLayout {
+        padding-top: 1px;
+        padding-bottom: 1px;
+        padding-left: 6px;
+        padding-right: 6px;
+        label := Text { text: root.text; font-size: Theme.fs-caption; font-weight: 700; color: Theme.accent-strong; }
+    }
+}
+
+// Either the artwork or the neutral placeholder disc, clipped to `radius` (`§5.5`).
+export component ArtworkView inherits Rectangle {
+    in property <image> art;
+    in property <bool> has-art: false;
+    in property <length> size;
+    in property <length> radius: 6px;
+    width: root.size;
+    height: root.size;
+    clip: true;
+    border-radius: root.radius;
+    background: root.has-art ? transparent : Theme.art-placeholder-bg;
+    if root.has-art: Image { source: root.art; image-fit: cover; width: 100%; height: 100%; }
+    if !root.has-art: Icon {
+        source: Icons.disc;
+        size: root.size * 0.6;
+        tint: Theme.art-placeholder-icon;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+}
+
+export component EmptyState inherits Rectangle {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> body;
+    in property <string> action-label: "";
+    callback action();
+    background: transparent;
+    VerticalLayout {
+        alignment: center;
+        cross-axis-alignment: center;
+        spacing: 12px;
+        Icon { source: root.icon; size: 48px; tint: Theme.text-tertiary; }
+        Text { text: root.title; font-size: Theme.fs-title; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
+        Text {
+            text: root.body;
+            font-size: Theme.fs-body;
+            color: Theme.text-secondary;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+            width: 320px;
+        }
+        if root.action-label != "": ActionButton { text: root.action-label; primary: true; clicked => { root.action(); } }
+    }
+}
+
+// Album tile: art, title, artist, subtitle, and a click that opens the album (`§5.5`).
+export component AlbumTile inherits Rectangle {
+    in property <AlbumCardData> data;
+    callback opened(string);
+    width: Theme.tile-art;
+    height: Theme.tile-h;
+    background: transparent;
+    VerticalLayout {
+        spacing: 8px;
+        Rectangle {
+            width: Theme.tile-art;
+            height: Theme.tile-art;
+            ArtworkView { art: root.data.art; has-art: root.data.has-art; size: Theme.tile-art; radius: 6px; }
+            if touch.has-hover: Rectangle { width: 100%; height: 100%; background: #ffffff0f; border-radius: 6px; }
+        }
+        Text { text: root.data.title; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
+        Text { text: root.data.artist; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; }
+        Text { text: root.data.subtitle; font-size: Theme.fs-meta; color: Theme.text-tertiary; overflow: elide; }
+    }
+    touch := TouchArea { clicked => { root.opened(root.data.key); } }
+}
+
+// A responsive grid of `AlbumTile`s, optionally capped to `max-rows` (`§5.5`).
+export component AlbumGrid inherits Rectangle {
+    in property <[AlbumCardData]> albums;
+    in property <int> max-rows: 0;
+    callback opened(string);
+    property <int> cols: max(1, floor((self.width + 22px) / (Theme.tile-art + 22px)));
+    property <int> shown: root.max-rows > 0 ? min(root.albums.length, root.cols * root.max-rows) : root.albums.length;
+    height: ceil(root.shown / root.cols) * (Theme.tile-h + 24px);
+    background: transparent;
+    for album[i] in root.albums: AlbumTile {
+        x: mod(i, root.cols) * (Theme.tile-art + 22px);
+        y: floor(i / root.cols) * (Theme.tile-h + 24px);
+        visible: i < root.shown;
+        data: album;
+        opened(key) => { root.opened(key); }
+    }
+}
+
+export component TrackRow inherits Rectangle {
+    in property <TrackRowData> data;
+    in property <int> index;
+    in property <bool> selected: false;
+    in property <bool> is-playing: false;
+    in property <bool> show-album: true;
+    in property <bool> show-format: false;
+    callback clicked(int);
+    callback activated(int);
+    height: Theme.table-row-h;
+    background: root.selected ? Theme.bg-selected : (touch.has-hover ? Theme.bg-hover : Theme.bg-content);
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 12px;
+        cross-axis-alignment: center;
+        Rectangle {
+            width: 44px;
+            height: 100%;
+            if root.is-playing: Icon {
+                source: Icons.now-playing;
+                size: Theme.icon-inline;
+                tint: Theme.accent;
+                x: parent.width - self.width;
+                y: (parent.height - self.height) / 2;
+            }
+            if !root.is-playing: Text {
+                text: root.data.number;
+                font-size: Theme.fs-body;
+                color: Theme.text-tertiary;
+                horizontal-alignment: right;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+            }
+        }
+        // `min-width: 0px; preferred-width: 0px;` on every stretch column below (and on the
+        // matching header `Text`s) makes `horizontal-stretch` the only input to each column's
+        // width (`§6` Stage 5 fix): left at their default (a `Text`'s own unwrapped text width),
+        // Slint's `layout_items` seeds each item's size from *its own* preferred width before
+        // adding its stretch share, so two rows with different title/artist lengths — or the
+        // header, whose cells have no text-derived preferred width pressure at all — ended up with
+        // different column x positions instead of a shared grid.
+        HorizontalLayout {
+            horizontal-stretch: 3;
+            min-width: 0px;
+            preferred-width: 0px;
+            spacing: 6px;
+            cross-axis-alignment: center;
+            // `alignment: start` (`§6` Stage 6 fix): with no title `horizontal-stretch`, the title
+            // and badge pack at their preferred size from the left, so the Hi-Res badge follows the
+            // title (`§5.5`) instead of the old `horizontal-stretch: 1` on the title pushing it to
+            // the far right of the whole Title column. When the column is too narrow, the shrink
+            // solver still elides the title first (`i-slint-compiler` `layout.rs` `solve_box_layout`).
+            alignment: start;
+            Text {
+                text: root.data.title;
+                font-size: Theme.fs-body;
+                color: root.is-playing ? Theme.accent : Theme.text-primary;
+                overflow: elide;
+            }
+            if root.data.hi-res: Badge { text: "Hi-Res"; }
+        }
+        Text {
+            text: root.data.artist;
+            horizontal-stretch: 2;
+            min-width: 0px;
+            preferred-width: 0px;
+            font-size: Theme.fs-body;
+            color: Theme.text-primary;
+            overflow: elide;
+        }
+        if root.show-album: Text {
+            text: root.data.album;
+            horizontal-stretch: 2;
+            min-width: 0px;
+            preferred-width: 0px;
+            font-size: Theme.fs-body;
+            color: Theme.text-primary;
+            overflow: elide;
+        }
+        Text { text: root.data.year; width: 56px; font-size: Theme.fs-body; color: Theme.text-primary; horizontal-alignment: right; }
+        if root.show-format: Rectangle {
+            width: 110px;
+            height: 100%;
+            // `x: 0` matches the left-aligned "Format" header (`§6` Stage 5 fix): with no `x`
+            // binding, Slint's `maybe_center_in_parent` centered the badge in the 110 px column
+            // instead.
+            Badge { x: 0; y: (parent.height - self.height) / 2; text: root.data.badge; }
+        }
+        Text { text: root.data.duration; width: 64px; font-size: Theme.fs-body; color: Theme.text-primary; horizontal-alignment: right; }
+    }
+    // `§5.5`: "the selected row is the last one clicked." Wiring only `double-clicked` (activation)
+    // left a single click with no `bg-selected` feedback at all (`§6` Stage 5 fix).
+    touch := TouchArea {
+        clicked => { root.clicked(root.index); }
+        double-clicked => { root.activated(root.index); }
+    }
+}
+
+// The table header row, shared by `TrackTable` (a plain `for`) and `VirtualizedTrackTable` (a
+// `ListView`-backed `for`), so both stay pixel-identical without duplicating the column layout
+// (`§5.5` "Header row").
+component TrackTableHeader inherits Rectangle {
+    in property <bool> show-album: true;
+    in property <bool> show-format: false;
+    height: Theme.table-header-h;
+    background: Theme.table-header-bg;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 12px;
+        // No `cross-axis-alignment` here (default stretch, `§5.5`): every column below is a bare
+        // `Rectangle`, which reports no natural height of its own, so each needs the layout's
+        // default cross-axis stretch to reach `Theme.table-header-h` — centering, done per column
+        // by its `Text`'s own `vertical-alignment: center`, would otherwise size each cell to 0.
+        Rectangle {
+            width: 44px;
+            Text { text: "#"; width: 100%; height: 100%; vertical-alignment: center; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-primary; horizontal-alignment: right; }
+            // A 1x14 px `divider` between adjacent columns (`§5.5`), centered in the 12 px column
+            // spacing (half on each side); an overlay child of a plain `Rectangle`, so it draws in
+            // the gap without widening the column or needing a matching spacer in `TrackRow`.
+            Rectangle { x: parent.width + 6px; y: (parent.height - 14px) / 2; width: 1px; height: 14px; background: Theme.divider; }
+        }
+        Rectangle {
+            horizontal-stretch: 3;
+            min-width: 0px;
+            preferred-width: 0px;
+            Text { text: "Title"; width: 100%; height: 100%; vertical-alignment: center; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-primary; }
+            Rectangle { x: parent.width + 6px; y: (parent.height - 14px) / 2; width: 1px; height: 14px; background: Theme.divider; }
+        }
+        Rectangle {
+            horizontal-stretch: 2;
+            min-width: 0px;
+            preferred-width: 0px;
+            Text { text: "Artist"; width: 100%; height: 100%; vertical-alignment: center; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-primary; }
+            Rectangle { x: parent.width + 6px; y: (parent.height - 14px) / 2; width: 1px; height: 14px; background: Theme.divider; }
+        }
+        if root.show-album: Rectangle {
+            horizontal-stretch: 2;
+            min-width: 0px;
+            preferred-width: 0px;
+            Text { text: "Album"; width: 100%; height: 100%; vertical-alignment: center; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-primary; }
+            Rectangle { x: parent.width + 6px; y: (parent.height - 14px) / 2; width: 1px; height: 14px; background: Theme.divider; }
+        }
+        Rectangle {
+            width: 56px;
+            Text { text: "Year"; width: 100%; height: 100%; vertical-alignment: center; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-primary; horizontal-alignment: right; }
+            Rectangle { x: parent.width + 6px; y: (parent.height - 14px) / 2; width: 1px; height: 14px; background: Theme.divider; }
+        }
+        if root.show-format: Rectangle {
+            width: 110px;
+            Text { text: "Format"; width: 100%; height: 100%; vertical-alignment: center; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-primary; }
+            Rectangle { x: parent.width + 6px; y: (parent.height - 14px) / 2; width: 1px; height: 14px; background: Theme.divider; }
+        }
+        // Last column: no trailing divider (only "between adjacent columns", `§5.5`).
+        Text { text: "Duration"; width: 64px; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-primary; horizontal-alignment: right; vertical-alignment: center; }
+    }
+    Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: Theme.divider; }
+}
+
+// A header row plus `rows`, non-virtualized: a plain `for` in a `VerticalLayout`. Used by Queue and
+// album detail, whose row counts stay small and already live inside the page's own `ScrollView`
+// (`§5.5`: "Album detail and Queue use a plain `for`..."). `VirtualizedTrackTable` below is §5.5's
+// `virtualized: true` variant for Songs/Recently Added — there is no `virtualized` property here.
+// Inherits `VerticalLayout` directly, like `SectionLabel` (not `Rectangle` wrapping one): a plain
+// `Rectangle`'s default layoutinfo (min 0, max infinite) does not pick up an inner layout's actual
+// content size, so a `Rectangle`-rooted table nested a few components deep inside a `ScrollView`
+// (Queue's own layout, itself inside a `Flickable`) was reported as infinitely stretchable and
+// grew far past its rows, leaving a large gap above them. A native layout root reports its true
+// summed size instead, matching how `Sidebar`'s and `NowPlayingPanel`'s content (built from plain
+// leaves and `SectionLabel`) size correctly today.
+export component TrackTable inherits VerticalLayout {
+    in property <[TrackRowData]> rows;
+    in property <string> now-playing-key: "";
+    in property <bool> show-album: true;
+    in property <bool> show-format: false;
+    callback activated(int);
+    property <int> selected-index: -1;
+    // A `for` loop's row count is a runtime value, so the compiler cannot bound this layout's own
+    // height from its children alone; it defaults `max-height` to unbounded. Left unbounded, this
+    // table (not the fixed-size labels around it) is the one element in Queue's outer layout that
+    // can grow, and a `ScrollView` whose content is shorter than the viewport hands that whole
+    // leftover height to whichever child can take it (`i-slint-compiler` `passes/flickable.rs`
+    // `fixup_geometry`'s `content-height` folds the layout's `min-height` against the viewport
+    // height) — so this table would stretch to fill the page and center its rows in the gap.
+    // Binding all three explicitly overrides that default and makes the table's true, exact size
+    // the only size its parent ever sees.
+    property <length> own-height: Theme.table-header-h + root.rows.length * Theme.table-row-h;
+    min-height: root.own-height;
+    preferred-height: root.own-height;
+    max-height: root.own-height;
+    spacing: 0px;
+
+    TrackTableHeader { show-album: root.show-album; show-format: root.show-format; }
+    for row[i] in root.rows: TrackRow {
+        data: row;
+        index: i;
+        selected: root.selected-index == i;
+        is-playing: root.now-playing-key != "" && row.key == root.now-playing-key;
+        show-album: root.show-album;
+        show-format: root.show-format;
+        clicked(index) => { root.selected-index = index; }
+        activated(index) => { root.selected-index = index; root.activated(index); }
+    }
+}
+
+// The virtualized variant Songs/Recently Added need (`§5.5`: "Songs and Recently Added use
+// `ListView { for row[i] in rows: TrackRow {…} }`, which is virtualized."): same header, but rows
+// live directly inside a `ListView` instead of a plain `for`, so only the visible rows are ever
+// instantiated — the sessions this library expects (up to about 10k tracks, `§3.4`) stay smooth in
+// Songs even though its `TrackRowData` model holds every track. The `for` must be a direct child of
+// `ListView` for the compiler to recognize and virtualize it (`i-slint-compiler`
+// `object_tree.rs:2892-2941`), so this cannot share `TrackTable`'s plain-`for` body — only its
+// header. Fills whatever space its parent gives it (a page's `vertical-stretch: 1`), unlike
+// `TrackTable`'s fixed `own-height`: the row count here is meant to scroll, not to size the page.
+export component VirtualizedTrackTable inherits VerticalLayout {
+    in property <[TrackRowData]> rows;
+    in property <string> now-playing-key: "";
+    in property <bool> show-album: true;
+    in property <bool> show-format: false;
+    callback activated(int);
+    property <int> selected-index: -1;
+    spacing: 0px;
+
+    TrackTableHeader { show-album: root.show-album; show-format: root.show-format; }
+    ListView {
+        vertical-stretch: 1;
+        min-height: 0px;
+        for row[i] in root.rows: TrackRow {
+            data: row;
+            index: i;
+            selected: root.selected-index == i;
+            is-playing: root.now-playing-key != "" && row.key == root.now-playing-key;
+            show-album: root.show-album;
+            show-format: root.show-format;
+            clicked(index) => { root.selected-index = index; }
+            activated(index) => { root.selected-index = index; root.activated(index); }
+        }
+    }
+}
