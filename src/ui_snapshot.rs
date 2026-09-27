@@ -241,6 +241,33 @@ fn render_snapshots() {
         ui.window().hide().unwrap();
     }
 
+    // Scenario 1c-bis: the same populated Home, with `unified-title-bar: true` (`§6` Stage 5b) —
+    // never set by `main.rs` outside macOS, but rendered here (the software renderer draws no
+    // native traffic lights) so a reviewer can check that `Sidebar` reserves its top 52 px and
+    // `TopBar` aligns its title/search row against that same strip.
+    {
+        let window = new_window();
+        let ui = MainWindow::new().unwrap();
+        ui.set_view(View::Home);
+        ui.set_nav_view(View::Home);
+        ui.set_library_empty(false);
+        ui.set_unified_title_bar(true);
+        ui.set_jump_back_albums(ModelRc::new(VecModel::from(vec![
+            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68]))),
+            sample_album("album-cold-shapes", "Cold Shapes", "Other Artist", "2019 · 9 tracks", None),
+        ])));
+        ui.set_recent_albums(ModelRc::new(VecModel::from(vec![
+            sample_album("album-night-drive", "Night Drive", "The Collective", "2024 · 8 tracks", Some((64, 64, [80, 140, 190]))),
+            sample_album("album-paper-trail", "Paper Trail", "Solo Artist", "2023 · 5 tracks", None),
+            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200]))),
+            sample_album("album-low-tide", "Low Tide", "Other Artist", "2021 · 7 tracks", None),
+            sample_album("album-fault-lines", "Fault Lines", "The Collective", "2020 · 11 tracks", Some((64, 64, [90, 170, 120]))),
+        ])));
+        ui.window().show().unwrap();
+        render_scenario(&window, &dir, "home-unified-titlebar");
+        ui.window().hide().unwrap();
+    }
+
     // Scenario 1d: the Albums grid (`§6` Stage 6), same art-mix rule as Home's shelves.
     {
         let window = new_window();

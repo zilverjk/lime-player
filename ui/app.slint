@@ -20,7 +20,23 @@ component Sidebar inherits Rectangle {
     in property <View> nav-view;
     in property <bool> unified-title-bar: false;
     callback selected(View);
+    callback window-drag-requested();
     background: Theme.bg-sidebar;
+
+    // The traffic lights float over this reserved strip in unified mode (`§6` Stage 5b), so it
+    // never holds a `NavItem`; dragging it moves the window, matching the empty top-bar area
+    // below (`TopBar`'s own drag `TouchArea`).
+    if root.unified-title-bar: TouchArea {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 52px;
+        pointer-event(e) => {
+            if e.button == PointerEventButton.left && e.kind == PointerEventKind.down {
+                root.window-drag-requested();
+            }
+        }
+    }
 
     VerticalLayout {
         padding-top: root.unified-title-bar ? 52px : 12px;
@@ -71,6 +87,7 @@ component TopBar inherits Rectangle {
     callback open-folder();
     callback search-edited(string);
     callback window-drag-requested();
+    callback window-zoom-requested();
     background: Theme.bg-topbar;
 
     if root.unified-title-bar: TouchArea {
@@ -81,6 +98,9 @@ component TopBar inherits Rectangle {
                 root.window-drag-requested();
             }
         }
+        // Like a native macOS title bar: double-clicking the empty area zooms the window
+        // (`§6` Stage 5b, "if that is feasible").
+        double-clicked => { root.window-zoom-requested(); }
     }
 
     HorizontalLayout {
@@ -97,7 +117,6 @@ component TopBar inherits Rectangle {
             Icon { source: Icons.chevron-left; size: 18px; tint: Theme.text-primary; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
             TouchArea { clicked => { root.back-requested(); } }
         }
-        if root.unified-title-bar: Text { text: "Lime Player"; font-size: Theme.fs-title; font-weight: 600; color: Theme.text-primary; vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; background: transparent; }
         ActionButton { text: "Open Files…"; icon: Icons.folder-open; primary: true; clicked => { root.open-files(); } }
         ActionButton { text: "Open Folder…"; icon: Icons.folder-plus; clicked => { root.open-folder(); } }
@@ -975,8 +994,12 @@ export component MainWindow inherits Window {
     in property <bool> can-go-back: false;
     in-out property <string> search-query: "";
 
-    // Window chrome (`§3.5`). Stage 5b (unified title bar) is skipped; the native title bar stays,
-    // so this is always false and only exists so the contract matches the spec exactly.
+    // Window chrome (`§3.5`, `§6` Stage 5b). `main.rs` sets this to `true` only on macOS, after
+    // installing `slint::BackendSelector::with_winit_window_attributes_hook` (transparent,
+    // title-hidden, fullsize-content-view) before `MainWindow::new()`. When true, `Sidebar`
+    // reserves its top 52 px for the traffic lights and `TopBar` shows the window title on the
+    // same row; both also expose a drag `TouchArea` over that empty space. Every other platform
+    // keeps the native decorated title bar and this stays `false`.
     in property <bool> unified-title-bar: false;
 
     // Library (`§3.5`). Feeds HomeView, AlbumsView, ArtistsView, TrackListPage and
@@ -1073,6 +1096,7 @@ export component MainWindow inherits Window {
     callback output-chosen(int);
     callback hog-mode-changed(bool);
     callback window-drag-requested();
+    callback window-zoom-requested();
 
     VerticalLayout {
         spacing: 0px;
@@ -1086,6 +1110,7 @@ export component MainWindow inherits Window {
                 nav-view: root.nav-view;
                 unified-title-bar: root.unified-title-bar;
                 selected(v) => { root.nav-selected(v); }
+                window-drag-requested => { root.window-drag-requested(); }
             }
 
             VerticalLayout {
@@ -1101,6 +1126,7 @@ export component MainWindow inherits Window {
                     open-folder => { root.open-folder(); }
                     search-edited(q) => { root.search-edited(q); }
                     window-drag-requested => { root.window-drag-requested(); }
+                    window-zoom-requested => { root.window-zoom-requested(); }
                 }
 
                 // Plain geometry (`x`/`width`), not a `HorizontalLayout`: `panel-shown` reads

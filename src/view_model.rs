@@ -995,6 +995,49 @@ mod ui_contract {
         );
     }
 
+    /// `§6` Stage 5b (unified title bar): `Sidebar` reserves its top 52 px for the traffic lights
+    /// and `TopBar` shows the window title, both gated on `unified-title-bar`; both also carry a
+    /// drag `TouchArea` over that empty space, and `TopBar`'s doubles as a zoom trigger, matching
+    /// a native macOS title bar. `main.rs` only ever sets `unified-title-bar` to `true` on macOS
+    /// (every other platform keeps the default `false`, so none of this reserves space there).
+    #[test]
+    fn unified_title_bar_reserves_traffic_light_space_and_is_draggable() {
+        let sidebar = extract_component(APP_SLINT, "Sidebar");
+        assert!(
+            sidebar.contains("padding-top: root.unified-title-bar ? 52px : 12px;"),
+            "Sidebar must reserve exactly 52px for the traffic lights in unified mode"
+        );
+        assert!(
+            sidebar.contains("callback window-drag-requested();"),
+            "Sidebar must expose its own drag callback for the reserved top strip"
+        );
+        assert!(
+            sidebar.contains("if root.unified-title-bar: TouchArea"),
+            "Sidebar's drag TouchArea must only exist in unified mode"
+        );
+
+        let top_bar = extract_component(APP_SLINT, "TopBar");
+        assert!(
+            !top_bar.contains("\"Lime Player\""),
+            "TopBar must not repeat the app name; the unified title bar shows no title text"
+        );
+        assert!(
+            top_bar.contains("callback window-drag-requested();") && top_bar.contains("callback window-zoom-requested();"),
+            "TopBar must expose both a drag and a zoom callback"
+        );
+        assert!(
+            top_bar.contains("double-clicked => { root.window-zoom-requested(); }"),
+            "TopBar's drag TouchArea must also zoom on a double click, like a native title bar"
+        );
+
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert!(main_window.contains("in property <bool> unified-title-bar: false;"), "unified-title-bar must default to false");
+        assert!(main_window.contains("callback window-drag-requested();"));
+        assert!(main_window.contains("callback window-zoom-requested();"));
+        let unified_bindings = main_window.matches("unified-title-bar: root.unified-title-bar;").count();
+        assert_eq!(unified_bindings, 2, "both Sidebar and TopBar must forward MainWindow's unified-title-bar");
+    }
+
     /// `PlayerBar`'s `output-popup` `ComboBox` and `NowPlayingPanel`'s own `ComboBox` both end up
     /// two-way bound to the same `MainWindow.selected-output-index` storage (chained `<=>`
     /// bindings), and Rust writes that index programmatically both at startup and on every

@@ -126,6 +126,23 @@ fn batch_reports_failures_inline(kind: BatchKind) -> bool {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Unified title bar (`§6` Stage 5b): must run before any window is created (`MainWindow::new()`
+    // below), on macOS only. `with_titlebar_transparent`/`with_title_hidden` hide the native
+    // "Lime Player" title bar strip; `with_fullsize_content_view` lets the content view (and so
+    // `Sidebar`/`TopBar`) extend under where the title bar used to be, so only the traffic lights
+    // float over it. `MainWindow.title` stays "Lime Player" (still used for Mission Control/the
+    // Window menu); it is only hidden in the titlebar itself. Every other platform keeps Slint's
+    // normal decorated window untouched.
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::winit::platform::macos::WindowAttributesExtMacOS;
+        slint::BackendSelector::new()
+            .with_winit_window_attributes_hook(|attributes| {
+                attributes.with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true)
+            })
+            .select()?;
+    }
+
     let preferences = Rc::new(RefCell::new(Preferences::load()));
     let settings_save_error = Rc::new(RefCell::new(None::<String>));
     // Persisted library sources (`library.json`, next to `settings.json`): loaded here, restored
@@ -234,6 +251,36 @@ fn main() -> Result<(), slint::PlatformError> {
     let album_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
 
     let window = MainWindow::new()?;
+    // Drives `Sidebar`'s reserved 52 px traffic-light strip and `TopBar`'s title text (`ui/app.slint`
+    // `MainWindow.unified-title-bar`); matches the `BackendSelector` hook installed above.
+    #[cfg(target_os = "macos")]
+    window.set_unified_title_bar(true);
+    // `window-drag-requested`/`window-zoom-requested` only fire from the `TouchArea`s `ui/app.slint`
+    // shows when `unified-title-bar` is true, i.e. only on macOS, so the handlers are macOS-only
+    // too. `drag_window()`/`set_maximized()` are winit 0.30 APIs reached through
+    // `slint::winit_030::WinitWindowAccessor` (`§6` Stage 5b).
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::WinitWindowAccessor;
+
+        let drag_window = window.as_weak();
+        window.on_window_drag_requested(move || {
+            if let Some(window) = drag_window.upgrade() {
+                window.window().with_winit_window(|winit_window| {
+                    let _ = winit_window.drag_window();
+                });
+            }
+        });
+
+        let zoom_window = window.as_weak();
+        window.on_window_zoom_requested(move || {
+            if let Some(window) = zoom_window.upgrade() {
+                window.window().with_winit_window(|winit_window| {
+                    winit_window.set_maximized(!winit_window.is_maximized());
+                });
+            }
+        });
+    }
     window.set_hog_mode_enabled(preferences.borrow().hog_mode_enabled);
     set_device_model(&window, &output_devices.borrow());
     sync_navigation(&window, &navigation.borrow());
