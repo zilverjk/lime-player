@@ -46,6 +46,8 @@ open "dist/Lime Player.app"
 
 The script creates an ad-hoc-signed (not Developer ID signed, not notarized) development bundle for local testing only.
 
+The app icon source is [`assets/icon.svg`](assets/icon.svg); the bundle uses the committed `assets/AppIcon.icns`. After editing the SVG, regenerate the `.icns` with `./scripts/generate-app-icon.sh` (requires `brew install resvg`).
+
 The repository config sets `CMAKE_POLICY_VERSION_MINIMUM=3.5` to allow the older bundled WavPack CMake files to build under CMake 4. The UI is compiled from [`ui/app.slint`](ui/app.slint) by `slint-build` in `build.rs`.
 
 ## macOS file-open regression check

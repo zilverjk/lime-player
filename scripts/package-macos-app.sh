@@ -17,6 +17,7 @@ CONTENTS="$APP_PATH/Contents"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 cp "$ROOT_DIR/target/release/lime-player" "$CONTENTS/MacOS/lime-player"
 chmod 755 "$CONTENTS/MacOS/lime-player"
+cp "$ROOT_DIR/assets/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
 
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -29,6 +30,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <string>Lime Player</string>
     <key>CFBundleExecutable</key>
     <string>lime-player</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>org.limeplayer.desktop</string>
     <key>CFBundleInfoDictionaryVersion</key>

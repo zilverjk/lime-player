@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bar" x1="0" y1="243" x2="0" y2="781" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#bdf65a"/>
+      <stop offset="0.55" stop-color="#8ef552"/>
+      <stop offset="1" stop-color="#36e85a"/>
+    </linearGradient>
+    <linearGradient id="outer" x1="0" y1="426" x2="0" y2="598" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6be676"/>
+      <stop offset="1" stop-color="#27cc4c"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="#0e0e0e" filter="url(#shadow)"/>
+  <rect x="225" y="426" width="78" height="172" rx="39" fill="url(#outer)"/>
+  <rect x="347" y="338" width="82" height="348" rx="41" fill="url(#bar)"/>
+  <rect x="471" y="243" width="82" height="538" rx="41" fill="url(#bar)"/>
+  <rect x="595" y="338" width="82" height="348" rx="41" fill="url(#bar)"/>
+  <rect x="721" y="426" width="78" height="172" rx="39" fill="url(#outer)"/>
+</svg>
