@@ -143,13 +143,13 @@ export component ActionButton inherits Rectangle {
         if root.icon.width > 0: Icon {
             source: root.icon;
             size: root.kind == ButtonKind.large ? 18px : Theme.icon-action;
-            tint: root.primary ? white : Theme.text-primary;
+            tint: root.primary ? Theme.on-accent : Theme.text-primary;
         }
         Text {
             text: root.text;
             font-size: root.kind == ButtonKind.large ? Theme.fs-title : Theme.fs-body;
             font-weight: 600;
-            color: root.primary ? white : Theme.text-primary;
+            color: root.primary ? Theme.on-accent : Theme.text-primary;
             vertical-alignment: center;
         }
     }

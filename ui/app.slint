@@ -88,7 +88,9 @@ component TopBar inherits Rectangle {
     callback search-edited(string);
     callback window-drag-requested();
     callback window-zoom-requested();
-    background: Theme.bg-topbar;
+    // Same background as the content area below it (`§6` layout pass): the top bar is no longer
+    // its own visibly distinct strip, so there must be no seam where it meets `content-area`.
+    background: Theme.bg-content;
 
     if root.unified-title-bar: TouchArea {
         width: 100%;
@@ -103,58 +105,92 @@ component TopBar inherits Rectangle {
         double-clicked => { root.window-zoom-requested(); }
     }
 
-    HorizontalLayout {
-        padding-left: 16px;
-        padding-right: 20px;
+    // Manual geometry for the back button, search pill and Open Files/Open Folder buttons
+    // (`§6` layout pass), not a `HorizontalLayout`: the search pill must stay centered on
+    // `root.width` itself (the middle column's own width, now that `TopBar` no longer spans the
+    // right panel too) regardless of how wide the back button or the buttons group are, which a
+    // stretch-based box layout cannot guarantee once the row gets tight — a `HorizontalLayout`
+    // fills any leftover space by first growing every item toward its own preferred size, so a
+    // search pill below its preferred width can end up flush against the buttons with zero
+    // spacer width left over instead of centered. Every element the drag `TouchArea` above sits
+    // behind still receives its own clicks first (declared after it, so drawn on top), leaving
+    // only the empty space between them draggable, exactly like before.
+    if root.can-go-back: Rectangle {
+        x: 16px;
+        y: (parent.height - self.height) / 2;
+        width: 30px;
+        height: 30px;
+        border-radius: 15px;
+        background: Theme.button-secondary;
+        Icon { source: Icons.chevron-left; size: 18px; tint: Theme.text-primary; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
+        TouchArea { clicked => { root.back-requested(); } }
+    }
+
+    buttons := HorizontalLayout {
+        // Explicit, not left to default (`§6` layout pass fix): as a manually-positioned child of
+        // a plain `Rectangle` — not laid out by it — an unset `width` here resolves to the
+        // *parent's* full width rather than this layout's own content size, which blew the
+        // primary "Open Files…" button up to fill the leftover space and starved the search
+        // pill's available width below.
+        width: self.preferred-width;
+        x: parent.width - self.width - 20px;
+        y: (parent.height - self.height) / 2;
         spacing: 12px;
         cross-axis-alignment: center;
-
-        if root.can-go-back: Rectangle {
-            width: 30px;
-            height: 30px;
-            border-radius: 15px;
-            background: Theme.button-secondary;
-            Icon { source: Icons.chevron-left; size: 18px; tint: Theme.text-primary; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
-            TouchArea { clicked => { root.back-requested(); } }
-        }
-        Rectangle { horizontal-stretch: 1; background: transparent; }
         ActionButton { text: "Open Files…"; icon: Icons.folder-open; primary: true; clicked => { root.open-files(); } }
         ActionButton { text: "Open Folder…"; icon: Icons.folder-plus; clicked => { root.open-folder(); } }
-        Rectangle {
-            width: Theme.search-w;
-            height: Theme.search-h;
-            background: Theme.bg-field;
-            border-radius: 8px;
-            HorizontalLayout {
-                padding-left: 8px;
-                padding-right: 8px;
-                spacing: 6px;
-                cross-axis-alignment: center;
-                Icon { source: Icons.search; size: 16px; tint: Theme.text-secondary; }
-                Rectangle {
-                    horizontal-stretch: 1;
+    }
+
+    // The safe horizontal band the search pill can occupy without ever touching the back button
+    // (or the left padding, when there is none) or the buttons group.
+    property <length> search-left-bound: root.can-go-back ? 16px + 30px + 12px : 16px;
+    property <length> search-right-bound: root.width - buttons.width - 20px - 12px;
+    property <length> search-available: max(0px, root.search-right-bound - root.search-left-bound);
+    property <length> search-actual-w: clamp(Theme.search-w, Theme.search-w-min, root.search-available);
+
+    search-wrap := Rectangle {
+        width: root.search-actual-w;
+        height: Theme.search-h;
+        // Centered on the full row, but clamped inside `search-left-bound`/`search-right-bound`
+        // so it can never overlap the back button or the buttons group even when there isn't
+        // enough slack on both sides to sit at the true center.
+        x: clamp((root.width - self.width) / 2, root.search-left-bound, root.search-right-bound - self.width);
+        y: (parent.height - self.height) / 2;
+        background: Theme.bg-field;
+        // Fully rounded ends (a pill), not the previous 8px box corner.
+        border-radius: self.height / 2;
+        border-width: 1px;
+        border-color: search-input.has-focus ? Theme.accent : Theme.divider;
+
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            spacing: 8px;
+            cross-axis-alignment: center;
+            Icon { source: Icons.search; size: 16px; tint: Theme.text-secondary; }
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 100%;
+                clip: true;
+                search-input := TextInput {
+                    text <=> root.search-query;
+                    font-size: Theme.fs-body;
+                    color: Theme.text-primary;
+                    input-type: search;
+                    width: 100%;
                     height: 100%;
-                    clip: true;
-                    search-input := TextInput {
-                        text <=> root.search-query;
-                        font-size: Theme.fs-body;
-                        color: Theme.text-primary;
-                        input-type: search;
-                        width: 100%;
-                        height: 100%;
-                        vertical-alignment: center;
-                        edited => { root.search-edited(self.text); }
-                    }
-                    if root.search-query == "": Text {
-                        text: "Search tracks, albums, artists…";
-                        width: 100%;
-                        height: 100%;
-                        font-size: Theme.fs-body;
-                        color: Theme.text-secondary;
-                        vertical-alignment: center;
-                    }
-                    if root.search-query == "": TouchArea { clicked => { search-input.focus(); } }
+                    vertical-alignment: center;
+                    edited => { root.search-edited(self.text); }
                 }
+                if root.search-query == "": Text {
+                    text: "Search tracks, albums, artists…";
+                    width: 100%;
+                    height: 100%;
+                    font-size: Theme.fs-body;
+                    color: Theme.text-secondary;
+                    vertical-alignment: center;
+                }
+                if root.search-query == "": TouchArea { clicked => { search-input.focus(); } }
             }
         }
     }
@@ -419,6 +455,11 @@ component PlayerBar inherits Rectangle {
 }
 
 component NowPlayingPanel inherits Rectangle {
+    // The panel is now full height (`§6` layout pass): it starts level with the top bar instead
+    // of below it, so in unified-title-bar mode its own top content needs the same kind of top
+    // clearance `Sidebar` already reserves for the traffic lights, or the artwork would sit
+    // right at the window's top edge.
+    in property <bool> unified-title-bar: false;
     in property <string> now-playing-key: "";
     in property <string> now-playing-title: "";
     in property <string> now-playing-artist: "";
@@ -447,6 +488,11 @@ component NowPlayingPanel inherits Rectangle {
     callback hog-mode-changed(bool);
     background: Theme.bg-panel;
 
+    // A subtle divider against the middle column (`§6` layout pass), now that the panel is a
+    // full-height column of its own rather than sitting only below the top bar: `bg-panel` and
+    // `bg-content` are close enough in value that the seam needs a hairline to read clearly.
+    Rectangle { x: 0; width: 1px; height: 100%; background: Theme.divider; }
+
     ScrollView {
         vertical-scrollbar-policy: as-needed;
         horizontal-scrollbar-policy: always-off;
@@ -457,7 +503,14 @@ component NowPlayingPanel inherits Rectangle {
             // viewport space was handed to whichever ones sat in this layout, opening 25-50 px gaps
             // between the title, artist, album, format line, "Output" label and the ComboBox.
             alignment: start;
-            padding: 20px;
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-bottom: 20px;
+            // Extra top clearance in unified-title-bar mode only (`§6` layout pass): matches
+            // `Sidebar`'s own `unified-title-bar ? 52px : 12px` fix for the same traffic-light
+            // strip, so the artwork lines up with where the middle column's content starts
+            // instead of sitting flush against the window's very top edge.
+            padding-top: root.unified-title-bar ? Theme.topbar-h + 20px : 20px;
             spacing: 8px;
 
             ArtworkView { art: root.now-playing-art; has-art: root.now-playing-has-art; width: 100%; size: Theme.panel-content-w; radius: 8px; }
@@ -1113,37 +1166,44 @@ export component MainWindow inherits Window {
                 window-drag-requested => { root.window-drag-requested(); }
             }
 
-            VerticalLayout {
+            // Plain geometry (`x`/`width`), not a `HorizontalLayout`, for the same reason as
+            // before (`§6` Stage 5 fix, carried into the layout pass below): `panel-shown` reads
+            // `root.width`, so a *layout* child whose width depends on `panel-shown` would feed
+            // this row's own preferred width back into `root`'s, and from there into
+            // `root.width` itself — a binding loop Slint 1.18 flags (and may panic on). Manual
+            // geometry never asks for a preferred size from its children, so it can't join that
+            // cycle. This row now holds the middle column (top bar + content, stacked) and the
+            // right panel side by side, both spanning its full height: the panel used to sit only
+            // below the top bar, but it must now run the whole height of the window down to the
+            // player bar, level with the top bar rather than starting under it (`§6` layout
+            // pass).
+            Rectangle {
                 horizontal-stretch: 1;
+                vertical-stretch: 1;
+                min-height: 0px;
 
-                TopBar {
-                    height: Theme.topbar-h;
-                    can-go-back: root.can-go-back;
-                    unified-title-bar: root.unified-title-bar;
-                    search-query <=> root.search-query;
-                    back-requested => { root.back-requested(); }
-                    open-files => { root.open-files(); }
-                    open-folder => { root.open-folder(); }
-                    search-edited(q) => { root.search-edited(q); }
-                    window-drag-requested => { root.window-drag-requested(); }
-                    window-zoom-requested => { root.window-zoom-requested(); }
-                }
+                middle-column := VerticalLayout {
+                    x: 0;
+                    y: 0;
+                    width: parent.width - (root.panel-shown ? Theme.panel-w : 0px);
+                    height: 100%;
 
-                // Plain geometry (`x`/`width`), not a `HorizontalLayout`: `panel-shown` reads
-                // `root.width`, so a *layout* child whose width depends on `panel-shown` would
-                // feed this row's own preferred width back into `root`'s, and from there into
-                // `root.width` itself — a binding loop Slint 1.18 flags (and may panic on).
-                // Manual geometry never asks for a preferred size from its children, so it can't
-                // join that cycle.
-                Rectangle {
-                    vertical-stretch: 1;
-                    min-height: 0px;
+                    TopBar {
+                        height: Theme.topbar-h;
+                        can-go-back: root.can-go-back;
+                        unified-title-bar: root.unified-title-bar;
+                        search-query <=> root.search-query;
+                        back-requested => { root.back-requested(); }
+                        open-files => { root.open-files(); }
+                        open-folder => { root.open-folder(); }
+                        search-edited(q) => { root.search-edited(q); }
+                        window-drag-requested => { root.window-drag-requested(); }
+                        window-zoom-requested => { root.window-zoom-requested(); }
+                    }
 
                     content-area := Rectangle {
-                        x: 0;
-                        y: 0;
-                        width: parent.width - (root.panel-shown ? Theme.panel-w : 0px);
-                        height: 100%;
+                        vertical-stretch: 1;
+                        min-height: 0px;
                         background: Theme.bg-content;
 
                         if root.is-library-view && root.library-empty: LibraryEmptyState {
@@ -1205,37 +1265,38 @@ export component MainWindow inherits Window {
                             title: root.unavailable-title;
                         }
                     }
+                }
 
-                    NowPlayingPanel {
-                        x: content-area.width;
-                        y: 0;
-                        width: root.panel-shown ? Theme.panel-w : 0px;
-                        height: 100%;
-                        visible: root.panel-shown;
-                        now-playing-key: root.now-playing-key;
-                        now-playing-title: root.now-playing-title;
-                        now-playing-artist: root.now-playing-artist;
-                        now-playing-album: root.now-playing-album;
-                        now-playing-year: root.now-playing-year;
-                        now-playing-genre: root.now-playing-genre;
-                        now-playing-badge: root.now-playing-badge;
-                        now-playing-art: root.now-playing-art;
-                        now-playing-has-art: root.now-playing-has-art;
-                        format-line: root.format-line;
-                        file-size-line: root.file-size-line;
-                        lyrics: root.lyrics;
-                        has-lyrics: root.has-lyrics;
-                        output-device-options <=> root.output-device-options;
-                        selected-output-index <=> root.selected-output-index;
-                        hog-mode-enabled <=> root.hog-mode-enabled;
-                        volume-detail: root.volume-detail;
-                        volume-available: root.volume-available;
-                        playback-status: root.playback-status;
-                        output-name: root.output-name;
-                        active-output-name: root.active-output-name;
-                        output-chosen(index) => { root.output-chosen(index); }
-                        hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
-                    }
+                NowPlayingPanel {
+                    x: middle-column.width;
+                    y: 0;
+                    width: root.panel-shown ? Theme.panel-w : 0px;
+                    height: 100%;
+                    visible: root.panel-shown;
+                    unified-title-bar: root.unified-title-bar;
+                    now-playing-key: root.now-playing-key;
+                    now-playing-title: root.now-playing-title;
+                    now-playing-artist: root.now-playing-artist;
+                    now-playing-album: root.now-playing-album;
+                    now-playing-year: root.now-playing-year;
+                    now-playing-genre: root.now-playing-genre;
+                    now-playing-badge: root.now-playing-badge;
+                    now-playing-art: root.now-playing-art;
+                    now-playing-has-art: root.now-playing-has-art;
+                    format-line: root.format-line;
+                    file-size-line: root.file-size-line;
+                    lyrics: root.lyrics;
+                    has-lyrics: root.has-lyrics;
+                    output-device-options <=> root.output-device-options;
+                    selected-output-index <=> root.selected-output-index;
+                    hog-mode-enabled <=> root.hog-mode-enabled;
+                    volume-detail: root.volume-detail;
+                    volume-available: root.volume-available;
+                    playback-status: root.playback-status;
+                    output-name: root.output-name;
+                    active-output-name: root.active-output-name;
+                    output-chosen(index) => { root.output-chosen(index); }
+                    hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
                 }
             }
         }

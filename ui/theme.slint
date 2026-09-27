@@ -1,4 +1,4 @@
-// Design tokens for the Orange-style UI shell (`§5.1`-`§5.4`). `Theme` holds every color, font
+// Design tokens for the UI shell (Orange-style layout, Lime icon palette: black ground, lime-green accent) (`§5.1`-`§5.4`). `Theme` holds every color, font
 // size and control size the UI uses; `Icons` exposes every SVG under `ui/icons/` as an `image` so
 // no component references a path directly. No `font-size:` literal is allowed outside this file —
 // every text element uses one of the `fs-*` tokens below (`§5.2`, enforced by
@@ -10,39 +10,41 @@
 
 export global Theme {
     // Colors (`§5.1`), sampled from the Orange reference screenshots.
-    out property <color> bg-sidebar: #312f2e;
-    out property <color> bg-content: #292827;
-    out property <color> bg-topbar: #373636;
-    out property <color> bg-header: #373636;
-    out property <color> bg-panel: #373636;
-    out property <color> table-header-bg: #312f2f;
-    out property <color> bg-bar: #2b2a2a;
-    out property <color> bg-field: #454342;
-    out property <color> bg-hover: #3a3837;
-    out property <color> bg-selected: #45423f;
-    out property <color> bg-nav-active: #534f4d;
-    out property <color> divider: #403e3d;
-    out property <color> text-primary: #f2f1f0;
-    out property <color> text-secondary: #aba7a4;
-    out property <color> text-tertiary: #7f7a77;
-    out property <color> accent: #ff8c4a;
-    out property <color> accent-icon: #ff8739;
-    out property <color> accent-hover: #ff9d63;
-    out property <color> accent-strong: #ff7f02;
-    out property <color> accent-soft: #4a3527;
-    out property <color> button-secondary: #464545;
-    out property <color> button-secondary-hover: #504f4f;
-    out property <color> slider-track: #4d4b4a;
-    out property <color> slider-track-disabled: #3a3837;
-    out property <color> knob: #f2f1f0;
-    out property <color> play-bg: #f2f1f0;
-    out property <color> play-bg-disabled: #6b6866;
-    out property <color> play-glyph: #2b2a2a;
-    out property <color> icon-transport: #e8e6e5;
+    out property <color> bg-sidebar: #121312;
+    out property <color> bg-content: #0e0e0e;
+    out property <color> bg-topbar: #161716;
+    out property <color> bg-header: #161716;
+    out property <color> bg-panel: #141514;
+    out property <color> table-header-bg: #151615;
+    out property <color> bg-bar: #111211;
+    out property <color> bg-field: #1f211f;
+    out property <color> bg-hover: #1b1d1b;
+    out property <color> bg-selected: #222522;
+    out property <color> bg-nav-active: #262a26;
+    out property <color> divider: #252825;
+    out property <color> text-primary: #f2f4f1;
+    out property <color> text-secondary: #a3a8a2;
+    out property <color> text-tertiary: #737872;
+    out property <color> accent: #8ef552;
+    out property <color> accent-icon: #9cf55a;
+    out property <color> accent-hover: #a9f86f;
+    out property <color> accent-strong: #bdf65a;
+    out property <color> accent-soft: #1f3318;
+    // Text and icons drawn on an accent fill; the lime accent is light, so dark ink keeps contrast.
+    out property <color> on-accent: #0e0e0e;
+    out property <color> button-secondary: #232623;
+    out property <color> button-secondary-hover: #2d312d;
+    out property <color> slider-track: #2e322e;
+    out property <color> slider-track-disabled: #1f221f;
+    out property <color> knob: #f2f4f1;
+    out property <color> play-bg: #f2f4f1;
+    out property <color> play-bg-disabled: #4a4f49;
+    out property <color> play-glyph: #0e0e0e;
+    out property <color> icon-transport: #e6e9e5;
     out property <color> icon-transport-hover: #ffffff;
-    out property <color> icon-transport-disabled: #5f5c5a;
-    out property <color> art-placeholder-bg: #4e4946;
-    out property <color> art-placeholder-icon: #7a7572;
+    out property <color> icon-transport-disabled: #535852;
+    out property <color> art-placeholder-bg: #1f221f;
+    out property <color> art-placeholder-icon: #4c524b;
 
     // Typography (`§5.2`).
     out property <length> fs-caption: 10px;
@@ -79,8 +81,14 @@ export global Theme {
     out property <length> tile-art: 176px;
     out property <length> tile-h: 234px;
     out property <length> page-pad: 28px;
-    out property <length> search-w: 300px;
-    out property <length> search-h: 30px;
+    // Top-bar search pill (`§6` layout pass: centered, wider, pill-shaped): `search-w` is the
+    // preferred/desired width, `search-w-min` is the floor it shrinks to before the available
+    // space between the back button (or the left edge) and the Open Files/Open Folder buttons
+    // runs out, and `search-h` is a little taller than the previous 30px box to read as a more
+    // prominent pill.
+    out property <length> search-w: 520px;
+    out property <length> search-w-min: 320px;
+    out property <length> search-h: 36px;
     // The right panel shows only when the window is at least this wide (`§5.3`).
     out property <length> panel-threshold: 1400px;
 }

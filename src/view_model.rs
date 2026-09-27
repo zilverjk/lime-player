@@ -1000,6 +1000,8 @@ mod ui_contract {
     /// drag `TouchArea` over that empty space, and `TopBar`'s doubles as a zoom trigger, matching
     /// a native macOS title bar. `main.rs` only ever sets `unified-title-bar` to `true` on macOS
     /// (every other platform keeps the default `false`, so none of this reserves space there).
+    /// The full-height right panel (`§6` layout pass) also forwards it, so its own top content
+    /// gets the matching top clearance instead of sitting flush against the window's top edge.
     #[test]
     fn unified_title_bar_reserves_traffic_light_space_and_is_draggable() {
         let sidebar = extract_component(APP_SLINT, "Sidebar");
@@ -1035,7 +1037,7 @@ mod ui_contract {
         assert!(main_window.contains("callback window-drag-requested();"));
         assert!(main_window.contains("callback window-zoom-requested();"));
         let unified_bindings = main_window.matches("unified-title-bar: root.unified-title-bar;").count();
-        assert_eq!(unified_bindings, 2, "both Sidebar and TopBar must forward MainWindow's unified-title-bar");
+        assert_eq!(unified_bindings, 3, "Sidebar, TopBar and NowPlayingPanel must all forward MainWindow's unified-title-bar");
     }
 
     /// `PlayerBar`'s `output-popup` `ComboBox` and `NowPlayingPanel`'s own `ComboBox` both end up
