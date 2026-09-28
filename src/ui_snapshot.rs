@@ -370,6 +370,59 @@ fn render_snapshots() {
         ui.window().hide().unwrap();
     }
 
+    // Scenario 1i: the dedicated Search view (`§3.4` "Search") with matches in every section —
+    // Songs (a plain, non-virtualized `TrackTable`), Albums (`AlbumGrid`) and Artists
+    // (`ArtistListRow`), each headed with its own count. The underlying view (Home) is left
+    // showing underneath: `search-active` alone decides what the content area renders, so this
+    // also doubles as a check that a view switch is never required to reach the Search view.
+    {
+        let window = new_window();
+        let ui = MainWindow::new().unwrap();
+        ui.set_view(View::Home);
+        ui.set_nav_view(View::Home);
+        ui.set_library_empty(false);
+        ui.set_search_query("nina".into());
+        ui.set_search_active(true);
+        ui.set_search_songs_header("Songs (4)".into());
+        ui.set_search_songs(ModelRc::new(VecModel::from(vec![
+            TrackRowData { hi_res: true, ..sample_row("song-1", "1", "Sunrise", "Warm Colors", "FLAC 24/96", "4:12") },
+            sample_row("song-2", "2", "Wide Open", "Wide Open", "FLAC 16/44.1", "3:58"),
+            sample_row("song-3", "3", "Nina's Theme", "Night Drive", "WavPack 24/96", "5:01"),
+            sample_row("song-4", "4", "Outro", "Warm Colors", "FLAC 16/44.1", "2:58"),
+        ])));
+        ui.set_search_albums_header("Albums (2)".into());
+        ui.set_search_albums(ModelRc::new(VecModel::from(vec![
+            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68]))),
+            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200]))),
+        ])));
+        ui.set_artists(ModelRc::new(VecModel::from(vec![sample_artist("Nina Path", "2 albums · 22 tracks")])));
+        ui.set_search_artists_header("Artists (1)".into());
+        ui.set_search_has_results(true);
+        ui.window().show().unwrap();
+        render_scenario(&window, &dir, "search-results");
+        ui.window().hide().unwrap();
+    }
+
+    // Scenario 1j: the Search view with no matches anywhere — the "No results for ..." `EmptyState`
+    // (distinct copy from a single unfiltered view's "No matches", `§3.4` "Search"), no section
+    // rendered at all.
+    {
+        let window = new_window();
+        let ui = MainWindow::new().unwrap();
+        ui.set_view(View::Home);
+        ui.set_nav_view(View::Home);
+        ui.set_library_empty(false);
+        ui.set_search_query("vinyl only".into());
+        ui.set_search_active(true);
+        ui.set_search_songs_header("Songs (0)".into());
+        ui.set_search_albums_header("Albums (0)".into());
+        ui.set_search_artists_header("Artists (0)".into());
+        ui.set_search_has_results(false);
+        ui.window().show().unwrap();
+        render_scenario(&window, &dir, "search-empty");
+        ui.window().hide().unwrap();
+    }
+
     // Scenario 2: Queue with 3 rows and a playing track (player bar + right panel), progress
     // ~40%, volume ~60%.
     {

@@ -14,7 +14,7 @@ export enum View {
     home, artists, albums, songs, browser, folders, recently-added, liked, statistics,
     recently-opened, scripts, favorites, new-playlist, queue, album-detail,
 }
-export enum TrackListKind { songs, recently-added, album, queue }
+export enum TrackListKind { songs, recently-added, album, queue, search }
 export enum AlbumAction { play, shuffle, add-to-queue, play-next }
 export enum ButtonKind { normal, large, chip }
 
@@ -309,6 +309,36 @@ export component AlbumGrid inherits Rectangle {
         data: album;
         opened(key) => { root.opened(key); }
     }
+}
+
+// An artist row: an icon, name and subtitle, and a click that opens the artist (`§5.7`). Shared by
+// `ArtistsView` and the dedicated Search view's own Artists section so the row markup exists once.
+export component ArtistListRow inherits Rectangle {
+    in property <ArtistRowData> data;
+    callback opened(string);
+    height: 52px;
+    border-radius: 6px;
+    background: row-touch.has-hover ? Theme.bg-hover : transparent;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 12px;
+        cross-axis-alignment: center;
+        Rectangle {
+            width: 36px;
+            height: 36px;
+            border-radius: 18px;
+            background: Theme.bg-field;
+            Icon { source: Icons.artists; size: 18px; tint: Theme.text-secondary; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text { text: root.data.name; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
+            Text { text: root.data.subtitle; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; }
+        }
+    }
+    row-touch := TouchArea { clicked => { root.opened(root.data.name); } }
 }
 
 export component TrackRow inherits Rectangle {

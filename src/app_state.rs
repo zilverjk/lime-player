@@ -147,15 +147,23 @@ impl NavEntry {
 
 /// Rust-owned navigation state (`§3.6`): the current view (with an optional artist filter or album
 /// key) and the sidebar highlight it was opened under, plus a back stack capped at
-/// `MAX_BACK_STACK` of the same pairs.
+/// `MAX_BACK_STACK` of the same pairs, and the live search box text (`§3.4` "Search").
+///
+/// The search query lives here, not as a separate piece of `main.rs` state, so that "leaving" the
+/// Search view — by sidebar navigation or by opening an album/artist from its results — and
+/// "returning to the view the user was on before searching" are both provably one thing: clearing
+/// `search_query` never touches `current`, and every navigation that pushes a new `current` also
+/// clears `search_query`, tested together below instead of relying on `main.rs` to keep two Rcs in
+/// step by hand.
 pub struct Navigation {
     current: NavEntry,
     back: Vec<NavEntry>,
+    search_query: String,
 }
 
 impl Default for Navigation {
     fn default() -> Self {
-        Self { current: NavEntry::plain(View::Home), back: Vec::new() }
+        Self { current: NavEntry::plain(View::Home), back: Vec::new(), search_query: String::new() }
     }
 }
 
@@ -184,27 +192,53 @@ impl Navigation {
         !self.back.is_empty()
     }
 
-    /// A sidebar click: clears the back stack and any artist filter, and moves both the current
-    /// view and the sidebar highlight (`§3.6`).
+    pub fn search_query(&self) -> &str {
+        &self.search_query
+    }
+
+    /// Whether the dedicated Search view should be showing (`§3.3`/`§3.4` "Search"): a non-empty
+    /// query once whitespace is trimmed off both ends, so pressing Space alone does not switch the
+    /// middle content away from whatever view was already current.
+    pub fn search_active(&self) -> bool {
+        !self.search_query.trim().is_empty()
+    }
+
+    /// Sets the live search box text (`search-edited`, `§3.4`). Never touches `current`: the view
+    /// underneath the Search view is exactly whatever it already was, so clearing the query later
+    /// (Esc, the pill's "x", or editing back down to empty) needs no separate "previous view" to
+    /// restore.
+    pub fn set_search_query(&mut self, query: String) {
+        self.search_query = query;
+    }
+
+    /// A sidebar click: clears the back stack, any artist filter and the search query, and moves
+    /// both the current view and the sidebar highlight (`§3.6`, `§3.4` "Search").
     pub fn nav_selected(&mut self, view: View) {
         self.back.clear();
         self.current = NavEntry::plain(view);
+        self.search_query.clear();
     }
 
     /// Opening an album: pushes the current entry and switches to album detail. `nav_view` is
     /// carried over unchanged, so the sidebar keeps highlighting wherever the album was opened
-    /// from, both now and after a later `back_requested` restores this entry (`§3.6`).
+    /// from, both now and after a later `back_requested` restores this entry (`§3.6`). Also clears
+    /// the search query (`§3.4` "Search"): opening an album from the Search view's results must
+    /// actually navigate there, not leave the Search view covering it because a non-empty query is
+    /// still active.
     pub fn album_opened(&mut self, key: &str) {
         let nav_view = self.current.nav_view;
         self.push_current();
         self.current = NavEntry { view: View::AlbumDetail, nav_view, artist_filter: None, album_key: Some(key.to_owned()) };
+        self.search_query.clear();
     }
 
     /// Opening an artist: pushes the current entry, switches to Albums filtered by `name`, and
-    /// highlights Artists in the sidebar (`§3.6`).
+    /// highlights Artists in the sidebar (`§3.6`). Also clears the search query, for the same
+    /// reason `album_opened` does (`§3.4` "Search").
     pub fn artist_opened(&mut self, name: &str) {
         self.push_current();
         self.current = NavEntry { view: View::Albums, nav_view: View::Artists, artist_filter: Some(name.to_owned()), album_key: None };
+        self.search_query.clear();
     }
 
     /// Restores the previous entry, sidebar highlight included (see the `NavEntry` doc comment).
@@ -629,6 +663,64 @@ mod tests {
         assert_eq!(nav.artist_filter(), Some("Nina"));
         assert_eq!(nav.nav_view(), View::Artists);
         assert!(nav.can_go_back());
+    }
+
+    #[test]
+    fn setting_and_clearing_the_search_query_does_not_change_the_current_view() {
+        let mut nav = Navigation::new();
+        nav.nav_selected(View::Albums);
+
+        nav.set_search_query("blue".to_owned());
+        assert!(nav.search_active());
+        assert_eq!(nav.view(), View::Albums, "typing a search must not itself change the view");
+
+        nav.set_search_query(String::new());
+        assert!(!nav.search_active());
+        assert_eq!(
+            nav.view(),
+            View::Albums,
+            "clearing the search (Esc or the pill's \"x\") must land back on exactly the view that was already current"
+        );
+    }
+
+    #[test]
+    fn search_active_ignores_a_whitespace_only_query() {
+        let mut nav = Navigation::new();
+
+        nav.set_search_query("   ".to_owned());
+
+        assert!(!nav.search_active(), "a whitespace-only query must not switch the content area to the Search view");
+    }
+
+    #[test]
+    fn nav_selected_clears_the_search_query() {
+        let mut nav = Navigation::new();
+        nav.set_search_query("blue".to_owned());
+        assert!(nav.search_active());
+
+        nav.nav_selected(View::Songs);
+
+        assert!(!nav.search_active(), "a sidebar click must clear the search box");
+        assert_eq!(nav.search_query(), "");
+    }
+
+    #[test]
+    fn album_opened_and_artist_opened_clear_the_search_query() {
+        let mut nav = Navigation::new();
+        nav.set_search_query("blue".to_owned());
+
+        nav.album_opened("aa:band\u{1f}double album");
+
+        assert!(
+            !nav.search_active(),
+            "opening an album from the Search view's own results must clear the search, or the Search view would keep \
+             covering the album it just navigated to"
+        );
+
+        nav.set_search_query("blue".to_owned());
+        nav.artist_opened("Nina");
+
+        assert!(!nav.search_active(), "opening an artist from search results must clear the search for the same reason");
     }
 
     #[test]

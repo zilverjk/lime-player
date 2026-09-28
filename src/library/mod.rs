@@ -130,26 +130,27 @@ impl Library {
     /// an album whose `album_artist` differs from its track artists would open an empty page.
     pub fn albums(&self, query: &str, artist_filter: Option<&str>) -> Vec<AlbumSummary> {
         let filter_key = artist_filter.map(str::trim).filter(|s| !s.is_empty()).map(str::to_lowercase);
+        let needle = normalize_for_search(query.trim());
         let mut summaries: Vec<AlbumSummary> = self
             .album_groups()
             .into_values()
             .filter_map(|tracks| {
                 let summary = summarize_album(&tracks);
-                let matches = match &filter_key {
+                let matches_artist = match &filter_key {
                     Some(key) => {
                         tracks.iter().any(|track| display_artist(track).to_lowercase() == *key)
                             || summary.artist.to_lowercase() == *key
                     }
                     None => true,
                 };
-                matches.then_some(summary)
+                // An album matches the search on any of its tracks' title/artist/album/album
+                // artist/genre (`track_matches_query`, `§...` Search), not just its own title or
+                // artist: a query that only hits a track's genre (e.g. "jazz") must still surface
+                // the album it belongs to, the same way `filtered_tracks` already works.
+                let matches_query = needle.is_empty() || tracks.iter().any(|track| track_matches_query(track, &needle));
+                (matches_artist && matches_query).then_some(summary)
             })
             .collect();
-        let query = query.trim();
-        if !query.is_empty() {
-            let needle = query.to_lowercase();
-            summaries.retain(|album| album.title.to_lowercase().contains(&needle) || album.artist.to_lowercase().contains(&needle));
-        }
         summaries.sort_by_cached_key(|album| (album.artist.to_lowercase(), album.title.to_lowercase()));
         summaries
     }
@@ -210,29 +211,33 @@ impl Library {
     /// keeping the first-seen casing as the display name; `albums(_, Some(name))` filters by the
     /// exact same lowercased key, so `album_count` always matches what that call returns.
     pub fn artists(&self, query: &str) -> Vec<ArtistSummary> {
+        let needle = normalize_for_search(query.trim());
         let mut display_names: HashMap<String, String> = HashMap::new();
         let mut track_counts: HashMap<String, usize> = HashMap::new();
         let mut albums_by_artist: HashMap<String, HashSet<String>> = HashMap::new();
+        // An artist matches once any of their tracks matches the search (`track_matches_query`),
+        // not just their own name: a genre- or album-only query (e.g. "jazz") must still surface
+        // the artists behind those tracks, the same broadening `albums` gets above.
+        let mut matched: HashSet<String> = HashSet::new();
         for track in &self.tracks {
             let artist = display_artist(track);
             let key = artist.to_lowercase();
             display_names.entry(key.clone()).or_insert(artist);
             *track_counts.entry(key.clone()).or_insert(0) += 1;
-            albums_by_artist.entry(key).or_default().insert(album_key(track));
+            albums_by_artist.entry(key.clone()).or_default().insert(album_key(track));
+            if needle.is_empty() || track_matches_query(track, &needle) {
+                matched.insert(key);
+            }
         }
         let mut summaries: Vec<ArtistSummary> = track_counts
             .into_iter()
+            .filter(|(key, _)| matched.contains(key))
             .map(|(key, track_count)| {
                 let album_count = albums_by_artist.get(&key).map(HashSet::len).unwrap_or(0);
                 let name = display_names.remove(&key).unwrap_or(key);
                 ArtistSummary { name, album_count, track_count }
             })
             .collect();
-        let query = query.trim();
-        if !query.is_empty() {
-            let needle = query.to_lowercase();
-            summaries.retain(|artist| artist.name.to_lowercase().contains(&needle));
-        }
         summaries.sort_by_key(|artist| artist.name.to_lowercase());
         summaries
     }
@@ -245,24 +250,52 @@ impl Library {
         groups
     }
 
-    /// A case-insensitive substring match on title, artist, album, album artist and genre; an
-    /// empty query matches every track (`§3.3` "Search").
+    /// A case- and accent-insensitive substring match on title, artist, album, album artist and
+    /// genre; an empty query matches every track (`§3.3` "Search").
     fn filtered_tracks(&self, query: &str) -> Vec<&TrackRecord> {
-        let query = query.trim();
-        if query.is_empty() {
+        let needle = normalize_for_search(query.trim());
+        if needle.is_empty() {
             return self.tracks.iter().collect();
         }
-        let needle = query.to_lowercase();
-        self.tracks
-            .iter()
-            .filter(|track| {
-                display_title(track).to_lowercase().contains(&needle)
-                    || display_artist(track).to_lowercase().contains(&needle)
-                    || display_album(track).to_lowercase().contains(&needle)
-                    || track.tags.album_artist.as_deref().unwrap_or_default().to_lowercase().contains(&needle)
-                    || track.tags.genre.as_deref().unwrap_or_default().to_lowercase().contains(&needle)
-            })
-            .collect()
+        self.tracks.iter().filter(|track| track_matches_query(track, &needle)).collect()
+    }
+}
+
+/// Whether `track` matches an already-normalized `needle` (see `normalize_for_search`) on title,
+/// artist, album, album artist or genre (`§3.3` "Search"). Shared by `filtered_tracks`, `albums`
+/// and `artists` so every section of the dedicated Search view (Songs/Albums/Artists) agrees on
+/// what counts as a match. An empty `needle` matches everything.
+fn track_matches_query(track: &TrackRecord, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    normalize_for_search(&display_title(track)).contains(needle)
+        || normalize_for_search(&display_artist(track)).contains(needle)
+        || normalize_for_search(&display_album(track)).contains(needle)
+        || track.tags.album_artist.as_deref().is_some_and(|s| normalize_for_search(s).contains(needle))
+        || track.tags.genre.as_deref().is_some_and(|s| normalize_for_search(s).contains(needle))
+}
+
+/// Lowercases and strips common Latin diacritics for case- and accent-insensitive search (`§3.3`
+/// "Search"): `"Música"` and `"musica"` normalize to the same string. Covers the accented Latin
+/// letters a real-world music library realistically carries (Spanish, Portuguese, French, German,
+/// Nordic); a character outside that table — including a whole different script (Cyrillic, CJK) —
+/// passes through unchanged, so search on those still works, just not accent-folded.
+pub fn normalize_for_search(input: &str) -> String {
+    input.to_lowercase().chars().map(strip_latin_diacritic).collect()
+}
+
+fn strip_latin_diacritic(c: char) -> char {
+    match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
+        'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
+        'ì' | 'í' | 'î' | 'ï' | 'ī' | 'ĭ' | 'į' => 'i',
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => 'o',
+        'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => 'u',
+        'ý' | 'ÿ' => 'y',
+        'ñ' | 'ń' => 'n',
+        'ç' | 'ć' | 'č' => 'c',
+        other => other,
     }
 }
 
@@ -473,6 +506,46 @@ mod tests {
         assert_eq!(library.songs("AMBIENT").len(), 1, "genre must be searched");
         assert!(library.songs("nonexistent").is_empty());
         assert_eq!(library.songs("").len(), 3);
+    }
+
+    #[test]
+    fn search_is_accent_insensitive_across_fields() {
+        let mut record = tags("Música Buena", "José", "Cumbia Fácil", Some("Álbum Artista"));
+        record.genre = Some("Salsa Romántica".into());
+        let library = library_with(vec![track("/music/a.flac", record, None, 0)]);
+
+        // Typing the plain-ASCII form must still find the accented tag, on every searched field.
+        assert_eq!(library.songs("musica").len(), 1, "title must match without the accent");
+        assert_eq!(library.songs("jose").len(), 1, "artist must match without the accent");
+        assert_eq!(library.songs("facil").len(), 1, "album must match without the accent");
+        assert_eq!(library.songs("album artista").len(), 1, "album artist must match without the accent");
+        assert_eq!(library.songs("romantica").len(), 1, "genre must match without the accent");
+        // And the reverse: typing an accent the tag doesn't need still matches, since both sides
+        // are folded the same way.
+        assert_eq!(library.songs("MÚSICA").len(), 1, "matching must also be case-insensitive on the accented form");
+    }
+
+    #[test]
+    fn albums_and_artists_search_broadens_to_any_track_field() {
+        // Neither the album title nor the artist name contains "jazz" — only the genre does — so
+        // `albums`/`artists` must fall back to a per-track match (`track_matches_query`), the same
+        // way `songs`/`filtered_tracks` already do, or a genre-only query would find no album/
+        // artist at all even though the matching tracks are right there in `songs`.
+        let mut jazzy = tags("Blue Skies", "Nina Session", "Warm Sessions", None);
+        jazzy.genre = Some("Jazz".into());
+        let other = tags("Other Song", "Someone Else", "Other Album", None);
+        let library = library_with(vec![
+            track("/music/a.flac", jazzy, None, 0),
+            track("/music/b.flac", other, None, 1),
+        ]);
+
+        let albums = library.albums("jazz", None);
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].title, "Warm Sessions");
+
+        let artists = library.artists("jazz");
+        assert_eq!(artists.len(), 1);
+        assert_eq!(artists[0].name, "Nina Session");
     }
 
     #[test]

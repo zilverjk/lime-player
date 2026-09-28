@@ -152,6 +152,14 @@ pub fn format_library_summary(count: usize, total_duration_ms: u64) -> String {
     format!("{song_word} · {time_part}")
 }
 
+/// A dedicated Search view section header (`§3.3` "Search"): `"Songs (12)"` once every match is
+/// shown, or `"Songs — Showing first 200 of 532"` once the section's cap (`SEARCH_SONGS_LIMIT`/
+/// `SEARCH_ALBUMS_LIMIT` in `view_model.rs`) truncates the match count — the count is never
+/// silently dropped.
+pub fn format_search_section_header(label: &str, shown: usize, total: usize) -> String {
+    if shown < total { format!("{label} \u{2014} Showing first {shown} of {total}") } else { format!("{label} ({total})") }
+}
+
 /// `mm:ss` (or `h:mm:ss` past an hour is not needed for playback position in this milestone;
 /// matches the pre-Stage-3 `format_playback_time` behavior exactly, tests included).
 pub fn format_clock(position_ms: u64) -> String {
@@ -352,6 +360,13 @@ mod tests {
             "Added 11 of 12 files · 1 could not be opened (foo.wv: hybrid WavPack is unsupported) \
              · 1 track's tags could not be read (bar.flac: unreadable tag block)"
         );
+    }
+
+    #[test]
+    fn search_section_header_reports_the_count_or_the_cap() {
+        assert_eq!(format_search_section_header("Songs", 12, 12), "Songs (12)");
+        assert_eq!(format_search_section_header("Songs", 200, 532), "Songs \u{2014} Showing first 200 of 532");
+        assert_eq!(format_search_section_header("Albums", 0, 0), "Albums (0)");
     }
 
     #[test]

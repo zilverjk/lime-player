@@ -219,9 +219,6 @@ fn main() -> Result<(), slint::PlatformError> {
     // path through the latter; both are recomputed together by `project_and_set_queue`.
     let queue_pending = Rc::new(RefCell::new(Vec::<QueueTrackSnapshot>::new()));
     let queue_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
-    // The current search box text (`§3.4` "search-edited... stores the query and marks the library
-    // dirty"). Read by every library projection alongside `Navigation`'s artist filter/album key.
-    let search_query = Rc::new(RefCell::new(String::new()));
     // Set by anything that can change a library projection's *inputs* in a way too frequent to
     // reproject inline (typing in the search box, a batch of scanner events): the 40 ms timer
     // reprojects once per tick while this is set, then clears it (`§3.4`). Navigation events
@@ -249,6 +246,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let songs_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
     let recent_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
     let album_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+    // The paths behind the dedicated Search view's (capped) Songs section rows, same idea as
+    // `songs_paths` above (`§3.4` "Search").
+    let search_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
 
     let window = MainWindow::new()?;
     // Drives `Sidebar`'s reserved 52 px traffic-light strip and `TopBar`'s title text (`ui/app.slint`
@@ -284,7 +284,13 @@ fn main() -> Result<(), slint::PlatformError> {
     window.set_hog_mode_enabled(preferences.borrow().hog_mode_enabled);
     set_device_model(&window, &output_devices.borrow());
     sync_navigation(&window, &navigation.borrow());
-    project_and_set_library(&window, &app_state.borrow(), &navigation.borrow(), &search_query.borrow(), &songs_paths, &recent_paths, &album_paths);
+    project_and_set_library(
+        &window,
+        &app_state.borrow(),
+        &navigation.borrow(),
+        navigation.borrow().search_query(),
+        LibraryViewPaths { songs: &songs_paths, recent: &recent_paths, album: &album_paths, search: &search_paths },
+    );
     let initial_index = preferences
         .borrow()
         .output_device_id
@@ -544,10 +550,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_nav_selected = Rc::clone(&navigation);
     let nav_selected_window = window.as_weak();
     let nav_selected_app_state = Rc::clone(&app_state);
-    let nav_selected_search_query = Rc::clone(&search_query);
     let nav_selected_songs_paths = Rc::clone(&songs_paths);
     let nav_selected_recent_paths = Rc::clone(&recent_paths);
     let nav_selected_album_paths = Rc::clone(&album_paths);
+    let nav_selected_search_paths = Rc::clone(&search_paths);
     window.on_nav_selected(move |view| {
         navigation_for_nav_selected.borrow_mut().nav_selected(view);
         if let Some(window) = nav_selected_window.upgrade() {
@@ -556,10 +562,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &nav_selected_app_state.borrow(),
                 &navigation_for_nav_selected.borrow(),
-                &nav_selected_search_query.borrow(),
-                &nav_selected_songs_paths,
-                &nav_selected_recent_paths,
-                &nav_selected_album_paths,
+                navigation_for_nav_selected.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &nav_selected_songs_paths,
+                    recent: &nav_selected_recent_paths,
+                    album: &nav_selected_album_paths,
+                    search: &nav_selected_search_paths,
+                },
             );
         }
     });
@@ -567,10 +576,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_back = Rc::clone(&navigation);
     let back_window = window.as_weak();
     let back_app_state = Rc::clone(&app_state);
-    let back_search_query = Rc::clone(&search_query);
     let back_songs_paths = Rc::clone(&songs_paths);
     let back_recent_paths = Rc::clone(&recent_paths);
     let back_album_paths = Rc::clone(&album_paths);
+    let back_search_paths = Rc::clone(&search_paths);
     window.on_back_requested(move || {
         navigation_for_back.borrow_mut().back_requested();
         if let Some(window) = back_window.upgrade() {
@@ -579,10 +588,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &back_app_state.borrow(),
                 &navigation_for_back.borrow(),
-                &back_search_query.borrow(),
-                &back_songs_paths,
-                &back_recent_paths,
-                &back_album_paths,
+                navigation_for_back.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &back_songs_paths,
+                    recent: &back_recent_paths,
+                    album: &back_album_paths,
+                    search: &back_search_paths,
+                },
             );
         }
     });
@@ -590,10 +602,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_album_opened = Rc::clone(&navigation);
     let album_opened_window = window.as_weak();
     let album_opened_app_state = Rc::clone(&app_state);
-    let album_opened_search_query = Rc::clone(&search_query);
     let album_opened_songs_paths = Rc::clone(&songs_paths);
     let album_opened_recent_paths = Rc::clone(&recent_paths);
     let album_opened_album_paths = Rc::clone(&album_paths);
+    let album_opened_search_paths = Rc::clone(&search_paths);
     window.on_album_opened(move |key| {
         navigation_for_album_opened.borrow_mut().album_opened(&key);
         if let Some(window) = album_opened_window.upgrade() {
@@ -602,10 +614,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &album_opened_app_state.borrow(),
                 &navigation_for_album_opened.borrow(),
-                &album_opened_search_query.borrow(),
-                &album_opened_songs_paths,
-                &album_opened_recent_paths,
-                &album_opened_album_paths,
+                navigation_for_album_opened.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &album_opened_songs_paths,
+                    recent: &album_opened_recent_paths,
+                    album: &album_opened_album_paths,
+                    search: &album_opened_search_paths,
+                },
             );
         }
     });
@@ -613,10 +628,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_artist_opened = Rc::clone(&navigation);
     let artist_opened_window = window.as_weak();
     let artist_opened_app_state = Rc::clone(&app_state);
-    let artist_opened_search_query = Rc::clone(&search_query);
     let artist_opened_songs_paths = Rc::clone(&songs_paths);
     let artist_opened_recent_paths = Rc::clone(&recent_paths);
     let artist_opened_album_paths = Rc::clone(&album_paths);
+    let artist_opened_search_paths = Rc::clone(&search_paths);
     window.on_artist_opened(move |name| {
         navigation_for_artist_opened.borrow_mut().artist_opened(&name);
         if let Some(window) = artist_opened_window.upgrade() {
@@ -625,10 +640,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &artist_opened_app_state.borrow(),
                 &navigation_for_artist_opened.borrow(),
-                &artist_opened_search_query.borrow(),
-                &artist_opened_songs_paths,
-                &artist_opened_recent_paths,
-                &artist_opened_album_paths,
+                navigation_for_artist_opened.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &artist_opened_songs_paths,
+                    recent: &artist_opened_recent_paths,
+                    album: &artist_opened_album_paths,
+                    search: &artist_opened_search_paths,
+                },
             );
         }
     });
@@ -639,10 +657,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let now_playing_album_window = window.as_weak();
     let now_playing_album_app_state = Rc::clone(&app_state);
     let now_playing_album_path = Rc::clone(&now_playing_path);
-    let now_playing_album_search_query = Rc::clone(&search_query);
     let now_playing_album_songs_paths = Rc::clone(&songs_paths);
     let now_playing_album_recent_paths = Rc::clone(&recent_paths);
     let now_playing_album_album_paths = Rc::clone(&album_paths);
+    let now_playing_album_search_paths = Rc::clone(&search_paths);
     window.on_now_playing_album_requested(move || {
         let key = now_playing_album_path
             .borrow()
@@ -656,21 +674,30 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &now_playing_album_app_state.borrow(),
                 &navigation_for_now_playing_album.borrow(),
-                &now_playing_album_search_query.borrow(),
-                &now_playing_album_songs_paths,
-                &now_playing_album_recent_paths,
-                &now_playing_album_album_paths,
+                navigation_for_now_playing_album.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &now_playing_album_songs_paths,
+                    recent: &now_playing_album_recent_paths,
+                    album: &now_playing_album_album_paths,
+                    search: &now_playing_album_search_paths,
+                },
             );
         }
     });
 
-    // `search-edited` (`§3.4`): stores the query and marks the library dirty; the 40 ms timer
-    // reprojects at most once per tick, batching fast typing the same way a scan batch is batched.
-    let search_query_for_edit = Rc::clone(&search_query);
+    // `search-edited` (`§3.4`): stores the query in `Navigation` and marks the library dirty; the
+    // 40 ms timer reprojects at most once per tick, batching fast typing the same way a scan batch
+    // is batched. `search-active` is pushed to the window immediately, not left for that tick,
+    // so the Search view swaps in/out on every keystroke instead of trailing it by up to 40 ms.
+    let navigation_for_search_edited = Rc::clone(&navigation);
+    let search_edited_window = window.as_weak();
     let library_dirty_for_search = Rc::clone(&library_dirty);
     window.on_search_edited(move |query| {
-        *search_query_for_edit.borrow_mut() = query.to_string();
+        navigation_for_search_edited.borrow_mut().set_search_query(query.to_string());
         library_dirty_for_search.set(true);
+        if let Some(window) = search_edited_window.upgrade() {
+            window.set_search_active(navigation_for_search_edited.borrow().search_active());
+        }
     });
 
     // `shuffle-all` (Home, `§3.7`): shuffles the whole library, not just one album.
@@ -692,13 +719,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // `track-activated` (`§3.7`): every kind maps a clicked row to the suffix of prepared tracks
     // starting there, through whichever path list backs that table (`songs_paths`/`recent_paths`/
-    // `album_paths`/`queue_paths`), then replaces the queue with it.
+    // `album_paths`/`queue_paths`/`search_paths`), then replaces the queue with it.
     let player_for_track_activated = Arc::clone(&audio_player);
     let app_state_for_track_activated = Rc::clone(&app_state);
     let queue_paths_for_activated = Rc::clone(&queue_paths);
     let songs_paths_for_activated = Rc::clone(&songs_paths);
     let recent_paths_for_activated = Rc::clone(&recent_paths);
     let album_paths_for_activated = Rc::clone(&album_paths);
+    let search_paths_for_activated = Rc::clone(&search_paths);
     window.on_track_activated(move |kind, index| {
         let Ok(index) = usize::try_from(index) else { return; };
         let paths = match kind {
@@ -706,6 +734,7 @@ fn main() -> Result<(), slint::PlatformError> {
             TrackListKind::Songs => &songs_paths_for_activated,
             TrackListKind::RecentlyAdded => &recent_paths_for_activated,
             TrackListKind::Album => &album_paths_for_activated,
+            TrackListKind::Search => &search_paths_for_activated,
         };
         let tracks = prepared_suffix(&app_state_for_track_activated.borrow().library, &paths.borrow(), index);
         // The UI never sends an empty `ReplaceQueue`: the worker would just ignore it, but a path
@@ -739,11 +768,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let event_queue_pending = Rc::clone(&queue_pending);
     let event_queue_paths = Rc::clone(&queue_paths);
     let event_navigation = Rc::clone(&navigation);
-    let event_search_query = Rc::clone(&search_query);
     let event_library_dirty = Rc::clone(&library_dirty);
     let event_songs_paths = Rc::clone(&songs_paths);
     let event_recent_paths = Rc::clone(&recent_paths);
     let event_album_paths = Rc::clone(&album_paths);
+    let event_search_paths = Rc::clone(&search_paths);
     let _event_timer = Timer::default();
     _event_timer.start(TimerMode::Repeated, Duration::from_millis(40), move || {
         // `§3.4`: "projections run once per dirty flag, so large scans are batched." Every event
@@ -1064,10 +1093,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &event_app_state.borrow(),
                 &event_navigation.borrow(),
-                &event_search_query.borrow(),
-                &event_songs_paths,
-                &event_recent_paths,
-                &event_album_paths,
+                event_navigation.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &event_songs_paths,
+                    recent: &event_recent_paths,
+                    album: &event_album_paths,
+                    search: &event_search_paths,
+                },
             );
             event_library_dirty.set(false);
             event_library_last_projected.set(Some(Instant::now()));
@@ -1137,21 +1169,26 @@ fn project_and_set_queue(
     *queue_paths.borrow_mut() = paths;
 }
 
-/// Re-projects every library-driven view (Home, Albums, Artists, Songs, Recently Added and album
-/// detail) from `app_state`, `navigation`'s current artist filter/album key, and `query` (`§6`
-/// Stage 6, `view_model::project_library`), and records each table's visible-path list so
-/// `on_track_activated` can map a clicked row back to a path. Called once at startup, immediately
-/// after every navigation mutation that can change `artist_filter`/`album_key`, and once per 40 ms
-/// tick while `library_dirty` is set (search edits and scanner events, `§3.4`).
-fn project_and_set_library(
-    window: &MainWindow,
-    app_state: &AppState,
-    navigation: &Navigation,
-    query: &str,
-    songs_paths: &Rc<RefCell<Vec<PathBuf>>>,
-    recent_paths: &Rc<RefCell<Vec<PathBuf>>>,
-    album_paths: &Rc<RefCell<Vec<PathBuf>>>,
-) {
+/// The path lists behind every library-driven table's currently rendered rows, in the same order
+/// as those rows, so `on_track_activated` can map a clicked row back to `library.prepared(path)`
+/// (`§3.4`/`§3.7`). Bundled into one struct, not four separate parameters, so
+/// `project_and_set_library` stays under clippy's `too_many_arguments` threshold now that the
+/// dedicated Search view added a fourth list alongside `songs`/`recent`/`album`.
+struct LibraryViewPaths<'a> {
+    songs: &'a Rc<RefCell<Vec<PathBuf>>>,
+    recent: &'a Rc<RefCell<Vec<PathBuf>>>,
+    album: &'a Rc<RefCell<Vec<PathBuf>>>,
+    search: &'a Rc<RefCell<Vec<PathBuf>>>,
+}
+
+/// Re-projects every library-driven view (Home, Albums, Artists, Songs, Recently Added, album
+/// detail and the dedicated Search view) from `app_state`, `navigation`'s current artist
+/// filter/album key/search query, and `query` (`§6` Stage 6, `view_model::project_library`), and
+/// records each table's visible-path list so `on_track_activated` can map a clicked row back to a
+/// path. Called once at startup, immediately after every navigation mutation that can change
+/// `artist_filter`/`album_key`/the search query, and once per 40 ms tick while `library_dirty` is
+/// set (search edits and scanner events, `§3.4`).
+fn project_and_set_library(window: &MainWindow, app_state: &AppState, navigation: &Navigation, query: &str, paths: LibraryViewPaths) {
     let projection = project_library(app_state, query, navigation.artist_filter(), navigation.album_key());
     window.set_library_empty(projection.library_empty);
     window.set_jump_back_albums(ModelRc::new(VecModel::from_iter(projection.jump_back_albums)));
@@ -1164,9 +1201,16 @@ fn project_and_set_library(
     window.set_recent_summary(projection.recent_summary.into());
     window.set_album_header(projection.album_header);
     window.set_album_tracks(ModelRc::new(VecModel::from_iter(projection.album_tracks)));
-    *songs_paths.borrow_mut() = projection.songs_paths;
-    *recent_paths.borrow_mut() = projection.recent_paths;
-    *album_paths.borrow_mut() = projection.album_paths;
+    window.set_search_songs(ModelRc::new(VecModel::from_iter(projection.search.songs)));
+    window.set_search_songs_header(projection.search.songs_header.into());
+    window.set_search_albums(ModelRc::new(VecModel::from_iter(projection.search.albums)));
+    window.set_search_albums_header(projection.search.albums_header.into());
+    window.set_search_artists_header(projection.search.artists_header.into());
+    window.set_search_has_results(projection.search.has_results);
+    *paths.songs.borrow_mut() = projection.songs_paths;
+    *paths.recent.borrow_mut() = projection.recent_paths;
+    *paths.album.borrow_mut() = projection.album_paths;
+    *paths.search.borrow_mut() = projection.search.songs_paths;
 }
 
 /// `TrackRecord` -> `PreparedTrack`, for the album/library-wide actions (`§3.7` Album Play/Shuffle/
@@ -1183,13 +1227,18 @@ fn shuffle_seed() -> u64 {
 }
 
 /// Applies the `§3.6` navigation state to the handful of Slint properties it drives. Called after
-/// every `Navigation` mutation.
+/// every `Navigation` mutation, including the ones that clear the search query (`nav_selected`,
+/// `album_opened`, `artist_opened`, `§3.4` "Search") — pushing `search-query`/`search-active` here
+/// too keeps the search box and the dedicated Search view in lockstep with `Navigation` itself,
+/// instead of `main.rs` having to remember to clear them separately at each call site.
 fn sync_navigation(window: &MainWindow, navigation: &Navigation) {
     window.set_view(navigation.view());
     window.set_nav_view(navigation.nav_view());
     window.set_can_go_back(navigation.can_go_back());
     window.set_artist_filter(navigation.artist_filter().unwrap_or_default().into());
     window.set_unavailable_title(unavailable_label(navigation.view()).into());
+    window.set_search_query(navigation.search_query().into());
+    window.set_search_active(navigation.search_active());
 }
 
 fn set_playback_status(

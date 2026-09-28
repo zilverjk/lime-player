@@ -8,8 +8,8 @@
 import { ComboBox, Palette, ScrollView } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 import {
-    ActionButton, AlbumGrid, ArtworkView, Badge, ButtonKind, EmptyState, Icon, IconButton, NavItem, Scrubber, SectionLabel,
-    TrackTable, VDivider, VirtualizedTrackTable,
+    ActionButton, AlbumGrid, ArtistListRow, ArtworkView, Badge, ButtonKind, EmptyState, Icon, IconButton, NavItem, Scrubber,
+    SectionLabel, TrackTable, VDivider, VirtualizedTrackTable,
     View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData,
 } from "widgets.slint";
 
@@ -181,6 +181,19 @@ component TopBar inherits Rectangle {
                     height: 100%;
                     vertical-alignment: center;
                     edited => { root.search-edited(self.text); }
+                    // Esc clears the query (`§3.4` "Search"), same as the pill's own "x" button
+                    // below: `self.text` and `root.search-edited` both need to be told directly —
+                    // assigning `self.text` alone updates the two-way-bound `root.search-query` but
+                    // never fires `edited`, which is what actually tells Rust to drop the query and
+                    // reproject back to whatever view was already current.
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            self.text = "";
+                            root.search-edited("");
+                            return accept;
+                        }
+                        return reject;
+                    }
                 }
                 if root.search-query == "": Text {
                     text: "Search tracks, albums, artists…";
@@ -191,6 +204,17 @@ component TopBar inherits Rectangle {
                     vertical-alignment: center;
                 }
                 if root.search-query == "": TouchArea { clicked => { search-input.focus(); } }
+            }
+            // The pill's clear "x" (`§3.4` "Search"): only shown once there is something to clear,
+            // same trigger as the placeholder above being hidden.
+            if root.search-query != "": IconButton {
+                source: Icons.close;
+                tooltip: "Clear search";
+                clicked => {
+                    search-input.text = "";
+                    root.search-edited("");
+                    search-input.focus();
+                }
             }
         }
     }
@@ -872,30 +896,65 @@ component ArtistsView inherits Rectangle {
                 title: "No matches";
                 body: "Nothing matches \u{201c}" + root.search-query + "\u{201d}.";
             }
-            for artist[i] in root.artists: Rectangle {
-                height: 52px;
-                border-radius: 6px;
-                background: row-touch.has-hover ? Theme.bg-hover : transparent;
-                HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
-                    spacing: 12px;
-                    cross-axis-alignment: center;
-                    Rectangle {
-                        width: 36px;
-                        height: 36px;
-                        border-radius: 18px;
-                        background: Theme.bg-field;
-                        Icon { source: Icons.artists; size: 18px; tint: Theme.text-secondary; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        spacing: 2px;
-                        Text { text: artist.name; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
-                        Text { text: artist.subtitle; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; }
-                    }
+            for artist[i] in root.artists: ArtistListRow {
+                data: artist;
+                opened(name) => { root.opened(name); }
+            }
+        }
+    }
+}
+
+// The dedicated Search view (`§3.4` "Search"), shown instead of whatever `root.view` names
+// whenever `search-active` is true: Songs (the plain `TrackTable`, not `VirtualizedTrackTable` —
+// this view shares one page `ScrollView` across all three sections, so no section can own its own
+// `ListView`; `songs` is already capped in Rust for exactly this reason), Albums (the same
+// `AlbumGrid` the Albums page uses) and Artists (`ArtistListRow`, shared with `ArtistsView`). A
+// section with no rows is hidden entirely rather than showing an empty table/grid/list under a
+// "(0)" header. `has-results` false means every section was empty, which is the only time the
+// "No results" `EmptyState` shows.
+component SearchResultsView inherits Rectangle {
+    in property <string> search-query: "";
+    in property <[TrackRowData]> songs: [];
+    in property <string> songs-header: "";
+    in property <string> now-playing-key: "";
+    in property <[AlbumCardData]> albums: [];
+    in property <string> albums-header: "";
+    in property <[ArtistRowData]> artists: [];
+    in property <string> artists-header: "";
+    in property <bool> has-results: false;
+    callback activated(int);
+    callback album-opened(string);
+    callback artist-opened(string);
+    background: Theme.bg-content;
+    ScrollView {
+        vertical-scrollbar-policy: as-needed;
+        horizontal-scrollbar-policy: always-off;
+        VerticalLayout {
+            alignment: start;
+            padding: Theme.page-pad;
+            spacing: 28px;
+            if !root.has-results: EmptyState {
+                icon: Icons.search;
+                title: "No results";
+                body: "No results for \u{201c}" + root.search-query + "\u{201d}.";
+            }
+            if root.songs.length > 0: VerticalLayout {
+                spacing: 12px;
+                Text { text: root.songs-header; font-size: Theme.fs-section; font-weight: 700; color: Theme.text-primary; }
+                TrackTable { rows: root.songs; now-playing-key: root.now-playing-key; show-format: true; activated(i) => { root.activated(i); } }
+            }
+            if root.albums.length > 0: VerticalLayout {
+                spacing: 12px;
+                Text { text: root.albums-header; font-size: Theme.fs-section; font-weight: 700; color: Theme.text-primary; }
+                AlbumGrid { albums: root.albums; opened(key) => { root.album-opened(key); } }
+            }
+            if root.artists.length > 0: VerticalLayout {
+                spacing: 12px;
+                Text { text: root.artists-header; font-size: Theme.fs-section; font-weight: 700; color: Theme.text-primary; }
+                for artist[i] in root.artists: ArtistListRow {
+                    data: artist;
+                    opened(name) => { root.artist-opened(name); }
                 }
-                row-touch := TouchArea { clicked => { root.opened(artist.name); } }
             }
         }
     }
@@ -1046,6 +1105,12 @@ export component MainWindow inherits Window {
     in-out property <View> nav-view: View.home;
     in property <bool> can-go-back: false;
     in-out property <string> search-query: "";
+    // Whether the dedicated Search view should cover the middle content (`§3.4` "Search"): Rust
+    // derives this from the trimmed `search-query` (`Navigation::search_active`) and pushes it
+    // here, rather than the view trimming `search-query` itself — Slint's string type has no
+    // `.trim()`. `content-area` below gates every other view on `!root.search-active`, so it is
+    // the only thing that ever changes which view is showing while a search is active.
+    in property <bool> search-active: false;
 
     // Window chrome (`§3.5`, `§6` Stage 5b). `main.rs` sets this to `true` only on macOS, after
     // installing `slint::BackendSelector::with_winit_window_attributes_hook` (transparent,
@@ -1069,6 +1134,18 @@ export component MainWindow inherits Window {
     in property <string> recent-summary: "";
     in property <AlbumHeaderData> album-header;
     in property <string> artist-filter: "";
+
+    // The dedicated Search view's own data (`§3.4` "Search"): Songs/Albums are already capped, and
+    // each section's header string already carries its count (or a "Showing first N of M" note
+    // once capped) from `format_search_section_header` — the view has no formatting of its own to
+    // do. Artists reuses `artists` above (query-matched, uncapped, same as the standalone Artists
+    // page): the two pages never render at the same time, so one field can serve both.
+    in property <[TrackRowData]> search-songs: [];
+    in property <string> search-songs-header: "";
+    in property <[AlbumCardData]> search-albums: [];
+    in property <string> search-albums-header: "";
+    in property <string> search-artists-header: "";
+    in property <bool> search-has-results: false;
 
     // Queue (`§3.5`).
     in property <TrackRowData> queue-current;
@@ -1206,10 +1283,33 @@ export component MainWindow inherits Window {
                         min-height: 0px;
                         background: Theme.bg-content;
 
-                        if root.is-library-view && root.library-empty: LibraryEmptyState {
+                        // `search-active` takes priority over every other branch below, including
+                        // the empty-library one: typing a query is what the user asked for right
+                        // now, so it always wins the middle content regardless of which `view` or
+                        // library state is underneath it (`§3.4` "Search"). Every other branch is
+                        // guarded with `!root.search-active` in turn, so exactly one ever renders —
+                        // and since none of them ever changes `view`/`nav-view` themselves, clearing
+                        // the search (Esc, the pill's "x", or editing back to empty) lands back on
+                        // whichever one was already current with no separate "previous view" state
+                        // to restore.
+                        if root.is-library-view && root.library-empty && !root.search-active: LibraryEmptyState {
                             open-files => { root.open-files(); }
                         }
-                        if root.view == View.home && !root.library-empty: HomeView {
+                        if root.search-active: SearchResultsView {
+                            search-query: root.search-query;
+                            songs: root.search-songs;
+                            songs-header: root.search-songs-header;
+                            now-playing-key: root.now-playing-key;
+                            albums: root.search-albums;
+                            albums-header: root.search-albums-header;
+                            artists: root.artists;
+                            artists-header: root.search-artists-header;
+                            has-results: root.search-has-results;
+                            activated(i) => { root.track-activated(TrackListKind.search, i); }
+                            album-opened(key) => { root.album-opened(key); }
+                            artist-opened(name) => { root.artist-opened(name); }
+                        }
+                        if !root.search-active && root.view == View.home && !root.library-empty: HomeView {
                             jump-back-albums: root.jump-back-albums;
                             recent-albums: root.recent-albums;
                             search-query: root.search-query;
@@ -1217,18 +1317,18 @@ export component MainWindow inherits Window {
                             shuffle-all => { root.shuffle-all(); }
                             show-all-albums => { root.nav-selected(View.albums); }
                         }
-                        if root.view == View.albums && !root.library-empty: AlbumsView {
+                        if !root.search-active && root.view == View.albums && !root.library-empty: AlbumsView {
                             albums: root.albums;
                             artist-filter: root.artist-filter;
                             search-query: root.search-query;
                             opened(key) => { root.album-opened(key); }
                         }
-                        if root.view == View.artists && !root.library-empty: ArtistsView {
+                        if !root.search-active && root.view == View.artists && !root.library-empty: ArtistsView {
                             artists: root.artists;
                             search-query: root.search-query;
                             opened(name) => { root.artist-opened(name); }
                         }
-                        if root.view == View.songs && !root.library-empty: TrackListPage {
+                        if !root.search-active && root.view == View.songs && !root.library-empty: TrackListPage {
                             hero: "Songs";
                             summary: root.songs-summary;
                             rows: root.songs;
@@ -1236,7 +1336,7 @@ export component MainWindow inherits Window {
                             search-query: root.search-query;
                             activated(i) => { root.track-activated(TrackListKind.songs, i); }
                         }
-                        if root.view == View.recently-added && !root.library-empty: TrackListPage {
+                        if !root.search-active && root.view == View.recently-added && !root.library-empty: TrackListPage {
                             hero: "Recently Added";
                             summary: root.recent-summary;
                             rows: root.recent-songs;
@@ -1244,7 +1344,7 @@ export component MainWindow inherits Window {
                             search-query: root.search-query;
                             activated(i) => { root.track-activated(TrackListKind.recently-added, i); }
                         }
-                        if root.view == View.album-detail: AlbumDetailView {
+                        if !root.search-active && root.view == View.album-detail: AlbumDetailView {
                             header: root.album-header;
                             tracks: root.album-tracks;
                             now-playing-key: root.now-playing-key;
@@ -1252,7 +1352,7 @@ export component MainWindow inherits Window {
                             action(action) => { root.album-action(root.album-header.key, action); }
                             activated(i) => { root.track-activated(TrackListKind.album, i); }
                         }
-                        if root.view == View.queue: QueueView {
+                        if !root.search-active && root.view == View.queue: QueueView {
                             queue-current: root.queue-current;
                             has-queue-current: root.has-queue-current;
                             queue-rows: root.queue-rows;
@@ -1260,7 +1360,7 @@ export component MainWindow inherits Window {
                             now-playing-key: root.now-playing-key;
                             track-activated(i) => { root.track-activated(TrackListKind.queue, i); }
                         }
-                        if !root.is-library-view && root.view != View.queue && root.view != View.album-detail: UnavailableView {
+                        if !root.search-active && !root.is-library-view && root.view != View.queue && root.view != View.album-detail: UnavailableView {
                             icon: root.unavailable-icon;
                             title: root.unavailable-title;
                         }

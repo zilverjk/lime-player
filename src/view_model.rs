@@ -10,7 +10,8 @@ use slint::Image;
 use crate::app_state::AppState;
 use crate::audio::{AudioInfo, AudioPlayer, PreparedTrack, QueueTrackSnapshot};
 use crate::library::format::{
-    format_album_card_subtitle, format_album_meta, format_badge, format_clock, format_library_summary, is_hi_res,
+    format_album_card_subtitle, format_album_meta, format_badge, format_clock, format_library_summary, format_search_section_header,
+    is_hi_res,
 };
 use crate::library::{AlbumSummary, ArtistSummary, Library, TrackRecord, display_album, display_artist, display_title, shuffled};
 use crate::{AlbumAction, AlbumCardData, AlbumHeaderData, ArtistRowData, TrackRowData};
@@ -200,6 +201,15 @@ fn total_known_duration_ms(records: &[&TrackRecord]) -> u64 {
 /// how many art-cache lookups it does) regardless of library size.
 const RECENT_ALBUMS_LIMIT: usize = 24;
 
+/// The dedicated Search view's Songs section renders through the plain, non-virtualized
+/// `TrackTable` (it shares one `ScrollView` with the Albums/Artists sections below it, so it
+/// cannot own a `ListView` the way `VirtualizedTrackTable` does), so its row count must stay
+/// bounded regardless of library size (`§3.3` "Search").
+const SEARCH_SONGS_LIMIT: usize = 200;
+/// The Search view's Albums section uses the same uncapped `AlbumGrid` as the Albums page, so this
+/// bounds how many `AlbumCardData`/art-cache lookups a broad query builds (`§3.3` "Search").
+const SEARCH_ALBUMS_LIMIT: usize = 48;
+
 /// Every library-driven view's data in one pass (`§6` Stage 6 step 2, "batch projection"): albums,
 /// artists and songs filtered by `query` (an empty query matches everything, `§3.3` "Search"),
 /// their newest-first "Recently Added" variants, the "Jump back in" shelf, and the current
@@ -221,6 +231,23 @@ pub struct LibraryProjection {
     pub album_header: AlbumHeaderData,
     pub album_tracks: Vec<TrackRowData>,
     pub album_paths: Vec<PathBuf>,
+    pub search: SearchProjection,
+}
+
+/// The dedicated Search view's data (`§3.3` "Search"): Songs/Albums capped and headed with a
+/// count (or a "Showing first N of M" note once the cap truncates them, never a silent drop —
+/// `format_search_section_header`); Artists reuses the same uncapped, query-matched rows the
+/// standalone Artists page shows (`LibraryProjection::artists`), so no separate field is needed
+/// here beyond its own header. `has_results` is false only when all three sections are empty,
+/// driving the view's "No results for ..." empty state.
+pub struct SearchProjection {
+    pub songs: Vec<TrackRowData>,
+    pub songs_paths: Vec<PathBuf>,
+    pub songs_header: String,
+    pub albums: Vec<AlbumCardData>,
+    pub albums_header: String,
+    pub artists_header: String,
+    pub has_results: bool,
 }
 
 pub fn project_library(state: &AppState, query: &str, artist_filter: Option<&str>, album_key: Option<&str>) -> LibraryProjection {
@@ -230,7 +257,7 @@ pub fn project_library(state: &AppState, query: &str, artist_filter: Option<&str
     let recent_albums =
         library.albums_recent(query).iter().take(RECENT_ALBUMS_LIMIT).map(|album| build_album_card(album, state)).collect();
     let jump_back_albums = project_jump_back_albums(state, query);
-    let artists = library.artists(query).iter().map(build_artist_row).collect();
+    let artists: Vec<ArtistRowData> = library.artists(query).iter().map(build_artist_row).collect();
 
     let song_records = library.songs(query);
     let (songs, songs_paths) = project_song_rows(&song_records);
@@ -249,6 +276,32 @@ pub fn project_library(state: &AppState, query: &str, artist_filter: Option<&str
         None => (AlbumHeaderData::default(), Vec::new(), Vec::new()),
     };
 
+    // The Search view ignores `artist_filter` deliberately: it always searches the whole library,
+    // never scoped to whatever artist the Albums page happened to be filtered by when the user
+    // started typing (`§3.3` "Search").
+    let search_song_total = song_records.len();
+    let (search_songs, search_songs_paths) = project_song_rows(&song_records[..song_records.len().min(SEARCH_SONGS_LIMIT)]);
+    let search_songs_header = format_search_section_header("Songs", search_songs.len(), search_song_total);
+
+    let search_album_summaries = library.albums(query, None);
+    let search_album_total = search_album_summaries.len();
+    let search_albums: Vec<AlbumCardData> =
+        search_album_summaries.iter().take(SEARCH_ALBUMS_LIMIT).map(|album| build_album_card(album, state)).collect();
+    let search_albums_header = format_search_section_header("Albums", search_albums.len(), search_album_total);
+
+    let search_artists_header = format_search_section_header("Artists", artists.len(), artists.len());
+    let search_has_results = search_song_total > 0 || search_album_total > 0 || !artists.is_empty();
+
+    let search = SearchProjection {
+        songs: search_songs,
+        songs_paths: search_songs_paths,
+        songs_header: search_songs_header,
+        albums: search_albums,
+        albums_header: search_albums_header,
+        artists_header: search_artists_header,
+        has_results: search_has_results,
+    };
+
     LibraryProjection {
         library_empty: library.is_empty(),
         jump_back_albums,
@@ -264,6 +317,7 @@ pub fn project_library(state: &AppState, query: &str, artist_filter: Option<&str
         album_header,
         album_tracks,
         album_paths,
+        search,
     }
 }
 
@@ -790,6 +844,62 @@ mod tests {
         assert_eq!(projection.songs[0].title, "Sunrise");
         assert_eq!(projection.artists.len(), 1);
         assert_eq!(projection.artists[0].name, "Nina Path");
+    }
+
+    #[test]
+    fn search_projection_sections_report_counts_and_ignore_the_artist_filter() {
+        let mut state = AppState::new();
+        let mut matching = tagged_track("/music/a.flac", "FLAC", 16, 44_100, false, Some(10_000));
+        matching.tags.title = Some("Sunrise".into());
+        matching.tags.artist = Some("Nina Path".into());
+        matching.tags.album = Some("Warm Colors".into());
+        let mut other = tagged_track("/music/b.flac", "FLAC", 16, 44_100, false, Some(10_000));
+        other.tags.title = Some("Nightfall".into());
+        other.tags.artist = Some("Other".into());
+        other.tags.album = Some("Cold Shapes".into());
+        state.library.upsert(matching);
+        state.library.upsert(other);
+
+        // An `artist_filter` (as if the Albums page were still filtered to some other artist when
+        // typing started) must not narrow the Search view: it always searches the whole library.
+        let projection = project_library(&state, "nina", Some("Other"), None);
+
+        assert_eq!(projection.search.songs.len(), 1);
+        assert_eq!(projection.search.songs[0].title, "Sunrise");
+        assert_eq!(projection.search.songs_header, "Songs (1)");
+        assert_eq!(projection.search.albums.len(), 1);
+        assert_eq!(projection.search.albums[0].title, "Warm Colors");
+        assert_eq!(projection.search.albums_header, "Albums (1)");
+        assert_eq!(projection.search.artists_header, "Artists (1)");
+        assert!(projection.search.has_results);
+
+        let empty = project_library(&state, "no such query", None, None);
+        assert!(!empty.search.has_results, "no matches in any section must report no results");
+        assert_eq!(empty.search.songs_header, "Songs (0)");
+    }
+
+    #[test]
+    fn search_projection_songs_are_capped_with_a_showing_first_header_and_index_aligned_paths() {
+        let mut state = AppState::new();
+        for i in 0..(SEARCH_SONGS_LIMIT + 5) {
+            let mut record = tagged_track(&format!("/music/track-{i:03}.flac"), "FLAC", 16, 44_100, false, Some(10_000));
+            record.tags.title = Some(format!("Track {i:03}"));
+            record.tags.artist = Some("Matching Artist".into());
+            state.library.upsert(record);
+        }
+
+        let projection = project_library(&state, "matching", None, None);
+
+        assert_eq!(projection.search.songs.len(), SEARCH_SONGS_LIMIT, "the rendered rows must stay capped");
+        assert_eq!(
+            projection.search.songs_header,
+            format!("Songs \u{2014} Showing first {SEARCH_SONGS_LIMIT} of {}", SEARCH_SONGS_LIMIT + 5),
+            "a capped section must say so, never truncate silently"
+        );
+        assert_eq!(projection.search.songs.len(), projection.search.songs_paths.len(), "rows and paths must stay index-aligned");
+        for (row, path) in projection.search.songs.iter().zip(&projection.search.songs_paths) {
+            assert_eq!(row.key, path.to_string_lossy(), "row `key` and its path entry must refer to the same track");
+        }
     }
 
     #[test]
