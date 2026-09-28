@@ -3,7 +3,6 @@
 //! describes. Pending seek stays in `main.rs`, since nothing outside `main.rs` needs it yet.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use slint::{Image, Rgb8Pixel, SharedPixelBuffer};
@@ -11,7 +10,7 @@ use slint::{Image, Rgb8Pixel, SharedPixelBuffer};
 use crate::View;
 use crate::audio::{AudioInfo, PreparedTrack};
 use crate::library::format::{format_badge, format_file_size, format_line};
-use crate::library::{ArtworkPixels, Library, TrackRecord, album_key, display_album, display_artist, display_title};
+use crate::library::{ArtworkPixels, Library, TrackKey, TrackRecord, album_key, display_album, display_artist, display_title, track_key_string};
 
 /// The back stack never grows past this many entries (`§3.6`): the oldest is dropped first.
 const MAX_BACK_STACK: usize = 16;
@@ -61,9 +60,9 @@ impl AppState {
     /// }` keeps the immutable `Ref` scrutinee alive through the whole then-block under edition
     /// 2024's `if let` rescoping, so the nested `borrow_mut()` panics with "already borrowed" the
     /// first time this runs. Folding both steps into one `&mut self` method removes the trap.
-    pub fn note_played_path(&mut self, path: &Path) {
-        if let Some(key) = self.library.get(path).map(album_key) {
-            self.note_played_album(&key);
+    pub fn note_played_key(&mut self, key: &TrackKey) {
+        if let Some(album_key) = self.library.get(key).map(album_key) {
+            self.note_played_album(&album_key);
         }
     }
 
@@ -77,8 +76,8 @@ impl AppState {
     /// again — or forever, if phase 2 then fails (`§3.3` "UI handling of scanner events").
     pub fn apply_probed(&mut self, tracks: &[PreparedTrack]) {
         for track in tracks {
-            if self.library.get(&track.path).is_none() {
-                self.library.upsert(TrackRecord::minimal(track.path.clone(), track.info.clone()));
+            if self.library.get(&track.key).is_none() {
+                self.library.upsert(TrackRecord::minimal(track.key.clone(), track.info.clone()));
             }
         }
     }
@@ -95,7 +94,7 @@ impl AppState {
     /// no tracks, no-op action buttons) and "Jump back in" silently drops the album (`§6` Stage 6
     /// fix).
     pub fn apply_scanned(&mut self, mut record: TrackRecord) -> Option<(String, String)> {
-        let old_key = self.library.get(&record.path).map(album_key);
+        let old_key = self.library.get(&record.key).map(album_key);
         let new_key = album_key(&record);
         if let Some(pixels) = record.artwork.take() {
             self.cache_artwork(&new_key, &pixels);
@@ -294,11 +293,11 @@ pub fn unavailable_label(view: View) -> &'static str {
 /// playing projection").
 pub fn now_playing_identity(
     library: &Library,
-    path: &Path,
+    key: &TrackKey,
     fallback_title: &str,
     fallback_album: &str,
 ) -> (String, String, String) {
-    match library.get(path) {
+    match library.get(key) {
         Some(record) => (display_title(record), display_artist(record), display_album(record)),
         None => (fallback_title.to_owned(), "Unknown Artist".to_owned(), fallback_album.to_owned()),
     }
@@ -306,8 +305,8 @@ pub fn now_playing_identity(
 
 /// The format/size line for the playing path: built from what is actually playing (`info`) plus
 /// the library record's file size, when known (`§5.10`). Feeds the right panel's `format-line`.
-pub fn now_playing_format_line(library: &Library, path: &Path, info: &AudioInfo) -> String {
-    let file_size = library.get(path).and_then(|record| record.file_size);
+pub fn now_playing_format_line(library: &Library, key: &TrackKey, info: &AudioInfo) -> String {
+    let file_size = library.get(key).and_then(|record| record.file_size);
     format_line(&info.format, info.bits_per_sample, info.sample_rate, info.is_float, info.source_channels, file_size, info.duration_ms)
 }
 
@@ -330,19 +329,19 @@ pub struct NowPlayingProjection {
     pub has_lyrics: bool,
 }
 
-pub fn project_now_playing(state: &AppState, path: &Path, info: &AudioInfo, fallback: &(String, String)) -> NowPlayingProjection {
-    let (title, artist, album) = now_playing_identity(&state.library, path, &fallback.0, &fallback.1);
-    let record = state.library.get(path);
+pub fn project_now_playing(state: &AppState, key: &TrackKey, info: &AudioInfo, fallback: &(String, String)) -> NowPlayingProjection {
+    let (title, artist, album) = now_playing_identity(&state.library, key, &fallback.0, &fallback.1);
+    let record = state.library.get(key);
     let year = record.and_then(|r| r.tags.year).map(|year| year.to_string()).unwrap_or_default();
     let genre = record.and_then(|r| r.tags.genre.clone()).unwrap_or_default();
     let badge = format_badge(&info.format, info.bits_per_sample, info.sample_rate, info.is_float);
-    let format_line = now_playing_format_line(&state.library, path, info);
+    let format_line = now_playing_format_line(&state.library, key, info);
     let file_size_line = record.and_then(|r| r.file_size).map(format_file_size).unwrap_or_default();
     let art = record.map(album_key).and_then(|key| state.artwork_for_key(&key));
     let lyrics = record.and_then(|r| r.tags.lyrics.clone()).unwrap_or_default();
     let has_lyrics = !lyrics.is_empty();
     NowPlayingProjection {
-        key: path.to_string_lossy().into_owned(),
+        key: track_key_string(key),
         title,
         artist,
         album,
@@ -428,7 +427,7 @@ mod tests {
     #[test]
     fn apply_probed_does_not_replace_an_existing_tagged_record() {
         let mut state = AppState::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
         let mut tagged = TrackRecord::minimal(path.clone(), info("FLAC", 24, 44_100, false, 2, Some(10_000)));
         tagged.tags.title = Some("Real Title".into());
         tagged.file_size = Some(1_703_750);
@@ -436,7 +435,7 @@ mod tests {
 
         // Re-opening the same file (queuing it again) probes it a second time; that must not wipe
         // the tags and file size already known from the first, full scan.
-        state.apply_probed(&[PreparedTrack { path: path.clone(), info: info("FLAC", 24, 44_100, false, 2, Some(10_000)) }]);
+        state.apply_probed(&[PreparedTrack { key: path.clone(), info: info("FLAC", 24, 44_100, false, 2, Some(10_000)) }]);
 
         let record = state.library.get(&path).unwrap();
         assert_eq!(record.tags.title.as_deref(), Some("Real Title"));
@@ -446,9 +445,9 @@ mod tests {
     #[test]
     fn apply_probed_inserts_a_minimal_record_for_an_unknown_path() {
         let mut state = AppState::new();
-        let path = PathBuf::from("/nas/album/new.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/new.flac"));
 
-        state.apply_probed(&[PreparedTrack { path: path.clone(), info: info("FLAC", 16, 44_100, false, 2, None) }]);
+        state.apply_probed(&[PreparedTrack { key: path.clone(), info: info("FLAC", 16, 44_100, false, 2, None) }]);
 
         let record = state.library.get(&path).expect("a minimal record should have been inserted");
         assert!(record.tags.title.is_none());
@@ -457,7 +456,7 @@ mod tests {
     #[test]
     fn now_playing_identity_falls_back_when_no_record_exists() {
         let library = Library::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
 
         let (title, artist, album) = now_playing_identity(&library, &path, "Track", "Album Folder");
 
@@ -469,7 +468,7 @@ mod tests {
     #[test]
     fn now_playing_identity_prefers_the_library_record() {
         let mut library = Library::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
         let mut record = TrackRecord::minimal(path.clone(), info("FLAC", 24, 44_100, false, 2, Some(1_000)));
         record.tags.title = Some("Real Title".into());
         record.tags.artist = Some("Real Artist".into());
@@ -486,7 +485,7 @@ mod tests {
     #[test]
     fn now_playing_format_line_uses_playing_info_and_record_file_size() {
         let mut library = Library::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
         // The record's own `info` deliberately differs from what is passed as "playing": the line
         // must reflect the latter (`Started.info`, what is actually playing), not the former.
         let mut record = TrackRecord::minimal(path.clone(), info("FLAC", 16, 48_000, false, 2, Some(5_000)));
@@ -777,12 +776,12 @@ mod tests {
     #[test]
     fn note_played_path_looks_up_the_album_in_one_borrow_and_records_it() {
         let mut state = AppState::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
         let record = TrackRecord::minimal(path.clone(), info("FLAC", 24, 44_100, false, 2, Some(10_000)));
         let key = album_key(&record);
         state.library.upsert(record);
 
-        state.note_played_path(&path);
+        state.note_played_key(&path);
 
         assert_eq!(state.recent_album_keys(), [key]);
     }
@@ -791,7 +790,7 @@ mod tests {
     fn note_played_path_does_nothing_for_a_path_with_no_library_record() {
         let mut state = AppState::new();
 
-        state.note_played_path(&PathBuf::from("/nas/unknown.flac"));
+        state.note_played_key(&TrackKey::whole_file(PathBuf::from("/nas/unknown.flac")));
 
         assert!(state.recent_album_keys().is_empty());
     }
@@ -799,11 +798,11 @@ mod tests {
     #[test]
     fn apply_scanned_rekeys_recent_album_when_the_dir_fallback_key_is_replaced() {
         let mut state = AppState::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
         // Phase 1: a minimal, untagged record groups under the `dir:` fallback key.
-        state.apply_probed(&[PreparedTrack { path: path.clone(), info: info("FLAC", 24, 44_100, false, 2, None) }]);
+        state.apply_probed(&[PreparedTrack { key: path.clone(), info: info("FLAC", 24, 44_100, false, 2, None) }]);
         let old_key = album_key(state.library.get(&path).unwrap());
-        state.note_played_path(&path);
+        state.note_played_key(&path);
         assert_eq!(state.recent_album_keys(), std::slice::from_ref(&old_key));
 
         // Phase 2: real tags arrive and move the same path onto an `af:`/`aa:` key.
@@ -827,14 +826,14 @@ mod tests {
     #[test]
     fn apply_scanned_does_not_rekey_while_sibling_tracks_still_hold_the_old_key() {
         let mut state = AppState::new();
-        let path_a = PathBuf::from("/nas/album/a.flac");
-        let path_b = PathBuf::from("/nas/album/b.flac");
+        let path_a = TrackKey::whole_file(PathBuf::from("/nas/album/a.flac"));
+        let path_b = TrackKey::whole_file(PathBuf::from("/nas/album/b.flac"));
         state.apply_probed(&[
-            PreparedTrack { path: path_a.clone(), info: info("FLAC", 24, 44_100, false, 2, None) },
-            PreparedTrack { path: path_b.clone(), info: info("FLAC", 24, 44_100, false, 2, None) },
+            PreparedTrack { key: path_a.clone(), info: info("FLAC", 24, 44_100, false, 2, None) },
+            PreparedTrack { key: path_b.clone(), info: info("FLAC", 24, 44_100, false, 2, None) },
         ]);
         let old_key = album_key(state.library.get(&path_a).unwrap());
-        state.note_played_path(&path_a);
+        state.note_played_key(&path_a);
 
         // Only `a.flac` gets scanned; `b.flac` still holds the old `dir:` key, so the group is not
         // empty yet and the recent-album entry must not be rewritten out from under it.
@@ -850,7 +849,7 @@ mod tests {
     #[test]
     fn now_playing_projection_fills_panel_fields_and_has_lyrics_only_when_present() {
         let mut state = AppState::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
         let mut record = TrackRecord::minimal(path.clone(), info("FLAC", 24, 44_100, false, 2, Some(10_000)));
         record.tags.title = Some("Real Title".into());
         record.tags.artist = Some("Real Artist".into());
@@ -880,7 +879,7 @@ mod tests {
     #[test]
     fn now_playing_projection_reports_no_lyrics_when_none_are_tagged() {
         let mut state = AppState::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
         let record = TrackRecord::minimal(path.clone(), info("FLAC", 16, 44_100, false, 2, Some(5_000)));
         state.library.upsert(record);
         let now_playing_info = info("FLAC", 16, 44_100, false, 2, Some(5_000));
@@ -894,7 +893,7 @@ mod tests {
     #[test]
     fn now_playing_projection_falls_back_to_filename_fields_with_no_record() {
         let state = AppState::new();
-        let path = PathBuf::from("/nas/album/unknown.flac");
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/unknown.flac"));
         let fallback = ("Fallback Title".to_owned(), "Fallback Album".to_owned());
         let now_playing_info = info("FLAC", 16, 44_100, false, 2, Some(5_000));
 

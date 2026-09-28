@@ -26,9 +26,9 @@ export struct TrackRowData {
     badge: string,
     hi-res: bool,
 }
-export struct AlbumCardData { key: string, title: string, artist: string, subtitle: string, art: image, has-art: bool }
+export struct AlbumCardData { key: string, title: string, artist: string, subtitle: string, art: image, has-art: bool, format-label: string, format-variant: string }
 export struct ArtistRowData { name: string, subtitle: string }
-export struct AlbumHeaderData { key: string, title: string, artist: string, meta: string, art: image, has-art: bool }
+export struct AlbumHeaderData { key: string, title: string, artist: string, meta: string, art: image, has-art: bool, format-label: string, format-variant: string }
 
 // `Icon`. Renders `source` through `colorize`, sized to a square of `size` (`§5.5`).
 export component Icon inherits Image {
@@ -225,6 +225,40 @@ export component Badge inherits Rectangle {
     }
 }
 
+// The album format pill shown on `AlbumTile` and `AlbumDetailView`'s header (`§5.5`/`§5.7`): same
+// shape/padding/font as `Badge` above, but its background/text color is picked from `variant`
+// instead of always the accent pair, so five different album formats can be told apart at a
+// glance. `variant` is one of `"mp3"`, `"flac"`, `"wavpack"`, `"mix"`, `"wav"` — the exact strings
+// `AlbumFormat::variant` in `src/library/format.rs` produces; an unrecognized variant (there should
+// never be one) falls back to the neutral WAV colors rather than an undefined brush. `"mp3"` reuses
+// `Theme.accent-soft`/`Theme.accent-strong` — the same lime green `Badge`'s Hi-Res badge already
+// uses — so no separate MP3 token exists in `theme.slint`.
+export component FormatPill inherits Rectangle {
+    in property <string> text;
+    in property <string> variant;
+    property <color> pill-bg: root.variant == "flac" ? Theme.flac-soft
+        : root.variant == "wavpack" ? Theme.wavpack-soft
+        : root.variant == "mix" ? Theme.mix-soft
+        : root.variant == "mp3" ? Theme.accent-soft
+        : Theme.wav-soft;
+    property <color> pill-text: root.variant == "flac" ? Theme.flac-strong
+        : root.variant == "wavpack" ? Theme.wavpack-strong
+        : root.variant == "mix" ? Theme.mix-strong
+        : root.variant == "mp3" ? Theme.accent-strong
+        : Theme.wav-strong;
+    background: root.pill-bg;
+    border-radius: 4px;
+    width: label.preferred-width + 12px;
+    height: label.preferred-height + 2px;
+    HorizontalLayout {
+        padding-top: 1px;
+        padding-bottom: 1px;
+        padding-left: 6px;
+        padding-right: 6px;
+        label := Text { text: root.text; font-size: Theme.fs-caption; font-weight: 700; color: root.pill-text; }
+    }
+}
+
 // Either the artwork or the neutral placeholder disc, clipped to `radius` (`§5.5`).
 export component ArtworkView inherits Rectangle {
     in property <image> art;
@@ -286,7 +320,14 @@ export component AlbumTile inherits Rectangle {
             ArtworkView { art: root.data.art; has-art: root.data.has-art; size: Theme.tile-art; radius: 6px; }
             if touch.has-hover: Rectangle { width: 100%; height: 100%; background: #ffffff0f; border-radius: 6px; }
         }
-        Text { text: root.data.title; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
+        // Title row: the title elides to make room for the format pill, which sits at the right
+        // end of the same line (user wireframe). The pill is omitted until a format is known.
+        HorizontalLayout {
+            spacing: 6px;
+            cross-axis-alignment: center;
+            Text { horizontal-stretch: 1; text: root.data.title; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
+            if root.data.format-label != "": FormatPill { text: root.data.format-label; variant: root.data.format-variant; }
+        }
         Text { text: root.data.artist; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; }
         Text { text: root.data.subtitle; font-size: Theme.fs-meta; color: Theme.text-tertiary; overflow: elide; }
     }

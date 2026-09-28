@@ -3,17 +3,16 @@
 //! I/O: everything here is unit-tested directly against `Library`/`AppState`/`QueueTrackSnapshot`
 //! values.
 
-use std::path::{Path, PathBuf};
-
 use slint::Image;
 
 use crate::app_state::AppState;
 use crate::audio::{AudioInfo, AudioPlayer, PreparedTrack, QueueTrackSnapshot};
 use crate::library::format::{
-    format_album_card_subtitle, format_album_meta, format_badge, format_clock, format_library_summary, format_search_section_header,
-    is_hi_res,
+    format_album_card_subtitle, format_album_meta, format_badge, format_clock, format_library_summary, format_search_section_header, is_hi_res,
 };
-use crate::library::{AlbumSummary, ArtistSummary, Library, TrackRecord, display_album, display_artist, display_title, shuffled};
+use crate::library::{
+    AlbumSummary, ArtistSummary, Library, TrackKey, TrackRecord, display_album, display_artist, display_title, shuffled, track_key_string,
+};
 use crate::{AlbumAction, AlbumCardData, AlbumHeaderData, ArtistRowData, TrackRowData};
 
 /// A row's fields when `path` has no library record yet: a track queued before the scanner's
@@ -37,7 +36,7 @@ struct RowFallback<'a> {
 fn track_row_from_record(record: &TrackRecord, number: String) -> TrackRowData {
     let info = &record.info;
     TrackRowData {
-        key: record.path.to_string_lossy().into_owned().into(),
+        key: track_key_string(&record.key).into(),
         number: number.into(),
         title: display_title(record).into(),
         artist: display_artist(record).into(),
@@ -49,11 +48,11 @@ fn track_row_from_record(record: &TrackRecord, number: String) -> TrackRowData {
     }
 }
 
-fn build_track_row(path: &Path, library: &Library, number: String, fallback: RowFallback<'_>) -> TrackRowData {
-    match library.get(path) {
+fn build_track_row(key: &TrackKey, library: &Library, number: String, fallback: RowFallback<'_>) -> TrackRowData {
+    match library.get(key) {
         Some(record) => track_row_from_record(record, number),
         None => {
-            let key = path.to_string_lossy().into_owned();
+            let key = track_key_string(key);
             let duration = fallback.duration_ms.map(format_clock).unwrap_or_else(|| "\u{2014}:\u{2014}".to_owned());
             TrackRowData {
                 key: key.into(),
@@ -89,6 +88,8 @@ fn build_album_card(album: &AlbumSummary, state: &AppState) -> AlbumCardData {
         subtitle: format_album_card_subtitle(album.year, album.track_count).into(),
         art,
         has_art,
+        format_label: album.format_label.clone().into(),
+        format_variant: album.format_variant.clone().into(),
     }
 }
 
@@ -146,7 +147,7 @@ fn album_has_multiple_discs(tracks: &[&TrackRecord]) -> bool {
 /// The current album's tracks (`§3.3` `Library::album_tracks` order: disc, track, title, path),
 /// projected to rows plus the paths behind them in the same order, for `track-activated`
 /// (`TrackListKind.album`) to map a clicked row back to `library.prepared(path)` (`§3.4`).
-fn project_album_tracks(library: &Library, key: &str) -> (Vec<TrackRowData>, Vec<PathBuf>) {
+fn project_album_tracks(library: &Library, key: &str) -> (Vec<TrackRowData>, Vec<TrackKey>) {
     let tracks = library.album_tracks(key);
     let multi_disc = album_has_multiple_discs(&tracks);
     let mut rows = Vec::with_capacity(tracks.len());
@@ -154,7 +155,7 @@ fn project_album_tracks(library: &Library, key: &str) -> (Vec<TrackRowData>, Vec
     for (index, record) in tracks.iter().enumerate() {
         let number = track_number_label(record.tags.disc_number, record.tags.track_number, multi_disc, index + 1);
         rows.push(track_row_from_record(record, number));
-        paths.push(record.path.clone());
+        paths.push(record.key.clone());
     }
     (rows, paths)
 }
@@ -167,12 +168,14 @@ fn project_album_header(library: &Library, state: &AppState, key: &str) -> Album
         Some(album) => {
             let (art, has_art) = art_or_placeholder(state.artwork_for_key(&album.key));
             AlbumHeaderData {
-                key: album.key.into(),
-                title: album.title.into(),
-                artist: album.artist.into(),
+                key: album.key.clone().into(),
+                title: album.title.clone().into(),
+                artist: album.artist.clone().into(),
                 meta: format_album_meta(album.year, album.track_count, album.total_duration_ms).into(),
                 art,
                 has_art,
+                format_label: album.format_label.clone().into(),
+                format_variant: album.format_variant.clone().into(),
             }
         }
         None => AlbumHeaderData::default(),
@@ -182,12 +185,12 @@ fn project_album_header(library: &Library, state: &AppState, key: &str) -> Album
 /// Songs/Recently Added rows (`§5.7`): `number` is the 1-based row index, not a disc-track label
 /// (only album detail uses that), and each row's path is recorded in the same order for
 /// `track-activated` (`§3.4`).
-fn project_song_rows(records: &[&TrackRecord]) -> (Vec<TrackRowData>, Vec<PathBuf>) {
+fn project_song_rows(records: &[&TrackRecord]) -> (Vec<TrackRowData>, Vec<TrackKey>) {
     let mut rows = Vec::with_capacity(records.len());
     let mut paths = Vec::with_capacity(records.len());
     for (index, record) in records.iter().enumerate() {
         rows.push(track_row_from_record(record, (index + 1).to_string()));
-        paths.push(record.path.clone());
+        paths.push(record.key.clone());
     }
     (rows, paths)
 }
@@ -223,14 +226,14 @@ pub struct LibraryProjection {
     pub albums: Vec<AlbumCardData>,
     pub artists: Vec<ArtistRowData>,
     pub songs: Vec<TrackRowData>,
-    pub songs_paths: Vec<PathBuf>,
+    pub songs_paths: Vec<TrackKey>,
     pub recent_songs: Vec<TrackRowData>,
-    pub recent_paths: Vec<PathBuf>,
+    pub recent_paths: Vec<TrackKey>,
     pub songs_summary: String,
     pub recent_summary: String,
     pub album_header: AlbumHeaderData,
     pub album_tracks: Vec<TrackRowData>,
-    pub album_paths: Vec<PathBuf>,
+    pub album_paths: Vec<TrackKey>,
     pub search: SearchProjection,
 }
 
@@ -242,7 +245,7 @@ pub struct LibraryProjection {
 /// driving the view's "No results for ..." empty state.
 pub struct SearchProjection {
     pub songs: Vec<TrackRowData>,
-    pub songs_paths: Vec<PathBuf>,
+    pub songs_paths: Vec<TrackKey>,
     pub songs_header: String,
     pub albums: Vec<AlbumCardData>,
     pub albums_header: String,
@@ -324,8 +327,8 @@ pub fn project_library(state: &AppState, query: &str, artist_filter: Option<&str
 /// The suffix of `paths` starting at `row`, resolved into `PreparedTrack`s through `library`
 /// (`§3.7`): a path the library has no record for anymore is skipped, never turned into a gap.
 /// Shared by every `track-activated` row — Songs, Recently Added, album detail and Queue alike.
-pub fn prepared_suffix(library: &Library, paths: &[PathBuf], row: usize) -> Vec<PreparedTrack> {
-    paths.get(row..).unwrap_or(&[]).iter().filter_map(|path| library.prepared(path)).collect()
+pub fn prepared_suffix(library: &Library, keys: &[TrackKey], row: usize) -> Vec<PreparedTrack> {
+    keys.get(row..).unwrap_or(&[]).iter().filter_map(|key| library.prepared(key)).collect()
 }
 
 /// A minimal, test-doubleable view of the player calls an album/queue action needs
@@ -391,14 +394,14 @@ const QUEUE_UP_NEXT_LIMIT: usize = 300;
 /// fallback_title, fallback_album)`, the same fallback shape `now_playing_identity` uses. Replaces
 /// `project_queue_snapshot`/`QueueViewRows`/`set_queue_models` (`§6` Stage 5 step 5).
 pub fn project_queue_rows(
-    now_playing: Option<(&Path, &AudioInfo, &str, &str)>,
+    now_playing: Option<(&TrackKey, &AudioInfo, &str, &str)>,
     pending: &[QueueTrackSnapshot],
     library: &Library,
-) -> (TrackRowData, Vec<TrackRowData>, Vec<PathBuf>) {
+) -> (TrackRowData, Vec<TrackRowData>, Vec<TrackKey>) {
     let rendered = &pending[..pending.len().min(QUEUE_UP_NEXT_LIMIT)];
     let current = match now_playing {
-        Some((path, info, fallback_title, fallback_album)) => build_track_row(
-            path,
+        Some((key, info, fallback_title, fallback_album)) => build_track_row(
+            key,
             library,
             "1".to_owned(),
             RowFallback {
@@ -419,7 +422,7 @@ pub fn project_queue_rows(
     let mut rows = Vec::with_capacity(rendered.len());
     for (index, track) in rendered.iter().enumerate() {
         rows.push(build_track_row(
-            &track.path,
+            &track.key,
             library,
             (index + 1).to_string(),
             RowFallback {
@@ -439,14 +442,20 @@ pub fn project_queue_rows(
     // through this exact list, so trimming it here would silently drop every pending track past
     // `QUEUE_UP_NEXT_LIMIT` from the resulting queue whenever a row inside the render cap is
     // activated.
-    let paths: Vec<PathBuf> = pending.iter().map(|track| track.path.clone()).collect();
+    let paths: Vec<TrackKey> = pending.iter().map(|track| track.key.clone()).collect();
     (current, rows, paths)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     use crate::library::TrackRecord;
+
+    fn key(path: &str) -> TrackKey {
+        TrackKey::whole_file(PathBuf::from(path))
+    }
 
     fn info(format: &str, bits: u32, rate: u32, is_float: bool, duration_ms: Option<u64>) -> AudioInfo {
         AudioInfo {
@@ -463,8 +472,8 @@ mod tests {
     #[test]
     fn queue_rows_projection_preserves_order_and_uses_library_or_snapshot_fallback() {
         let mut library = Library::new();
-        let known_path = PathBuf::from("/nas/album-a/first-light.flac");
-        let mut known = TrackRecord::minimal(known_path.clone(), info("FLAC", 24, 96_000, false, Some(95_000)));
+        let known_key = key("/nas/album-a/first-light.flac");
+        let mut known = TrackRecord::minimal(known_key.clone(), info("FLAC", 24, 96_000, false, Some(95_000)));
         known.tags.title = Some("First Light".into());
         known.tags.artist = Some("Real Artist".into());
         known.tags.album = Some("Real Album".into());
@@ -472,7 +481,7 @@ mod tests {
 
         let pending = vec![
             QueueTrackSnapshot {
-                path: known_path.clone(),
+                key: known_key.clone(),
                 title: "ignored".into(),
                 parent_folder: "ignored".into(),
                 format: "ignored".into(),
@@ -482,7 +491,7 @@ mod tests {
                 duration_ms: None,
             },
             QueueTrackSnapshot {
-                path: PathBuf::from("/nas/album-b/second-track.mp3"),
+                key: key("/nas/album-b/second-track.mp3"),
                 title: "Second Track".into(),
                 parent_folder: "Album B".into(),
                 format: "MP3".into(),
@@ -492,7 +501,7 @@ mod tests {
                 duration_ms: None,
             },
             QueueTrackSnapshot {
-                path: PathBuf::from("/nas/album-c/third-track.wv"),
+                key: key("/nas/album-c/third-track.wv"),
                 title: "Third Track".into(),
                 parent_folder: "Album C".into(),
                 format: "WavPack".into(),
@@ -508,14 +517,10 @@ mod tests {
         assert_eq!(current, TrackRowData::default(), "nothing playing means an empty current row");
         assert_eq!(
             paths,
-            vec![
-                known_path.clone(),
-                PathBuf::from("/nas/album-b/second-track.mp3"),
-                PathBuf::from("/nas/album-c/third-track.wv"),
-            ],
+            vec![known_key.clone(), key("/nas/album-b/second-track.mp3"), key("/nas/album-c/third-track.wv")],
             "order must be preserved"
         );
-        assert_eq!(rows[0].key, known_path.to_string_lossy().to_string(), "key is always the absolute path");
+        assert_eq!(rows[0].key, track_key_string(&known_key), "key is always the absolute path");
         assert_eq!(rows[0].number, "1");
         assert_eq!(rows[0].title, "First Light", "a library record wins over the snapshot fields");
         assert_eq!(rows[0].artist, "Real Artist");
@@ -535,12 +540,13 @@ mod tests {
     #[test]
     fn queue_rows_projection_builds_the_current_row_from_now_playing_state() {
         let library = Library::new();
-        let path = PathBuf::from("/nas/album/track.flac");
+        let now_playing_key = key("/nas/album/track.flac");
         let now_playing_info = info("WavPack", 32, 48_000, true, Some(200_000));
 
-        let (current, _, _) = project_queue_rows(Some((&path, &now_playing_info, "Fallback Title", "Fallback Album")), &[], &library);
+        let (current, _, _) =
+            project_queue_rows(Some((&now_playing_key, &now_playing_info, "Fallback Title", "Fallback Album")), &[], &library);
 
-        assert_eq!(current.key, path.to_string_lossy().to_string());
+        assert_eq!(current.key, track_key_string(&now_playing_key));
         assert_eq!(current.title, "Fallback Title");
         assert_eq!(current.album, "Fallback Album");
         assert_eq!(current.badge, "WavPack 32f/48");
@@ -552,7 +558,7 @@ mod tests {
         let library = Library::new();
         let pending: Vec<QueueTrackSnapshot> = (0..QUEUE_UP_NEXT_LIMIT + 50)
             .map(|i| QueueTrackSnapshot {
-                path: PathBuf::from(format!("/nas/queue/track-{i}.flac")),
+                key: key(&format!("/nas/queue/track-{i}.flac")),
                 title: format!("Track {i}"),
                 parent_folder: "Queue".into(),
                 format: "FLAC".into(),
@@ -572,16 +578,16 @@ mod tests {
             "the activation path list must stay uncapped so activating a queue row never drops \
              pending tracks past the render cap"
         );
-        assert_eq!(paths[0], pending[0].path, "the cap must keep the queue's own front-to-back order");
+        assert_eq!(paths[0], pending[0].key, "the cap must keep the queue's own front-to-back order");
         for (index, track) in pending.iter().enumerate() {
-            assert_eq!(paths[index], track.path, "path {index} must still map to the same pending track beyond the render cap");
+            assert_eq!(paths[index], track.key, "path {index} must still map to the same pending track beyond the render cap");
         }
     }
 
     /// A minimal multi-track record built the same way `library::tests` does, so these Stage 6
     /// tests can set only the tags each one cares about.
     fn tagged_track(path: &str, format: &str, bits: u32, rate: u32, is_float: bool, duration_ms: Option<u64>) -> TrackRecord {
-        TrackRecord::minimal(PathBuf::from(path), info(format, bits, rate, is_float, duration_ms))
+        TrackRecord::minimal(key(path), info(format, bits, rate, is_float, duration_ms))
     }
 
     #[test]
@@ -599,16 +605,16 @@ mod tests {
         disc2_track3.tags.disc_number = Some(2);
         disc2_track3.tags.track_number = Some(3);
         disc2_track3.tags.title = Some("Outro".into());
-        let key = crate::library::album_key(&disc1_track1);
+        let album_key = crate::library::album_key(&disc1_track1);
         library.upsert(disc1_track1);
         library.upsert(disc2_track3);
 
-        let (rows, paths) = project_album_tracks(&library, &key);
+        let (rows, paths) = project_album_tracks(&library, &album_key);
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].number, "1-01", "disc 1 must still show the disc prefix once the album has more than one disc");
         assert_eq!(rows[1].number, "2-03");
-        assert_eq!(paths, vec![PathBuf::from("/music/Album/CD1/01.flac"), PathBuf::from("/music/Album/CD2/03.flac")]);
+        assert_eq!(paths, vec![key("/music/Album/CD1/01.flac"), key("/music/Album/CD2/03.flac")]);
     }
 
     #[test]
@@ -685,6 +691,39 @@ mod tests {
 
         assert_eq!(card.subtitle, "2021 · 12 tracks");
         assert!(!card.has_art, "no cached artwork for this album key means the placeholder flag");
+        assert_eq!(card.format_label, "FLAC", "every track is FLAC, so the pill must show a single format, not Mix Formats");
+        assert_eq!(card.format_variant, "flac");
+    }
+
+    #[test]
+    fn album_card_and_header_show_mix_formats_once_tracks_disagree() {
+        let mut state = AppState::new();
+        let mut flac_track = tagged_track("/music/Mixed/01.flac", "FLAC", 16, 44_100, false, Some(60_000));
+        flac_track.tags.album = Some("Odds And Ends".into());
+        flac_track.tags.artist = Some("Various".into());
+        let mut mp3_track = tagged_track("/music/Mixed/02.mp3", "MP3", 16, 44_100, false, Some(60_000));
+        mp3_track.tags.album = Some("Odds And Ends".into());
+        mp3_track.tags.artist = Some("Various".into());
+        state.library.upsert(flac_track);
+        state.library.upsert(mp3_track);
+
+        let albums = state.library.albums("", None);
+        assert_eq!(albums.len(), 1);
+        let card = build_album_card(&albums[0], &state);
+        assert_eq!(card.format_label, "Mix Formats");
+        assert_eq!(card.format_variant, "mix");
+
+        let header = project_album_header(&state.library, &state, &albums[0].key);
+        assert_eq!(header.format_label, "Mix Formats");
+        assert_eq!(header.format_variant, "mix");
+    }
+
+    #[test]
+    fn album_header_pill_is_empty_for_a_missing_album() {
+        let state = AppState::new();
+        let header = project_album_header(&state.library, &state, "no-such-key");
+        assert_eq!(header.format_label, "", "a missing album key must project the default, empty header");
+        assert_eq!(header.format_variant, "");
     }
 
     #[test]
@@ -708,10 +747,10 @@ mod tests {
         // maps a clicked row straight to `songs_paths[row]` with no other lookup.
         let projection = project_library(&state, "warm", None, None);
         assert_eq!(projection.songs.len(), 3, "the query must exclude the non-matching track");
-        for (i, path) in projection.songs_paths.iter().enumerate() {
+        for (i, key) in projection.songs_paths.iter().enumerate() {
             assert_eq!(
                 projection.songs[i].key,
-                path.to_string_lossy(),
+                track_key_string(key),
                 "songs and songs_paths must stay index-aligned under a search filter"
             );
         }
@@ -719,15 +758,15 @@ mod tests {
         // A path without a record: simulate the row at index 0 leaving the library between render
         // and click (`§3.7`) with a fresh library that has every visible path except that one.
         let mut library_after_departure = Library::new();
-        for path in &projection.songs_paths[1..] {
-            library_after_departure.upsert(state.library.get(path).unwrap().clone());
+        for key in &projection.songs_paths[1..] {
+            library_after_departure.upsert(state.library.get(key).unwrap().clone());
         }
 
         let tracks = prepared_suffix(&library_after_departure, &projection.songs_paths, 0);
 
         assert_eq!(tracks.len(), 2, "the path with no library record anymore is skipped, not turned into a gap");
-        assert_eq!(tracks[0].path, projection.songs_paths[1]);
-        assert_eq!(tracks[1].path, projection.songs_paths[2]);
+        assert_eq!(tracks[0].key, projection.songs_paths[1]);
+        assert_eq!(tracks[1].key, projection.songs_paths[2]);
     }
 
     // Records the full track list, not just its length (`§6` Stage 6 fix): a call that keeps the
@@ -752,7 +791,7 @@ mod tests {
 
     #[test]
     fn album_actions_map_to_player_calls() {
-        let track = |name: &str| PreparedTrack { path: PathBuf::from(name), info: info("FLAC", 16, 44_100, false, Some(10_000)) };
+        let track = |name: &str| PreparedTrack { key: key(name), info: info("FLAC", 16, 44_100, false, Some(10_000)) };
         // 5 tracks: enough that an accidentally-unshuffled or reordered list is not plausibly
         // mistaken for a correct shuffle/album order by chance.
         let tracks: Vec<PreparedTrack> =
@@ -784,9 +823,9 @@ mod tests {
             record.tags.album = Some(format!("Album {i}"));
             record.tags.artist = Some("Artist".into());
             state.library.upsert(record);
-            state.note_played_path(&PathBuf::from(path));
+            state.note_played_key(&key(&path));
         }
-        state.note_played_path(&PathBuf::from("/music/album-5/track.flac"));
+        state.note_played_key(&key("/music/album-5/track.flac"));
 
         let jump_back = project_jump_back_albums(&state, "");
 
@@ -802,13 +841,13 @@ mod tests {
         jazz.tags.album = Some("Kind of Blue".into());
         jazz.tags.artist = Some("Miles Davis".into());
         state.library.upsert(jazz);
-        state.note_played_path(&PathBuf::from("/music/jazz/track.flac"));
+        state.note_played_key(&key("/music/jazz/track.flac"));
 
         let mut rock = tagged_track("/music/rock/track.flac", "FLAC", 16, 44_100, false, Some(10_000));
         rock.tags.album = Some("Nevermind".into());
         rock.tags.artist = Some("Nirvana".into());
         state.library.upsert(rock);
-        state.note_played_path(&PathBuf::from("/music/rock/track.flac"));
+        state.note_played_key(&key("/music/rock/track.flac"));
 
         assert_eq!(project_jump_back_albums(&state, "").len(), 2, "no query keeps every played album");
 
@@ -897,8 +936,8 @@ mod tests {
             "a capped section must say so, never truncate silently"
         );
         assert_eq!(projection.search.songs.len(), projection.search.songs_paths.len(), "rows and paths must stay index-aligned");
-        for (row, path) in projection.search.songs.iter().zip(&projection.search.songs_paths) {
-            assert_eq!(row.key, path.to_string_lossy(), "row `key` and its path entry must refer to the same track");
+        for (row, key) in projection.search.songs.iter().zip(&projection.search.songs_paths) {
+            assert_eq!(row.key, track_key_string(key), "row `key` and its path entry must refer to the same track");
         }
     }
 
@@ -1027,6 +1066,23 @@ mod ui_contract {
                 assert!(!starts_with_digit, "a literal font-size was found outside theme.slint (must use a Theme.fs-* token)");
                 rest = &rest[pos + "font-size:".len()..];
             }
+        }
+    }
+
+    #[test]
+    fn album_format_pill_tokens_are_declared_and_referenced() {
+        // `Theme` tokens the format pill added (`§5.5`/`§5.7`): each must be declared once in
+        // `theme.slint` and actually consumed somewhere in `widgets.slint`/`app.slint` — no dead
+        // token, and (implicitly, by never needing a hex literal here) no hex color introduced
+        // outside `theme.slint` for the pill itself.
+        for token in [
+            "flac-soft", "flac-strong", "wavpack-soft", "wavpack-strong", "mix-soft", "mix-strong", "wav-soft", "wav-strong",
+        ] {
+            let declaration_needle = format!("out property <color> {token}:");
+            assert!(THEME_SLINT.contains(&declaration_needle), "theme.slint must declare `{token}`");
+            let usage_needle = format!("Theme.{token}");
+            let used_somewhere = [WIDGETS_SLINT, APP_SLINT].iter().any(|source| source.contains(&usage_needle));
+            assert!(used_somewhere, "`{token}` is declared but never referenced in widgets.slint/app.slint");
         }
     }
 

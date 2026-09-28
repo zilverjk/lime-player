@@ -211,6 +211,72 @@ pub fn format_scan_failures_summary(requested: usize, probe_failures: &[(String,
     summary
 }
 
+/// An album's format, aggregated across all of its tracks (`§5.5`/`§5.7` album format pill). The
+/// per-track input is whatever `AudioInfo.format` string `probe_file` set in
+/// `src/audio/decoder.rs` — today always exactly `"FLAC"`, `"WAV"`, `"MP3"` or `"WavPack"`, never
+/// anything else, since every other extension is refused before a `TrackRecord` exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlbumFormat {
+    Mp3,
+    Flac,
+    WavPack,
+    Wav,
+    Mix,
+}
+
+impl AlbumFormat {
+    /// The pill's display label: `"MP3"`, `"FLAC"`, `"WavPack"`, `"WAV"`, `"Mix Formats"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            AlbumFormat::Mp3 => "MP3",
+            AlbumFormat::Flac => "FLAC",
+            AlbumFormat::WavPack => "WavPack",
+            AlbumFormat::Wav => "WAV",
+            AlbumFormat::Mix => "Mix Formats",
+        }
+    }
+
+    /// The Slint-side `FormatPill.variant` string that picks the pill's color.
+    pub fn variant(self) -> &'static str {
+        match self {
+            AlbumFormat::Mp3 => "mp3",
+            AlbumFormat::Flac => "flac",
+            AlbumFormat::WavPack => "wavpack",
+            AlbumFormat::Wav => "wav",
+            AlbumFormat::Mix => "mix",
+        }
+    }
+}
+
+/// Aggregates an album's per-track format strings into one album-level `AlbumFormat`: `None` for
+/// an empty track list (an album whose tracks have not resolved yet), the matching single format
+/// when every track shares the same one (matched case-insensitively — `probe_file` itself only
+/// ever emits one fixed case per format, but nothing here should rely on that staying true), or
+/// `AlbumFormat::Mix` once two or more distinct formats are present, however many. A format string
+/// this module does not recognize also falls back to `Mix` rather than panicking or silently
+/// picking a label for it — `probe_file` today never produces one, since every unsupported
+/// extension is refused before a `TrackRecord` exists, but this keeps the function total.
+pub fn aggregate_album_format<'a>(track_formats: impl Iterator<Item = &'a str>) -> Option<AlbumFormat> {
+    let mut distinct: Vec<String> = Vec::new();
+    for format in track_formats {
+        let lower = format.to_ascii_lowercase();
+        if !distinct.contains(&lower) {
+            distinct.push(lower);
+        }
+    }
+    match distinct.as_slice() {
+        [] => None,
+        [only] => Some(match only.as_str() {
+            "mp3" => AlbumFormat::Mp3,
+            "flac" => AlbumFormat::Flac,
+            "wavpack" => AlbumFormat::WavPack,
+            "wav" => AlbumFormat::Wav,
+            _ => AlbumFormat::Mix,
+        }),
+        _ => Some(AlbumFormat::Mix),
+    }
+}
+
 fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -367,6 +433,47 @@ mod tests {
         assert_eq!(format_search_section_header("Songs", 12, 12), "Songs (12)");
         assert_eq!(format_search_section_header("Songs", 200, 532), "Songs \u{2014} Showing first 200 of 532");
         assert_eq!(format_search_section_header("Albums", 0, 0), "Albums (0)");
+    }
+
+    #[test]
+    fn aggregate_album_format_matches_single_shared_formats() {
+        assert_eq!(aggregate_album_format(["MP3", "MP3", "MP3"].into_iter()), Some(AlbumFormat::Mp3));
+        assert_eq!(aggregate_album_format(["FLAC", "FLAC"].into_iter()), Some(AlbumFormat::Flac));
+        assert_eq!(aggregate_album_format(["WavPack", "WavPack"].into_iter()), Some(AlbumFormat::WavPack));
+        assert_eq!(aggregate_album_format(["WAV", "WAV"].into_iter()), Some(AlbumFormat::Wav));
+    }
+
+    #[test]
+    fn aggregate_album_format_handles_single_track_and_empty_albums() {
+        assert_eq!(aggregate_album_format(["FLAC"].into_iter()), Some(AlbumFormat::Flac));
+        assert_eq!(aggregate_album_format(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn aggregate_album_format_is_mix_once_two_or_more_formats_are_present() {
+        assert_eq!(aggregate_album_format(["FLAC", "MP3"].into_iter()), Some(AlbumFormat::Mix));
+        assert_eq!(aggregate_album_format(["FLAC", "WAV", "WavPack"].into_iter()), Some(AlbumFormat::Mix));
+        assert_eq!(aggregate_album_format(["MP3", "MP3", "WAV"].into_iter()), Some(AlbumFormat::Mix));
+    }
+
+    #[test]
+    fn aggregate_album_format_matches_case_insensitively() {
+        assert_eq!(aggregate_album_format(["flac", "FLAC", "Flac"].into_iter()), Some(AlbumFormat::Flac));
+        assert_eq!(aggregate_album_format(["wavpack", "WAVPACK"].into_iter()), Some(AlbumFormat::WavPack));
+    }
+
+    #[test]
+    fn aggregate_album_format_labels_and_variants() {
+        assert_eq!(AlbumFormat::Mp3.label(), "MP3");
+        assert_eq!(AlbumFormat::Flac.label(), "FLAC");
+        assert_eq!(AlbumFormat::WavPack.label(), "WavPack");
+        assert_eq!(AlbumFormat::Wav.label(), "WAV");
+        assert_eq!(AlbumFormat::Mix.label(), "Mix Formats");
+        assert_eq!(AlbumFormat::Mp3.variant(), "mp3");
+        assert_eq!(AlbumFormat::Flac.variant(), "flac");
+        assert_eq!(AlbumFormat::WavPack.variant(), "wavpack");
+        assert_eq!(AlbumFormat::Wav.variant(), "wav");
+        assert_eq!(AlbumFormat::Mix.variant(), "mix");
     }
 
     #[test]

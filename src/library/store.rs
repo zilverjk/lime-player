@@ -20,6 +20,13 @@ pub struct LibrarySources {
     /// Added folders ("Open Folder…"), re-walked at every startup so new files placed in them
     /// since the last run show up automatically.
     pub folders: Vec<PathBuf>,
+    /// Individually opened `.cue` sheets ("Open Files…", a `.cue` picked directly): re-scanned
+    /// (never re-enqueued) at the next startup so its own folder's cue expansion runs again,
+    /// exactly like a saved `files`/`folders` entry. `#[serde(default)]` (on the whole struct
+    /// above) so a `library.json` written before this field existed still loads: only the *source*
+    /// paths persist here, never the cue-derived `TrackKey`/`TrackRecord`s themselves, which are
+    /// always rebuilt by rescanning.
+    pub cue_files: Vec<PathBuf>,
 }
 
 impl LibrarySources {
@@ -37,6 +44,14 @@ impl LibrarySources {
     pub fn add_folder(&mut self, path: PathBuf) {
         if !self.folders.contains(&path) {
             self.folders.push(path);
+        }
+    }
+
+    /// Adds a directly-opened `.cue` sheet path if it is not already present (same de-dup as
+    /// `add_file`).
+    pub fn add_cue_file(&mut self, path: PathBuf) {
+        if !self.cue_files.contains(&path) {
+            self.cue_files.push(path);
         }
     }
 
@@ -99,11 +114,39 @@ mod tests {
         let mut sources = LibrarySources::default();
         sources.add_file(PathBuf::from("/Volumes/nas/song.flac"));
         sources.add_folder(PathBuf::from("/Volumes/nas/Album"));
+        sources.add_cue_file(PathBuf::from("/Volumes/nas/Album/album.cue"));
 
         save_to(&path, &sources).unwrap();
         let loaded = load_from(&path).unwrap();
 
         assert_eq!(loaded, sources);
+        assert_eq!(loaded.cue_files, vec![PathBuf::from("/Volumes/nas/Album/album.cue")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_cue_file_deduplicates_exact_paths() {
+        let mut sources = LibrarySources::default();
+        sources.add_cue_file(PathBuf::from("/music/Album/album.cue"));
+        sources.add_cue_file(PathBuf::from("/music/Album/album.cue"));
+
+        assert_eq!(sources.cue_files, vec![PathBuf::from("/music/Album/album.cue")]);
+    }
+
+    /// `#[serde(default)]` on `LibrarySources` must let a `library.json` written before
+    /// `cue_files` existed still load, with `cue_files` defaulting to empty instead of failing to
+    /// parse (`CLAUDE.md` CUE-sheet playback support, §7).
+    #[test]
+    fn a_library_json_without_cue_files_still_loads() {
+        let dir = temp_dir("pre-cue-files");
+        let path = dir.join("library.json");
+        std::fs::write(&path, br#"{"files":["/music/a.flac"],"folders":["/music/Album"]}"#).unwrap();
+
+        let loaded = load_from(&path).unwrap();
+
+        assert_eq!(loaded.files, vec![PathBuf::from("/music/a.flac")]);
+        assert_eq!(loaded.folders, vec![PathBuf::from("/music/Album")]);
+        assert!(loaded.cue_files.is_empty(), "an old library.json with no cue_files field must default to empty, not fail to load");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

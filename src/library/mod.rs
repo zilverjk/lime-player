@@ -4,6 +4,7 @@
 //! (individually opened files and added folders) so `main.rs` can rebuild this same session
 //! library at the next startup by re-running them through `scanner::LibraryScanner`.
 
+pub mod cue;
 pub mod format;
 pub mod scanner;
 pub mod store;
@@ -13,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::audio::{AudioInfo, PreparedTrack, TrackTags};
+use format::aggregate_album_format;
 
 /// Decoded, downscaled album art (RGB8, longest side capped at 400 px by `scanner::decode_artwork`).
 /// Converted to a `slint::Image` on the UI thread only (`§3.3` "Artwork cache").
@@ -30,9 +32,44 @@ pub enum ArtworkSource {
     None,
 }
 
-#[derive(Clone, Debug)]
-pub struct TrackRecord {
+/// Identity of a logical track: a physical file path plus the `[start_frame, end_frame)`
+/// sample-frame sub-range it plays within that file. A normal whole-file track is
+/// `TrackKey { path, start_frame: 0, end_frame: None }`. A CUE sub-range track's
+/// `start_frame`/`end_frame` are in sample frames of the underlying physical file, computed via
+/// `cue::cue_time_to_sample_frame` once the file's real sample rate is known; `end_frame` is
+/// exclusive (`[start_frame, end_frame)`), and the last track of a physical file has `end_frame:
+/// None`, meaning "to EOF". `Ord`/`Hash` let this serve as a `HashMap`/`Library` key and give a
+/// deterministic sort/dedup order (path, then start_frame, then end_frame).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TrackKey {
     pub path: PathBuf,
+    pub start_frame: u64,
+    pub end_frame: Option<u64>,
+}
+
+impl TrackKey {
+    /// The key for an ordinary, non-CUE whole-file track.
+    pub fn whole_file(path: PathBuf) -> Self {
+        Self { path, start_frame: 0, end_frame: None }
+    }
+}
+
+/// The stable string form of a `TrackKey`, used for `TrackRowData.key`/`now-playing-key` on the
+/// Slint side, where two CUE tracks derived from the same physical file must render distinct
+/// strings (`key.path` alone would collide). A whole-file track's key keeps its original plain
+/// `path.display()` format unchanged, so nothing downstream that already parses/compares it as a
+/// bare path breaks.
+pub fn track_key_string(key: &TrackKey) -> String {
+    if key.start_frame == 0 && key.end_frame.is_none() {
+        key.path.display().to_string()
+    } else {
+        format!("{}#{}", key.path.display(), key.start_frame)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackRecord {
+    pub key: TrackKey,
     // Read by `Library::prepared` (queue actions from library rows) and `summarize_album`
     // (album-detail headers, `§6` Stage 6).
     pub info: AudioInfo,
@@ -49,8 +86,8 @@ impl TrackRecord {
     /// A record with no tags, no art and no known size, built from a scanner `Probed` event so
     /// the file shows up under its fallback name immediately (`§3.3` "UI handling of scanner
     /// events").
-    pub fn minimal(path: PathBuf, info: AudioInfo) -> Self {
-        Self { path, info, file_size: None, tags: TrackTags::default(), artwork: None, artwork_source: ArtworkSource::None, added_seq: 0 }
+    pub fn minimal(key: TrackKey, info: AudioInfo) -> Self {
+        Self { key, info, file_size: None, tags: TrackTags::default(), artwork: None, artwork_source: ArtworkSource::None, added_seq: 0 }
     }
 }
 
@@ -66,6 +103,16 @@ pub struct AlbumSummary {
     pub track_count: usize,
     pub total_duration_ms: u64,
     pub first_added_seq: u64,
+    /// The album format pill's label/variant (`§5.5`/`§5.7`), precomputed once here — in the same
+    /// pass over this album's tracks that builds the rest of the summary — rather than recomputed
+    /// from scratch (`Library::album_tracks` + `aggregate_album_format`) on every album-card/header
+    /// render (`view_model::album_format_pill`, removed): an O(tracks) rescan per card made
+    /// rendering a grid of many albums O(albums × tracks) on the UI thread on every reprojection
+    /// (search keystrokes, nav, throttled rescans). Empty strings for an album with no tracks (only
+    /// possible via `AlbumHeaderData::default()`'s own empty header, never through `summarize_album`
+    /// itself, which is never called with an empty slice).
+    pub format_label: String,
+    pub format_variant: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,27 +125,28 @@ pub struct ArtistSummary {
 #[derive(Default)]
 pub struct Library {
     tracks: Vec<TrackRecord>,
-    by_path: HashMap<PathBuf, usize>,
+    by_key: HashMap<TrackKey, usize>,
     next_seq: u64,
 }
 
 impl Library {
-    /// Inserts `record`, or replaces the record at the same path in place while keeping its
-    /// original `added_seq` (`§3.3`).
+    /// Inserts `record`, or replaces the record at the same `TrackKey` in place while keeping its
+    /// original `added_seq` (`§3.3`). Two records that share a path but differ in `start_frame`/
+    /// `end_frame` (distinct CUE sub-ranges of the same physical file) coexist as separate entries.
     pub fn upsert(&mut self, mut record: TrackRecord) {
-        if let Some(&index) = self.by_path.get(&record.path) {
+        if let Some(&index) = self.by_key.get(&record.key) {
             record.added_seq = self.tracks[index].added_seq;
             self.tracks[index] = record;
         } else {
             record.added_seq = self.next_seq;
             self.next_seq += 1;
-            self.by_path.insert(record.path.clone(), self.tracks.len());
+            self.by_key.insert(record.key.clone(), self.tracks.len());
             self.tracks.push(record);
         }
     }
 
-    pub fn get(&self, path: &Path) -> Option<&TrackRecord> {
-        self.by_path.get(path).map(|&index| &self.tracks[index])
+    pub fn get(&self, key: &TrackKey) -> Option<&TrackRecord> {
+        self.by_key.get(key).map(|&index| &self.tracks[index])
     }
 }
 
@@ -111,10 +159,10 @@ impl Library {
         Self::default()
     }
 
-    /// `path` + `info`, ready for a queue command (`enqueue`/`play_next`/`replace_queue`); `None`
-    /// for a path the library has no record of.
-    pub fn prepared(&self, path: &Path) -> Option<PreparedTrack> {
-        self.get(path).map(|record| PreparedTrack { path: record.path.clone(), info: record.info.clone() })
+    /// `key` + `info`, ready for a queue command (`enqueue`/`play_next`/`replace_queue`); `None`
+    /// for a key the library has no record of.
+    pub fn prepared(&self, key: &TrackKey) -> Option<PreparedTrack> {
+        self.get(key).map(|record| PreparedTrack { key: record.key.clone(), info: record.info.clone() })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -175,7 +223,7 @@ impl Library {
         // `display_title` again on every comparison instead of once per track (`§6`, same fix as
         // `songs` below).
         tracks.sort_by_cached_key(|track| {
-            (track.tags.disc_number.unwrap_or(0), track.tags.track_number.unwrap_or(0), display_title(track).to_lowercase(), track.path.clone())
+            (track.tags.disc_number.unwrap_or(0), track.tags.track_number.unwrap_or(0), display_title(track).to_lowercase(), track.key.clone())
         });
         tracks
     }
@@ -322,7 +370,11 @@ fn summarize_album(tracks: &[&TrackRecord]) -> AlbumSummary {
     let year = tracks.iter().filter_map(|track| track.tags.year).min();
     let total_duration_ms = tracks.iter().filter_map(|track| track.info.duration_ms).sum();
     let first_added_seq = tracks.iter().map(|track| track.added_seq).min().unwrap_or(0);
-    AlbumSummary { key, title, artist, year, track_count: tracks.len(), total_duration_ms, first_added_seq }
+    let (format_label, format_variant) = match aggregate_album_format(tracks.iter().map(|track| track.info.format.as_str())) {
+        Some(format) => (format.label().to_owned(), format.variant().to_owned()),
+        None => (String::new(), String::new()),
+    };
+    AlbumSummary { key, title, artist, year, track_count: tracks.len(), total_duration_ms, first_added_seq, format_label, format_variant }
 }
 
 /// Deterministic, case-insensitive, trimmed album grouping key (`§3.3` "Album grouping key"). Used
@@ -331,7 +383,7 @@ fn summarize_album(tracks: &[&TrackRecord]) -> AlbumSummary {
 pub fn album_key(record: &TrackRecord) -> String {
     let album = record.tags.album.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let album_artist = record.tags.album_artist.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let parent = record.path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let parent = record.key.path.parent().map(Path::to_path_buf).unwrap_or_default();
     match (album_artist, album) {
         (Some(album_artist), Some(album)) => format!("aa:{}\u{1f}{}", album_artist.to_lowercase(), album.to_lowercase()),
         (None, Some(album)) => format!("af:{}\u{1f}{}", album.to_lowercase(), parent.display()),
@@ -340,7 +392,7 @@ pub fn album_key(record: &TrackRecord) -> String {
 }
 
 pub fn display_title(record: &TrackRecord) -> String {
-    record.tags.title.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).unwrap_or_else(|| file_stem(&record.path))
+    record.tags.title.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).unwrap_or_else(|| file_stem(&record.key.path))
 }
 
 pub fn display_artist(record: &TrackRecord) -> String {
@@ -363,7 +415,7 @@ pub fn display_album(record: &TrackRecord) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
-        .or_else(|| record.path.parent().and_then(Path::file_name).and_then(|name| name.to_str()).map(str::to_owned))
+        .or_else(|| record.key.path.parent().and_then(Path::file_name).and_then(|name| name.to_str()).map(str::to_owned))
         .unwrap_or_else(|| "Unknown Album".to_owned())
 }
 
@@ -396,9 +448,13 @@ fn xorshift64star(mut x: u64) -> u64 {
 mod tests {
     use super::*;
 
+    fn key(path: &str) -> TrackKey {
+        TrackKey::whole_file(PathBuf::from(path))
+    }
+
     fn track(path: &str, tags: TrackTags, duration_ms: Option<u64>, added_seq: u64) -> TrackRecord {
         TrackRecord {
-            path: PathBuf::from(path),
+            key: key(path),
             info: AudioInfo {
                 sample_rate: 44_100,
                 duration_ms,
@@ -462,6 +518,37 @@ mod tests {
         assert_eq!(albums[0].total_duration_ms, 380_000);
     }
 
+    /// `AlbumSummary.format_label`/`format_variant` (§I "album_format_pill recomputes format
+    /// aggregation from scratch on every album-card render"): computed once in `summarize_album`
+    /// from the album's own tracks, matching what `aggregate_album_format` would compute directly —
+    /// a single shared format pins the label/variant, and disagreeing formats fall back to "Mix
+    /// Formats"/"mix", exactly like the removed per-render `view_model::album_format_pill` did.
+    #[test]
+    fn album_summary_precomputes_format_label_and_variant() {
+        fn track_with_format(path: &str, format: &str, added_seq: u64) -> TrackRecord {
+            let mut record = track(path, tags("Song", "Artist", "Uniform", None), Some(60_000), added_seq);
+            record.info.format = format.to_owned();
+            record
+        }
+
+        let uniform = library_with(vec![
+            track_with_format("/music/Uniform/a.flac", "FLAC", 0),
+            track_with_format("/music/Uniform/b.flac", "FLAC", 1),
+        ]);
+        let uniform_album = uniform.albums("", None).into_iter().next().expect("one album");
+        assert_eq!(uniform_album.format_label, "FLAC");
+        assert_eq!(uniform_album.format_variant, "flac");
+
+        let mut mixed_a = track_with_format("/music/Mixed/a.flac", "FLAC", 0);
+        mixed_a.tags.album = Some("Mixed".into());
+        let mut mixed_b = track_with_format("/music/Mixed/b.mp3", "MP3", 1);
+        mixed_b.tags.album = Some("Mixed".into());
+        let mixed = library_with(vec![mixed_a, mixed_b]);
+        let mixed_album = mixed.albums("", None).into_iter().find(|album| album.title == "Mixed").expect("mixed album");
+        assert_eq!(mixed_album.format_label, "Mix Formats");
+        assert_eq!(mixed_album.format_variant, "mix");
+    }
+
     #[test]
     fn album_tracks_sort_by_disc_track_title() {
         let mut second = tags("Second", "Artist", "Album", Some("Band"));
@@ -479,7 +566,7 @@ mod tests {
             track("/music/Album/disc2.flac", disc2, None, 1),
             track("/music/Album/first.flac", first, None, 2),
         ]);
-        let key = album_key(library.get(Path::new("/music/Album/first.flac")).unwrap());
+        let key = album_key(library.get(&key("/music/Album/first.flac")).unwrap());
 
         let ordered = library.album_tracks(&key);
 
@@ -556,15 +643,83 @@ mod tests {
         // still pass this test by accident.
         library.upsert(track("/music/zzz.flac", tags("Other", "Artist", "Album", None), None, 0));
         library.upsert(track("/music/a.flac", tags("Old Title", "Artist", "Album", None), None, 0));
-        let first_seq = library.get(Path::new("/music/a.flac")).unwrap().added_seq;
+        let first_seq = library.get(&key("/music/a.flac")).unwrap().added_seq;
         assert_ne!(first_seq, 0);
 
         library.upsert(track("/music/a.flac", tags("New Title", "Artist", "Album", None), None, 99));
 
-        let record = library.get(Path::new("/music/a.flac")).unwrap();
+        let record = library.get(&key("/music/a.flac")).unwrap();
         assert_eq!(record.added_seq, first_seq);
         assert_ne!(record.added_seq, 99);
         assert_eq!(display_title(record), "New Title");
+    }
+
+    fn track_with_key(key: TrackKey, tags: TrackTags, duration_ms: Option<u64>, added_seq: u64) -> TrackRecord {
+        TrackRecord {
+            key,
+            info: AudioInfo {
+                sample_rate: 44_100,
+                duration_ms,
+                source_channels: 2,
+                bits_per_sample: 16,
+                is_float: false,
+                integer_pcm: true,
+                format: "FLAC".into(),
+            },
+            file_size: None,
+            tags,
+            artwork: None,
+            artwork_source: ArtworkSource::None,
+            added_seq,
+        }
+    }
+
+    #[test]
+    fn track_key_equality_hash_and_ordering() {
+        let whole = TrackKey::whole_file(PathBuf::from("/music/a.flac"));
+        let same_whole = TrackKey { path: PathBuf::from("/music/a.flac"), start_frame: 0, end_frame: None };
+        let sub_range_a = TrackKey { path: PathBuf::from("/music/a.flac"), start_frame: 100, end_frame: Some(200) };
+        let sub_range_b = TrackKey { path: PathBuf::from("/music/a.flac"), start_frame: 200, end_frame: None };
+
+        assert_eq!(whole, same_whole, "two keys with identical fields must be equal");
+        assert_ne!(whole, sub_range_a, "a whole-file key must differ from a sub-range key on the same path");
+        assert_ne!(sub_range_a, sub_range_b, "two sub-ranges of the same file with different bounds must differ");
+
+        // Usable as a HashMap key: distinct keys map to distinct slots, equal keys collide.
+        let mut map = HashMap::new();
+        map.insert(whole.clone(), "whole");
+        map.insert(sub_range_a.clone(), "a");
+        map.insert(sub_range_b.clone(), "b");
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&same_whole), Some(&"whole"));
+
+        // Deterministic ordering: sorted primarily by path, then start_frame, then end_frame —
+        // `derive(Ord)` on the struct's field order already gives this, asserted directly so a
+        // future field reorder cannot silently change the sort order relied on for dedup.
+        let mut keys = vec![sub_range_b.clone(), whole.clone(), sub_range_a.clone()];
+        keys.sort();
+        assert_eq!(keys, vec![whole, sub_range_a, sub_range_b]);
+    }
+
+    #[test]
+    fn library_keyed_by_track_key_lets_sub_ranges_of_one_file_coexist() {
+        let mut library = Library::new();
+        let path = PathBuf::from("/music/album.flac");
+        let track_one = TrackKey { path: path.clone(), start_frame: 0, end_frame: Some(1_000) };
+        let track_two = TrackKey { path: path.clone(), start_frame: 1_000, end_frame: None };
+
+        library.upsert(track_with_key(track_one.clone(), tags("Track One", "Artist", "Album", None), Some(20_000), 0));
+        library.upsert(track_with_key(track_two.clone(), tags("Track Two", "Artist", "Album", None), Some(30_000), 0));
+
+        assert_eq!(library.get(&track_one).map(display_title), Some("Track One".to_owned()));
+        assert_eq!(library.get(&track_two).map(display_title), Some("Track Two".to_owned()));
+        assert_eq!(library.songs("").len(), 2, "two distinct sub-ranges of one physical file are two separate tracks");
+
+        // The exact same key (same path AND same sub-range) replaces in place, exactly like a
+        // whole-file upsert already does.
+        library.upsert(track_with_key(track_one.clone(), tags("Track One Retagged", "Artist", "Album", None), Some(20_000), 0));
+        assert_eq!(library.songs("").len(), 2, "re-upserting the same sub-range key must replace, not add a third track");
+        assert_eq!(library.get(&track_one).map(display_title), Some("Track One Retagged".to_owned()));
     }
 
     #[test]
@@ -603,7 +758,7 @@ mod tests {
         let info = crate::audio::probe_file(&path).unwrap();
         let metadata = crate::audio::read_metadata(&path).unwrap();
         let record = TrackRecord {
-            path: path.clone(),
+            key: TrackKey::whole_file(path.clone()),
             info,
             file_size: None,
             tags: metadata.tags,

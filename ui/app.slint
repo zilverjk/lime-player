@@ -8,7 +8,7 @@
 import { ComboBox, Palette, ScrollView } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 import {
-    ActionButton, AlbumGrid, ArtistListRow, ArtworkView, Badge, ButtonKind, EmptyState, Icon, IconButton, NavItem, Scrubber,
+    ActionButton, AlbumGrid, ArtistListRow, ArtworkView, Badge, ButtonKind, EmptyState, FormatPill, Icon, IconButton, NavItem, Scrubber,
     SectionLabel, TrackTable, VDivider, VirtualizedTrackTable,
     View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData,
 } from "widgets.slint";
@@ -1047,7 +1047,12 @@ component AlbumDetailView inherits Rectangle {
                             artist-label := Text { width: 100%; text: root.header.artist; font-size: Theme.fs-subtitle; color: Theme.accent; overflow: elide; }
                             TouchArea { clicked => { root.artist-opened(root.header.artist); } }
                         }
-                        Text { text: root.header.meta; font-size: Theme.fs-meta; color: Theme.text-secondary; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            Text { text: root.header.meta; font-size: Theme.fs-meta; color: Theme.text-secondary; }
+                            if root.header.format-label != "": FormatPill { text: root.header.format-label; variant: root.header.format-variant; }
+                        }
                         Rectangle { height: 4px; }
                         HorizontalLayout {
                             spacing: 12px;

@@ -46,6 +46,18 @@ export global Theme {
     out property <color> art-placeholder-bg: #1f221f;
     out property <color> art-placeholder-icon: #4c524b;
 
+    // Album format pill colors (`§5.5`/`§5.7`): MP3 reuses `accent-soft`/`accent-strong` above
+    // (the same lime green the Hi-Res badge already uses). Each pair follows that same shape — a
+    // dark, low-luminance background plus a bright, readable-on-black text color.
+    out property <color> flac-soft: #241f33;
+    out property <color> flac-strong: #b38ef5;
+    out property <color> wavpack-soft: #332c1f;
+    out property <color> wavpack-strong: #f5c15a;
+    out property <color> mix-soft: #1f2a33;
+    out property <color> mix-strong: #5ab3f5;
+    out property <color> wav-soft: #242524;
+    out property <color> wav-strong: #c7cac6;
+
     // Typography (`§5.2`).
     out property <length> fs-caption: 10px;
     out property <length> fs-label: 11px;

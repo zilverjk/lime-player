@@ -105,14 +105,56 @@ fn sample_art(art: Option<(u32, u32, [u8; 3])>) -> (Image, bool) {
     }
 }
 
-fn sample_album(key: &str, title: &str, artist: &str, subtitle: &str, art: Option<(u32, u32, [u8; 3])>) -> AlbumCardData {
+/// `format_label`/`format_variant` are passed through verbatim to `AlbumCardData` — pass `("", "")`
+/// for a scenario where the format pill doesn't matter (omitted entirely, per `FormatPill`'s
+/// `AlbumTile` usage in `ui/widgets.slint`), or one of the `AlbumFormat::label()`/`variant()` pairs
+/// from `src/library/format.rs` (`"MP3"`/`"mp3"`, `"FLAC"`/`"flac"`, `"WavPack"`/`"wavpack"`,
+/// `"Mix Formats"`/`"mix"`, `"WAV"`/`"wav"`) to render one.
+#[allow(clippy::too_many_arguments)]
+fn sample_album(
+    key: &str,
+    title: &str,
+    artist: &str,
+    subtitle: &str,
+    art: Option<(u32, u32, [u8; 3])>,
+    format_label: &str,
+    format_variant: &str,
+) -> AlbumCardData {
     let (art, has_art) = sample_art(art);
-    AlbumCardData { key: key.into(), title: title.into(), artist: artist.into(), subtitle: subtitle.into(), art, has_art }
+    AlbumCardData {
+        key: key.into(),
+        title: title.into(),
+        artist: artist.into(),
+        subtitle: subtitle.into(),
+        art,
+        has_art,
+        format_label: format_label.into(),
+        format_variant: format_variant.into(),
+    }
 }
 
-fn sample_album_header(key: &str, title: &str, artist: &str, meta: &str, art: Option<(u32, u32, [u8; 3])>) -> AlbumHeaderData {
+/// See `sample_album` above for `format_label`/`format_variant`.
+#[allow(clippy::too_many_arguments)]
+fn sample_album_header(
+    key: &str,
+    title: &str,
+    artist: &str,
+    meta: &str,
+    art: Option<(u32, u32, [u8; 3])>,
+    format_label: &str,
+    format_variant: &str,
+) -> AlbumHeaderData {
     let (art, has_art) = sample_art(art);
-    AlbumHeaderData { key: key.into(), title: title.into(), artist: artist.into(), meta: meta.into(), art, has_art }
+    AlbumHeaderData {
+        key: key.into(),
+        title: title.into(),
+        artist: artist.into(),
+        meta: meta.into(),
+        art,
+        has_art,
+        format_label: format_label.into(),
+        format_variant: format_variant.into(),
+    }
 }
 
 fn sample_artist(name: &str, subtitle: &str) -> ArtistRowData {
@@ -226,15 +268,15 @@ fn render_snapshots() {
         ui.set_nav_view(View::Home);
         ui.set_library_empty(false);
         ui.set_jump_back_albums(ModelRc::new(VecModel::from(vec![
-            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68]))),
-            sample_album("album-cold-shapes", "Cold Shapes", "Other Artist", "2019 · 9 tracks", None),
+            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68])), "", ""),
+            sample_album("album-cold-shapes", "Cold Shapes", "Other Artist", "2019 · 9 tracks", None, "", ""),
         ])));
         ui.set_recent_albums(ModelRc::new(VecModel::from(vec![
-            sample_album("album-night-drive", "Night Drive", "The Collective", "2024 · 8 tracks", Some((64, 64, [80, 140, 190]))),
-            sample_album("album-paper-trail", "Paper Trail", "Solo Artist", "2023 · 5 tracks", None),
-            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200]))),
-            sample_album("album-low-tide", "Low Tide", "Other Artist", "2021 · 7 tracks", None),
-            sample_album("album-fault-lines", "Fault Lines", "The Collective", "2020 · 11 tracks", Some((64, 64, [90, 170, 120]))),
+            sample_album("album-night-drive", "Night Drive", "The Collective", "2024 · 8 tracks", Some((64, 64, [80, 140, 190])), "", ""),
+            sample_album("album-paper-trail", "Paper Trail", "Solo Artist", "2023 · 5 tracks", None, "", ""),
+            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200])), "", ""),
+            sample_album("album-low-tide", "Low Tide", "Other Artist", "2021 · 7 tracks", None, "", ""),
+            sample_album("album-fault-lines", "Fault Lines", "The Collective", "2020 · 11 tracks", Some((64, 64, [90, 170, 120])), "", ""),
         ])));
         ui.window().show().unwrap();
         render_scenario(&window, &dir, "home-populated");
@@ -253,22 +295,25 @@ fn render_snapshots() {
         ui.set_library_empty(false);
         ui.set_unified_title_bar(true);
         ui.set_jump_back_albums(ModelRc::new(VecModel::from(vec![
-            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68]))),
-            sample_album("album-cold-shapes", "Cold Shapes", "Other Artist", "2019 · 9 tracks", None),
+            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68])), "", ""),
+            sample_album("album-cold-shapes", "Cold Shapes", "Other Artist", "2019 · 9 tracks", None, "", ""),
         ])));
         ui.set_recent_albums(ModelRc::new(VecModel::from(vec![
-            sample_album("album-night-drive", "Night Drive", "The Collective", "2024 · 8 tracks", Some((64, 64, [80, 140, 190]))),
-            sample_album("album-paper-trail", "Paper Trail", "Solo Artist", "2023 · 5 tracks", None),
-            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200]))),
-            sample_album("album-low-tide", "Low Tide", "Other Artist", "2021 · 7 tracks", None),
-            sample_album("album-fault-lines", "Fault Lines", "The Collective", "2020 · 11 tracks", Some((64, 64, [90, 170, 120]))),
+            sample_album("album-night-drive", "Night Drive", "The Collective", "2024 · 8 tracks", Some((64, 64, [80, 140, 190])), "", ""),
+            sample_album("album-paper-trail", "Paper Trail", "Solo Artist", "2023 · 5 tracks", None, "", ""),
+            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200])), "", ""),
+            sample_album("album-low-tide", "Low Tide", "Other Artist", "2021 · 7 tracks", None, "", ""),
+            sample_album("album-fault-lines", "Fault Lines", "The Collective", "2020 · 11 tracks", Some((64, 64, [90, 170, 120])), "", ""),
         ])));
         ui.window().show().unwrap();
         render_scenario(&window, &dir, "home-unified-titlebar");
         ui.window().hide().unwrap();
     }
 
-    // Scenario 1d: the Albums grid (`§6` Stage 6), same art-mix rule as Home's shelves.
+    // Scenario 1d: the Albums grid (`§6` Stage 6), same art-mix rule as Home's shelves. Also
+    // exercises every `FormatPill` color/variant (`§5.5`) — one card per `AlbumFormat` value
+    // (`src/library/format.rs`), including "Mix Formats" for an album whose tracks aren't all the
+    // same format, plus one card with no pill at all (empty label omits it entirely).
     {
         let window = new_window();
         let ui = MainWindow::new().unwrap();
@@ -276,12 +321,12 @@ fn render_snapshots() {
         ui.set_nav_view(View::Albums);
         ui.set_library_empty(false);
         ui.set_albums(ModelRc::new(VecModel::from(vec![
-            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68]))),
-            sample_album("album-cold-shapes", "Cold Shapes", "Other Artist", "2019 · 9 tracks", None),
-            sample_album("album-night-drive", "Night Drive", "The Collective", "2024 · 8 tracks", Some((64, 64, [80, 140, 190]))),
-            sample_album("album-paper-trail", "Paper Trail", "Solo Artist", "2023 · 5 tracks", None),
-            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200]))),
-            sample_album("album-low-tide", "Low Tide", "Other Artist", "2021 · 7 tracks", None),
+            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68])), "MP3", "mp3"),
+            sample_album("album-cold-shapes", "Cold Shapes", "Other Artist", "2019 · 9 tracks", None, "FLAC", "flac"),
+            sample_album("album-night-drive", "Night Drive", "The Collective", "2024 · 8 tracks", Some((64, 64, [80, 140, 190])), "WavPack", "wavpack"),
+            sample_album("album-paper-trail", "Paper Trail", "Solo Artist", "2023 · 5 tracks", None, "Mix Formats", "mix"),
+            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200])), "WAV", "wav"),
+            sample_album("album-low-tide", "Low Tide", "Other Artist", "2021 · 7 tracks", None, "", ""),
         ])));
         ui.window().show().unwrap();
         render_scenario(&window, &dir, "albums-grid");
@@ -342,6 +387,8 @@ fn render_snapshots() {
             "Berliner Philharmoniker, Herbert von Karajan, Anne-Sophie Mutter, Mstislav Rostropovich, Nina Path",
             "2021 · 4 tracks · 18:32",
             Some((200, 200, [196, 120, 68])),
+            "FLAC",
+            "flac",
         ));
         ui.set_now_playing_key("track-3".into());
         ui.set_album_tracks(ModelRc::new(VecModel::from(vec![
@@ -352,6 +399,42 @@ fn render_snapshots() {
         ])));
         ui.window().show().unwrap();
         render_scenario(&window, &dir, "album-detail");
+        ui.window().hide().unwrap();
+    }
+
+    // Scenario 1g-bis: a CUE-derived album detail — a single physical WavPack file split into
+    // sequential tracks by a cue sheet (`TrackKey`, decoder end-frame truncation, scanner CUE
+    // expansion): plain "1".."6" track numbers (no disc-dash prefix, unlike the multi-disc scenario
+    // above), a shared "WavPack 24/96" badge on every row (the whole album is one decoded file, so
+    // every track shares the same format/rate/bit depth), and the header itself showing the WavPack
+    // format pill (`format-label`/`format-variant`, `§5.5`/`§5.7`).
+    {
+        let window = new_window();
+        let ui = MainWindow::new().unwrap();
+        ui.set_view(View::AlbumDetail);
+        ui.set_nav_view(View::Albums);
+        ui.set_library_empty(false);
+        ui.set_can_go_back(true);
+        ui.set_album_header(sample_album_header(
+            "album-live-at-the-grotto",
+            "Live at the Grotto",
+            "Nina Path",
+            "2018 · 6 tracks · 27:41",
+            Some((200, 200, [110, 150, 95])),
+            "WavPack",
+            "wavpack",
+        ));
+        ui.set_now_playing_key("cue-track-3".into());
+        ui.set_album_tracks(ModelRc::new(VecModel::from(vec![
+            sample_row("cue-track-1", "1", "Walking In", "Live at the Grotto", "WavPack 24/96", "4:12"),
+            sample_row("cue-track-2", "2", "Slow Burn", "Live at the Grotto", "WavPack 24/96", "3:58"),
+            sample_row("cue-track-3", "3", "Turnstile", "Live at the Grotto", "WavPack 24/96", "5:20"),
+            sample_row("cue-track-4", "4", "Low Light", "Live at the Grotto", "WavPack 24/96", "4:47"),
+            sample_row("cue-track-5", "5", "Undertow", "Live at the Grotto", "WavPack 24/96", "3:31"),
+            sample_row("cue-track-6", "6", "Walking Out", "Live at the Grotto", "WavPack 24/96", "5:53"),
+        ])));
+        ui.window().show().unwrap();
+        render_scenario(&window, &dir, "cue-album");
         ui.window().hide().unwrap();
     }
 
@@ -392,8 +475,8 @@ fn render_snapshots() {
         ])));
         ui.set_search_albums_header("Albums (2)".into());
         ui.set_search_albums(ModelRc::new(VecModel::from(vec![
-            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68]))),
-            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200]))),
+            sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68])), "", ""),
+            sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200])), "", ""),
         ])));
         ui.set_artists(ModelRc::new(VecModel::from(vec![sample_artist("Nina Path", "2 albums · 22 tracks")])));
         ui.set_search_artists_header("Artists (1)".into());

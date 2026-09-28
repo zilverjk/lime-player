@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -13,6 +13,7 @@ use rtrb::{Consumer, RingBuffer};
 
 use super::coreaudio::{self, DacState, HogLease};
 use super::decoder::{AudioInfo, PcmSample, decode_file};
+use crate::library::TrackKey;
 
 const RING_SAMPLES: usize = 65_536;
 const PREBUFFER_MILLISECONDS: usize = 60;
@@ -174,7 +175,7 @@ pub struct PlayerSettings {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueueTrackSnapshot {
-    pub path: PathBuf,
+    pub key: TrackKey,
     pub title: String,
     pub parent_folder: String,
     pub format: String,
@@ -197,7 +198,7 @@ impl Default for PlayerSettings {
 pub enum PlaybackEvent {
     Devices(Vec<OutputDevice>),
     Started {
-        path: PathBuf,
+        key: TrackKey,
         info: AudioInfo,
         title: String,
         album: String,
@@ -240,8 +241,8 @@ enum Command {
     PlayNext(Vec<PreparedTrack>),
     ReplaceQueue(Vec<PreparedTrack>),
     Previous,
-    /// `path` guards against a stale seek racing a track transition.
-    Seek { path: PathBuf, position_ms: u64 },
+    /// `key` guards against a stale seek racing a track transition.
+    Seek { key: TrackKey, position_ms: u64 },
     /// 0.0..=1.0 device volume scalar (`§4.5`).
     SetVolume(f32),
     SelectOutput(Option<String>),
@@ -297,8 +298,8 @@ impl AudioPlayer {
         let _ = self.commands.send(Command::Previous);
     }
 
-    pub fn seek(&self, path: PathBuf, position_ms: u64) {
-        let _ = self.commands.send(Command::Seek { path, position_ms });
+    pub fn seek(&self, key: TrackKey, position_ms: u64) {
+        let _ = self.commands.send(Command::Seek { key, position_ms });
     }
 
     /// `level` is a 0.0..=1.0 device volume scalar (`§4.5`); ignored by the worker when the
@@ -355,7 +356,7 @@ pub fn enumerate_outputs() -> Result<Vec<OutputDevice>, String> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedTrack {
-    pub path: PathBuf,
+    pub key: TrackKey,
     pub info: AudioInfo,
 }
 
@@ -614,15 +615,43 @@ impl ActivePlayback {
     }
 }
 
-/// Latency-compensated audible position for the currently active track.
+/// Latency-compensated, TRACK-RELATIVE audible position for the currently active track (0 at this
+/// track's own `key.start_frame`, per `CLAUDE.md` CUE sheet support §4 — the UI's timeline is
+/// always track-relative, never the underlying physical file's absolute position). Computes the
+/// absolute position first (`active.start_frame`, the absolute decode start this stream was built
+/// with), then subtracts `key.start_frame`'s time equivalent exactly once via
+/// `track_relative_millis`, so every caller of this helper gets the subtraction automatically and
+/// it can never be double-applied or forgotten.
 fn audible_position_for(active: &ActivePlayback) -> u64 {
-    audible_position_millis(
+    let absolute_ms = audible_position_millis(
         active.consumed_output_samples.load(Ordering::Acquire),
         active.start_frame,
         active.output_latency_nanos.load(Ordering::Relaxed),
         active.prepared.info.sample_rate,
     )
-    .unwrap_or(0)
+    .unwrap_or(0);
+    track_relative_millis(absolute_ms, active.prepared.key.start_frame, active.prepared.info.sample_rate)
+}
+
+/// Converts an absolute physical-file-frame position (already in milliseconds) to a position
+/// relative to `key_start_frame` (an active `TrackKey`'s own `start_frame`) — the CUE-track
+/// track-relative Timeline subtraction point (`CLAUDE.md` §4). A whole-file track's
+/// `key_start_frame` is always 0, so this is a no-op subtraction for every non-CUE track.
+/// Saturates rather than underflows: `absolute_ms` should never fall behind `key_start_ms` in
+/// practice, but a clamp is cheaper and safer than a panic on a hot event-emission path.
+fn track_relative_millis(absolute_ms: u64, key_start_frame: u64, sample_rate: u32) -> u64 {
+    absolute_ms.saturating_sub(frame_to_millis(key_start_frame, sample_rate))
+}
+
+/// Frame count -> milliseconds at `sample_rate`, using the same u128-rounding pattern as
+/// `consumed_samples_position_millis`/`seek_target_frame` to avoid overflow. `frame` here is a
+/// plain (non-interleaved) frame count, unlike `consumed_samples_position_millis`'s interleaved
+/// sample count.
+fn frame_to_millis(frame: u64, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    (u128::from(frame) * 1_000 / u128::from(sample_rate)) as u64
 }
 
 fn join_decoder_until(
@@ -664,6 +693,20 @@ fn consumed_samples_position_millis(consumed_samples: u64, sample_rate: u32) -> 
     let complete_stereo_frames = u128::from(consumed_samples / 2);
     let millis = complete_stereo_frames * 1_000 / u128::from(sample_rate);
     u64::try_from(millis).ok()
+}
+
+/// `active`'s absolute consumed-samples position (no latency compensation, unlike
+/// `audible_position_for`), converted to TRACK-RELATIVE milliseconds via `track_relative_millis`
+/// (`CLAUDE.md` CUE sheet support §4). Used at the two Timeline-emission sites (a natural/graceful
+/// drain, a retained playback failure) that report the exact consumed-samples position rather than
+/// the latency-compensated audible one.
+fn active_track_relative_position_ms(active: &ActivePlayback) -> u64 {
+    let absolute_ms = consumed_samples_position_millis(
+        active.consumed_output_samples.load(Ordering::Acquire),
+        active.prepared.info.sample_rate,
+    )
+    .unwrap_or(0);
+    track_relative_millis(absolute_ms, active.prepared.key.start_frame, active.prepared.info.sample_rate)
 }
 
 fn record_output_samples_consumed(counter: &AtomicU64, delivered_samples: u64) {
@@ -868,15 +911,15 @@ fn rate_change_guard_wait(last: Option<&StoppedOutput>, uid: &str, new_rate: u32
     OUTPUT_DRAIN_GUARD.checked_sub(now.duration_since(last.at)).filter(|d| !d.is_zero())
 }
 
-/// Drains same-path `Seek` commands already queued behind the one just received, keeping only
+/// Drains same-key `Seek` commands already queued behind the one just received, keeping only
 /// the latest target so a burst of scrub events collapses into a single seek. The first
 /// non-matching command is returned (to be replayed as `pending_command`) so command order is
 /// preserved (`§4.2`).
-fn drain_same_path_seeks(commands: &Receiver<Command>, path: &Path, initial_position_ms: u64) -> (u64, Option<Command>) {
+fn drain_same_key_seeks(commands: &Receiver<Command>, key: &TrackKey, initial_position_ms: u64) -> (u64, Option<Command>) {
     let mut position_ms = initial_position_ms;
     loop {
         match commands.try_recv() {
-            Ok(Command::Seek { path: next_path, position_ms: next_position_ms }) if next_path == path => {
+            Ok(Command::Seek { key: next_key, position_ms: next_position_ms }) if next_key == *key => {
                 position_ms = next_position_ms;
             }
             Ok(other) => return (position_ms, Some(other)),
@@ -951,6 +994,7 @@ impl Drop for DecoderExitGuard {
 fn spawn_track_preparation(
     prepared: PreparedTrack,
     start_frame: u64,
+    end_frame: Option<u64>,
     events: Sender<PlaybackEvent>,
 ) -> Result<TrackPreparation, String> {
     let integer_output = uses_strict_integer_route(&prepared.info);
@@ -969,7 +1013,7 @@ fn spawn_track_preparation(
     let decoder_failure_flag = decoder_failed.clone();
     let decoder_diagnostics = diagnostics.clone();
     let decoder_error_slot = decoder_error.clone();
-    let decoder_path = prepared.path.clone();
+    let decoder_path = prepared.key.path.clone();
     // The output stream is configured from this below (`start_track_prepared`); the decoder must
     // refuse rather than decode a file that no longer matches it (`§1.4`).
     let decoder_expected_info = prepared.info.clone();
@@ -984,7 +1028,7 @@ fn spawn_track_preparation(
                 error_slot: decoder_error_slot.clone(),
             };
             let mut decoder_found_nonzero_sample = false;
-            let result = decode_file(&decoder_path, &decoder_expected_info, &decoder_cancel, integer_output, start_frame, |sample| {
+            let result = decode_file(&decoder_path, &decoder_expected_info, &decoder_cancel, integer_output, start_frame, end_frame, |sample| {
                 if decoder_cancel.load(Ordering::Acquire) {
                     return Err("Playback cancelled".into());
                 }
@@ -1065,7 +1109,7 @@ struct PlaybackWorker {
     events: Sender<PlaybackEvent>,
     queue: VecDeque<PreparedTrack>,
     lookahead: Option<TrackPreparation>,
-    failed_preparation_path: Option<PathBuf>,
+    failed_preparation_key: Option<TrackKey>,
     waiting_for_decoder_cancel: bool,
     last_completed: Option<PreparedTrack>,
     blocked_head: bool,
@@ -1083,7 +1127,7 @@ struct PlaybackWorker {
     /// Tracks that left `self.active` by natural completion, a completed graceful skip, or a
     /// `ReplaceQueue` stop; capped at 200, oldest dropped first (`§3.7`).
     history: Vec<PreparedTrack>,
-    /// A command dequeued by `drain_same_path_seeks` while coalescing same-path seeks, held so
+    /// A command dequeued by `drain_same_key_seeks` while coalescing same-key seeks, held so
     /// command order is preserved across the next `run()` iteration (`§4.2`).
     pending_command: Option<Command>,
 }
@@ -1097,7 +1141,7 @@ impl PlaybackWorker {
             events,
             queue: VecDeque::new(),
             lookahead: None,
-            failed_preparation_path: None,
+            failed_preparation_key: None,
             waiting_for_decoder_cancel: false,
             last_completed: None,
             blocked_head: false,
@@ -1193,10 +1237,10 @@ impl PlaybackWorker {
             Command::PlayNext(tracks) => self.play_next(tracks),
             Command::ReplaceQueue(tracks) => self.replace_queue(tracks),
             Command::Previous => self.previous_track(),
-            Command::Seek { path, position_ms } => {
-                let (position_ms, next_command) = drain_same_path_seeks(&self.commands, &path, position_ms);
+            Command::Seek { key, position_ms } => {
+                let (position_ms, next_command) = drain_same_key_seeks(&self.commands, &key, position_ms);
                 self.pending_command = next_command;
-                self.seek_to(path, position_ms);
+                self.seek_to(key, position_ms);
             }
             Command::SelectOutput(id) => {
                 self.selected_output = id.clone();
@@ -1253,7 +1297,7 @@ impl PlaybackWorker {
         ) {
             self.emit(PlaybackEvent::Status(format!(
                 "Skipped previously failed track {}; continuing the queue.",
-                display_name(&skipped)
+                display_name(&skipped.path)
             )));
         }
         self.queue.extend(tracks);
@@ -1274,7 +1318,7 @@ impl PlaybackWorker {
         {
             self.emit(PlaybackEvent::Status(format!(
                 "Skipped previously failed track {}; continuing the queue.",
-                display_name(&skipped)
+                display_name(&skipped.path)
             )));
         }
         for track in tracks.into_iter().rev() {
@@ -1302,7 +1346,7 @@ impl PlaybackWorker {
         self.queue.clear();
         self.queue.extend(tracks);
         self.blocked_head = false;
-        self.failed_preparation_path = None;
+        self.failed_preparation_key = None;
         self.emit_queue_snapshot();
         self.start_next();
     }
@@ -1317,8 +1361,8 @@ impl PlaybackWorker {
                 if unhealthy {
                     self.restart_current_from_queue();
                 } else {
-                    let path = active.prepared.path.clone();
-                    self.seek_to(path, 0); // position 0 needs no known duration
+                    let key = active.prepared.key.clone();
+                    self.seek_to(key, 0); // position 0 needs no known duration
                 }
                 return;
             }
@@ -1457,12 +1501,12 @@ impl PlaybackWorker {
 
     /// Seeks the active track to `position_ms`, pinned to its current output device and Hog
     /// mode so the seek can never trigger a device change or a Hog acquire/release (`§4.2`).
-    fn seek_to(&mut self, path: PathBuf, position_ms: u64) {
+    fn seek_to(&mut self, key: TrackKey, position_ms: u64) {
         let Some(active) = self.active.as_ref() else {
             self.reject_seek("Seek ignored: no track is active.");
             return;
         };
-        if active.prepared.path != path {
+        if active.prepared.key != key {
             // Covers the race where `advance_if_drained` already moved on this tick.
             self.reject_seek("Seek ignored: the track changed.");
             return;
@@ -1484,18 +1528,24 @@ impl PlaybackWorker {
             return;
         }
 
-        let start_frame = if position_ms == 0 {
+        // `info.duration_ms` is already the *sub-range* duration for a CUE track (overridden by
+        // the scanner at expansion time), so `seek_target_frame`'s clamp is against the sub-range's
+        // own length, and its result is already track-relative (0 at this track's own start) —
+        // `key.start_frame` is added below to get the absolute physical-file decode frame.
+        let relative_frame = if position_ms == 0 {
             0
         } else {
             seek_target_frame(position_ms, active.prepared.info.sample_rate, active.prepared.info.duration_ms.unwrap())
         };
+        let start_frame = active.prepared.key.start_frame + relative_frame;
+        let end_frame = active.prepared.key.end_frame;
         let was_playing = active.playing;
         let pinned = pinned_output(active);
 
         // Guards above already confirmed `self.active` is `Some`.
         let Some(prepared) = self.stop_active_now(false) else { return };
 
-        match spawn_track_preparation(prepared.clone(), start_frame, self.events.clone()) {
+        match spawn_track_preparation(prepared.clone(), start_frame, end_frame, self.events.clone()) {
             Ok(preparation) => {
                 let options = StartOptions {
                     start_frame,
@@ -1543,7 +1593,9 @@ impl PlaybackWorker {
             }
         };
         let options = StartOptions {
-            start_frame: 0,
+            // A CUE sub-range track's fresh (non-seek) start decodes from its own INDEX 01, not
+            // absolute file frame 0; a whole-file track's `key.start_frame` is always 0.
+            start_frame: prepared.key.start_frame,
             start_playing: true,
             reason: StartReason::NewTrack,
             pinned_output: None,
@@ -1578,7 +1630,7 @@ impl PlaybackWorker {
 
     fn preparation_for_start(&mut self, prepared: &PreparedTrack) -> Result<TrackPreparation, String> {
         if let Some(mut preparation) = self.lookahead.take() {
-            if preparation.prepared.path == prepared.path
+            if preparation.prepared.key == prepared.key
                 && !preparation.audio.cancel.load(Ordering::Acquire)
             {
                 return Ok(preparation);
@@ -1596,9 +1648,9 @@ impl PlaybackWorker {
                 return Err("A previous next-track decoder is still stopping.".into());
             }
         }
-        self.failed_preparation_path = None;
+        self.failed_preparation_key = None;
         self.waiting_for_decoder_cancel = false;
-        spawn_track_preparation(prepared.clone(), 0, self.events.clone())
+        spawn_track_preparation(prepared.clone(), prepared.key.start_frame, prepared.key.end_frame, self.events.clone())
     }
 
     fn reconcile_lookahead(&mut self) {
@@ -1625,12 +1677,12 @@ impl PlaybackWorker {
             }
             return;
         };
-        if self.failed_preparation_path.as_ref().is_some_and(|path| path != &prepared.path) {
-            self.failed_preparation_path = None;
+        if self.failed_preparation_key.as_ref().is_some_and(|key| key != &prepared.key) {
+            self.failed_preparation_key = None;
         }
 
         let has_current_head = self.lookahead.as_ref().is_some_and(|preparation| {
-            preparation.prepared.path == prepared.path
+            preparation.prepared.key == prepared.key
                 && !preparation.audio.cancel.load(Ordering::Acquire)
         });
         if has_current_head {
@@ -1660,16 +1712,16 @@ impl PlaybackWorker {
             self.lookahead = None;
         }
 
-        if self.failed_preparation_path.as_ref() == Some(&prepared.path) {
+        if self.failed_preparation_key.as_ref() == Some(&prepared.key) {
             return;
         }
-        match spawn_track_preparation(prepared.clone(), 0, self.events.clone()) {
+        match spawn_track_preparation(prepared.clone(), prepared.key.start_frame, prepared.key.end_frame, self.events.clone()) {
             Ok(preparation) => {
-                self.failed_preparation_path = None;
+                self.failed_preparation_key = None;
                 self.lookahead = Some(preparation);
             }
             Err(error) => {
-                self.failed_preparation_path = Some(prepared.path.clone());
+                self.failed_preparation_key = Some(prepared.key.clone());
                 self.emit(PlaybackEvent::Status(format!(
                     "Could not prepare next track audio: {error}"
                 )));
@@ -1986,10 +2038,10 @@ impl PlaybackWorker {
 
         match options.reason {
             StartReason::NewTrack => {
-                let title = display_name(&prepared.path);
-                let parent = prepared.path.parent().map(display_path).unwrap_or_else(|| "Audio file".into());
+                let title = display_name(&prepared.key.path);
+                let parent = prepared.key.path.parent().map(display_path).unwrap_or_else(|| "Audio file".into());
                 self.emit(PlaybackEvent::Started {
-                    path: prepared.path.clone(),
+                    key: prepared.key.clone(),
                     info: prepared.info.clone(),
                     title,
                     album: parent,
@@ -2011,7 +2063,7 @@ impl PlaybackWorker {
                 self.refresh_volume(true);
                 if let Some(worker_drain_observed_at) = worker_drain_observed_at {
                     let diagnostic = handoff_timing_diagnostic(
-                        &prepared.path.display().to_string(),
+                        &prepared.key.path.display().to_string(),
                         &prepared.info.format,
                         prepared.info.sample_rate,
                         stream_play_returned_at.saturating_duration_since(worker_drain_observed_at),
@@ -2027,8 +2079,13 @@ impl PlaybackWorker {
             }
             StartReason::Seek => {
                 // No `Started` and no handoff diagnostic: the track itself has not changed.
-                let position_ms =
+                // `consumed_samples_position_millis` gives the *absolute* file position; the
+                // emitted Timeline must be track-relative (0 at this track's own `key.start_frame`),
+                // subtracted here via `track_relative_millis` so it is never double-subtracted or
+                // forgotten on this code path (`CLAUDE.md` CUE sheet support, §4).
+                let absolute_ms =
                     consumed_samples_position_millis(options.start_frame * 2, prepared.info.sample_rate).unwrap_or(0);
+                let position_ms = track_relative_millis(absolute_ms, prepared.key.start_frame, prepared.info.sample_rate);
                 self.emit(PlaybackEvent::Timeline { position_ms, duration_ms: prepared.info.duration_ms });
                 self.emit(PlaybackEvent::Playing(options.start_playing));
             }
@@ -2098,11 +2155,7 @@ impl PlaybackWorker {
             self.emit(PlaybackEvent::Status(message));
         }
         self.emit(PlaybackEvent::Timeline {
-            position_ms: consumed_samples_position_millis(
-                active.consumed_output_samples.load(Ordering::Acquire),
-                active.prepared.info.sample_rate,
-            )
-            .unwrap_or(0),
+            position_ms: active_track_relative_position_ms(&active),
             duration_ms: active.prepared.info.duration_ms,
         });
         let naturally_completed = (!active.skip_requested).then(|| active.prepared.clone());
@@ -2376,11 +2429,7 @@ impl PlaybackWorker {
             active.prepared.info.sample_rate,
         );
         self.emit(PlaybackEvent::Timeline {
-            position_ms: consumed_samples_position_millis(
-                active.consumed_output_samples.load(Ordering::Acquire),
-                active.prepared.info.sample_rate,
-            )
-            .unwrap_or(0),
+            position_ms: active_track_relative_position_ms(&active),
             duration_ms: active.prepared.info.duration_ms,
         });
         if status.is_none() {
@@ -2437,9 +2486,10 @@ fn queue_snapshot(queue: &VecDeque<PreparedTrack>) -> Vec<QueueTrackSnapshot> {
     queue
         .iter()
         .map(|prepared| QueueTrackSnapshot {
-            path: prepared.path.clone(),
-            title: display_name(&prepared.path),
+            key: prepared.key.clone(),
+            title: display_name(&prepared.key.path),
             parent_folder: prepared
+                .key
                 .path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -2486,13 +2536,13 @@ fn recover_blocked_head_for_enqueue(
     queue: &mut VecDeque<PreparedTrack>,
     blocked_head: &mut bool,
     has_active_playback: bool,
-) -> Option<PathBuf> {
+) -> Option<TrackKey> {
     if has_active_playback || !*blocked_head {
         return None;
     }
-    let failed_path = queue.pop_front().map(|track| track.path);
+    let failed_key = queue.pop_front().map(|track| track.key);
     *blocked_head = false;
-    failed_path
+    failed_key
 }
 
 fn restore_last_completed_track(
@@ -2772,6 +2822,7 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use super::super::decoder::probe_file;
+    use std::path::PathBuf;
 
     #[test]
     fn handoff_timing_diagnostic_labels_transition_stages_and_unmeasured_gap() {
@@ -2849,7 +2900,7 @@ mod tests {
 
     fn test_track(name: &str) -> PreparedTrack {
         PreparedTrack {
-            path: PathBuf::from(name),
+            key: TrackKey::whole_file(PathBuf::from(name)),
             info: AudioInfo {
                 sample_rate: 44_100,
                 duration_ms: Some(1_000),
@@ -2883,7 +2934,7 @@ mod tests {
             snapshot,
             vec![
                 QueueTrackSnapshot {
-                    path: PathBuf::from("/nas/album/first.flac"),
+                    key: TrackKey::whole_file(PathBuf::from("/nas/album/first.flac")),
                     title: "first".into(),
                     parent_folder: "album".into(),
                     format: "FLAC".into(),
@@ -2893,7 +2944,7 @@ mod tests {
                     duration_ms: Some(95_000),
                 },
                 QueueTrackSnapshot {
-                    path: PathBuf::from("/nas/other/second.mp3"),
+                    key: TrackKey::whole_file(PathBuf::from("/nas/other/second.mp3")),
                     title: "second".into(),
                     parent_folder: "other".into(),
                     format: "MPEG Audio".into(),
@@ -2909,7 +2960,49 @@ mod tests {
     fn fixture_track(name: &str) -> PreparedTrack {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
         let info = probe_file(&path).expect("decoder fixture should be probeable");
-        PreparedTrack { path, info }
+        PreparedTrack { key: TrackKey::whole_file(path), info }
+    }
+
+    /// A minimal, hardware-free `ActivePlayback` for a track identified by `key`, for tests that
+    /// only need to exercise pure position/timeline math (`audible_position_for` and friends), not
+    /// the full worker/queue machinery `worker_with_active_track_and_events` sets up.
+    fn test_active_playback_with_key(key: TrackKey) -> ActivePlayback {
+        let info = AudioInfo {
+            sample_rate: 44_100,
+            duration_ms: Some(10_000),
+            source_channels: 2,
+            bits_per_sample: 16,
+            is_float: false,
+            integer_pcm: true,
+            format: "FLAC".into(),
+        };
+        ActivePlayback {
+            prepared: PreparedTrack { key, info },
+            stream: None,
+            decoder: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            drained: Arc::new(AtomicBool::new(false)),
+            decoder_failed: Arc::new(AtomicBool::new(false)),
+            output_failed: Arc::new(AtomicBool::new(false)),
+            format_mismatch: Arc::new(AtomicU8::new(0)),
+            diagnostics: Arc::new(AudioDiagnostics::default()),
+            reported_diagnostics: AudioDiagnosticsSnapshot::default(),
+            reported_underrun_samples: 0,
+            underrun_reported_at: Instant::now(),
+            stream_play_returned_stream_time: StreamInstant::ZERO,
+            stream_play_returned_unix_ms: unix_time_millis(),
+            first_output_pcm_callback_reported: false,
+            consumed_output_samples: Arc::new(AtomicU64::new(0)),
+            output_latency_nanos: Arc::new(AtomicU64::new(0)),
+            start_frame: 0,
+            timeline_reported_samples: 0,
+            timeline_reported_at: Instant::now(),
+            drain_started: None,
+            playing: true,
+            skip_requested: false,
+            output_id: String::new(),
+            hog_mode: false,
+        }
     }
 
     fn worker_with_active_track(queue: Vec<PreparedTrack>) -> PlaybackWorker {
@@ -3076,19 +3169,19 @@ mod tests {
     #[test]
     fn next_track_preparation_does_not_mutate_active_output_state() {
         let next = fixture_track("decoder-tone.flac");
-        let next_path = next.path.clone();
+        let next_path = next.key.path.clone();
         let mut worker = worker_with_active_track(vec![next]);
         let output_id = worker.selected_output.clone();
         let hog_mode = worker.settings.hog_mode_enabled;
 
         worker.reconcile_lookahead();
 
-        assert_eq!(worker.active.as_ref().unwrap().prepared.path, PathBuf::from("/music/current.flac"));
+        assert_eq!(worker.active.as_ref().unwrap().prepared.key.path, PathBuf::from("/music/current.flac"));
         assert_eq!(worker.selected_output, output_id);
         assert_eq!(worker.settings.hog_mode_enabled, hog_mode);
         assert!(worker.hog_lease.is_none());
-        assert_eq!(worker.queue.front().unwrap().path, next_path);
-        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.path, next_path);
+        assert_eq!(worker.queue.front().unwrap().key.path, next_path);
+        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.key.path, next_path);
         cancel_and_reap_lookahead(&mut worker);
     }
 
@@ -3096,7 +3189,7 @@ mod tests {
     fn replacing_queue_head_waits_for_cancelled_decoder_before_replacement() {
         let old = fixture_track("decoder-tone.flac");
         let new = fixture_track("decoder-tone.wv");
-        let new_path = new.path.clone();
+        let new_path = new.key.path.clone();
         let mut worker = worker_with_active_track(vec![old.clone()]);
         worker.reconcile_lookahead();
         let old_finished = worker.lookahead.as_ref().unwrap().audio.eof.clone();
@@ -3105,7 +3198,7 @@ mod tests {
         worker.queue.push_front(new);
         worker.reconcile_lookahead();
 
-        if worker.lookahead.as_ref().is_some_and(|prep| prep.prepared.path == old.path) {
+        if worker.lookahead.as_ref().is_some_and(|prep| prep.prepared.key.path == old.key.path) {
             assert!(worker.lookahead.as_ref().unwrap().audio.cancel.load(Ordering::Acquire));
             for _ in 0..1_000 {
                 if worker.lookahead.as_ref().unwrap().audio.decoder_finished() {
@@ -3118,7 +3211,7 @@ mod tests {
         }
 
         assert!(old_finished.load(Ordering::Acquire));
-        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.path, new_path);
+        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.key.path, new_path);
         cancel_and_reap_lookahead(&mut worker);
     }
 
@@ -3126,7 +3219,7 @@ mod tests {
     fn speculative_decode_error_keeps_active_track_and_queue_head_intact() {
         let mut missing = test_track("/nas/missing-next-track.flac");
         missing.info = fixture_track("decoder-tone.flac").info;
-        let missing_path = missing.path.clone();
+        let missing_path = missing.key.path.clone();
         let mut worker = worker_with_active_track(vec![missing]);
 
         worker.reconcile_lookahead();
@@ -3140,8 +3233,8 @@ mod tests {
         let preparation = worker.lookahead.as_ref().unwrap();
         assert!(preparation.audio.eof.load(Ordering::Acquire));
         assert!(preparation.audio.decoder_failed.load(Ordering::Acquire));
-        assert_eq!(worker.active.as_ref().unwrap().prepared.path, PathBuf::from("/music/current.flac"));
-        assert_eq!(worker.queue.front().unwrap().path, missing_path);
+        assert_eq!(worker.active.as_ref().unwrap().prepared.key.path, PathBuf::from("/music/current.flac"));
+        assert_eq!(worker.queue.front().unwrap().key.path, missing_path);
         assert_eq!(worker.selected_output.as_deref(), Some("unchanged-output-id"));
         assert!(worker.settings.hog_mode_enabled);
         cancel_and_reap_lookahead(&mut worker);
@@ -3154,7 +3247,7 @@ mod tests {
 
         let status = retain_failed_track(&mut queue, failed.clone(), PlaybackFailure::Decoder, false);
 
-        assert_eq!(queue.front().unwrap().path, failed.path);
+        assert_eq!(queue.front().unwrap().key.path, failed.key.path);
         assert_eq!(status, Some(PlaybackFailure::Decoder.status()));
     }
 
@@ -3165,7 +3258,7 @@ mod tests {
 
         let status = retain_failed_track(&mut queue, failed.clone(), PlaybackFailure::Output, false);
 
-        assert_eq!(queue.front().unwrap().path, failed.path);
+        assert_eq!(queue.front().unwrap().key.path, failed.key.path);
         assert_eq!(status, Some(PlaybackFailure::Output.status()));
     }
 
@@ -3176,7 +3269,7 @@ mod tests {
 
         let status = retain_failed_track(&mut queue, failed, PlaybackFailure::Decoder, true);
 
-        assert_eq!(queue.front().unwrap().path, PathBuf::from("/music/next.flac"));
+        assert_eq!(queue.front().unwrap().key.path, PathBuf::from("/music/next.flac"));
         assert_eq!(status, None);
     }
 
@@ -3192,7 +3285,7 @@ mod tests {
         assert!(worker.active.is_none());
         assert!(!worker.blocked_head, "a completed skip is not a retained failure");
         assert_eq!(
-            worker.history.last().map(|t| t.path.clone()),
+            worker.history.last().map(|t| t.key.path.clone()),
             Some(PathBuf::from("/music/current.flac")),
             "an output-failed track that finished a requested skip must still join history (§3.7), \
              so Previous can return to it"
@@ -3219,9 +3312,9 @@ mod tests {
 
         let skipped = recover_blocked_head_for_enqueue(&mut queue, &mut blocked_head, false);
 
-        assert_eq!(skipped, Some(failed.path));
+        assert_eq!(skipped, Some(failed.key.clone()));
         assert!(!blocked_head);
-        assert_eq!(queue.front().unwrap().path, newly_opened.path);
+        assert_eq!(queue.front().unwrap().key.path, newly_opened.key.path);
     }
 
     #[test]
@@ -3234,7 +3327,7 @@ mod tests {
 
         assert_eq!(skipped, None);
         assert!(blocked_head);
-        assert_eq!(queue.front().unwrap().path, queued.path);
+        assert_eq!(queue.front().unwrap().key.path, queued.key.path);
     }
 
     #[test]
@@ -3245,7 +3338,7 @@ mod tests {
         assert!(restore_last_completed_track(&mut queue, Some(&completed)));
 
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.front().unwrap().path, completed.path);
+        assert_eq!(queue.front().unwrap().key.path, completed.key.path);
     }
 
     #[test]
@@ -3257,7 +3350,7 @@ mod tests {
         assert!(!restore_last_completed_track(&mut queue, Some(&completed)));
 
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.front().unwrap().path, queued.path);
+        assert_eq!(queue.front().unwrap().key.path, queued.key.path);
     }
 
     #[test]
@@ -3706,7 +3799,7 @@ mod tests {
 
         assert!(worker.active.is_none(), "a failed output must clear the active slot");
         assert_eq!(
-            worker.queue.front().map(|track| track.path.clone()),
+            worker.queue.front().map(|track| track.key.path.clone()),
             Some(PathBuf::from("/music/current.flac")),
             "a non-skip output failure keeps the track at the queue head"
         );
@@ -3746,14 +3839,71 @@ mod tests {
         assert_eq!(seek_target_frame(50_000, 44_100, 10_000), 9_500 * 44_100 / 1_000);
     }
 
+    /// The CUE sub-range seek composition (`CLAUDE.md` §4): given a `TrackKey` with a nonzero
+    /// `start_frame`, a track-relative `position_ms` and a sample rate, the absolute decode frame
+    /// `seek_to` hands to `spawn_track_preparation` is exactly `key.start_frame +
+    /// seek_target_frame(position_ms, rate, sub_range_duration_ms)` — using the *sub-range's own*
+    /// duration for the clamp, never the physical file's whole duration. This locks down the exact
+    /// composition `seek_to` performs (see its own `relative_frame`/`start_frame` computation).
+    #[test]
+    fn cue_sub_range_seek_offset_composes_key_start_frame_with_track_relative_seek_target() {
+        let key = TrackKey { path: PathBuf::from("/music/album.flac"), start_frame: 44_100 * 60, end_frame: Some(44_100 * 120) };
+        let sample_rate = 44_100;
+        // The sub-range spans 60 s (120s - 60s of the physical file), never the whole file's
+        // duration, which could be much longer.
+        let sub_range_duration_ms = 60_000;
+
+        let relative_frame = seek_target_frame(30_000, sample_rate, sub_range_duration_ms);
+        let absolute_frame = key.start_frame + relative_frame;
+        assert_eq!(relative_frame, 30_000 * sample_rate as u64 / 1_000, "30 s into a 60 s sub-range, track-relative");
+        assert_eq!(absolute_frame, key.start_frame + relative_frame);
+        assert!(absolute_frame > key.start_frame, "an absolute seek frame must land inside the sub-range, past its own start");
+        assert!(
+            absolute_frame < key.end_frame.unwrap(),
+            "an absolute seek frame must never land at or past this track's own end_frame"
+        );
+
+        // A seek near the end of the sub-range clamps against the *sub-range's* own duration
+        // (60_000 ms), not the physical file's: requesting past it still lands within 500 ms of
+        // this track's own end, never anywhere near the physical file's true end.
+        let clamped_relative = seek_target_frame(120_000, sample_rate, sub_range_duration_ms);
+        let clamped_absolute = key.start_frame + clamped_relative;
+        assert_eq!(clamped_relative, (60_000 - 500) * sample_rate as u64 / 1_000);
+        assert!(clamped_absolute < key.end_frame.unwrap(), "the clamp must stay strictly inside this track's own end_frame");
+    }
+
+    /// The Timeline track-relative subtraction (`CLAUDE.md` §4): a CUE track's `key.start_frame`
+    /// equivalent in time must be subtracted from the absolute audible position before it is
+    /// emitted, so the UI's timeline always reads 0 at this track's own start — `audible_position_for`
+    /// is the single point that performs this subtraction (via `track_relative_millis`).
+    #[test]
+    fn audible_position_is_relative_to_the_tracks_own_key_start_frame() {
+        let key = TrackKey { path: PathBuf::from("/music/album.flac"), start_frame: 44_100 * 10, end_frame: Some(44_100 * 20) };
+        let mut active = test_active_playback_with_key(key.clone());
+        // 12 s into the physical file: 2 s into this track's own 10 s sub-range.
+        active.start_frame = key.start_frame;
+        active.consumed_output_samples.store(44_100 * 12 * 2, Ordering::Release);
+
+        let position_ms = audible_position_for(&active);
+
+        assert_eq!(position_ms, 2_000, "2 s into the sub-range, not 12 s into the physical file");
+    }
+
+    /// A whole-file track's `key.start_frame` is always 0, so `track_relative_millis` must be a
+    /// pure no-op for it — the pre-existing (non-CUE) behavior must be unchanged.
+    #[test]
+    fn track_relative_millis_is_a_no_op_for_a_whole_file_key() {
+        assert_eq!(track_relative_millis(5_000, 0, 44_100), 5_000);
+    }
+
     #[test]
     fn seek_with_stale_path_is_ignored() {
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
         let queue_before: Vec<_> = worker.queue.iter().cloned().collect();
 
-        worker.seek_to(PathBuf::from("/music/other-track.flac"), 1_000);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/other-track.flac")), 1_000);
 
-        assert_eq!(worker.active.as_ref().unwrap().prepared.path, PathBuf::from("/music/current.flac"));
+        assert_eq!(worker.active.as_ref().unwrap().prepared.key.path, PathBuf::from("/music/current.flac"));
         assert_eq!(worker.queue.iter().cloned().collect::<Vec<_>>(), queue_before);
 
         let mut saw_status = false;
@@ -3774,7 +3924,7 @@ mod tests {
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
         worker.active.as_mut().unwrap().prepared.info.duration_ms = None;
 
-        worker.seek_to(PathBuf::from("/music/current.flac"), 5_000);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 5_000);
 
         assert!(worker.active.is_some(), "a duration-guard refusal must not touch the active track");
         let mut duration_guard_status = None;
@@ -3791,7 +3941,7 @@ mod tests {
         // Position 0 needs no known duration, so it proceeds past this specific guard and
         // attempts a real restart, which then fails for an unrelated reason (no real output
         // device is configured in this hardware-free unit test).
-        worker.seek_to(PathBuf::from("/music/current.flac"), 0);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
 
         assert!(worker.active.is_none(), "stop_active_now always clears the active slot before restarting");
         let mut saw_seek_failed_status = false;
@@ -3811,9 +3961,9 @@ mod tests {
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
         assert_eq!(worker.active.as_ref().unwrap().output_id, "", "test fixture: no real output device");
 
-        worker.seek_to(PathBuf::from("/music/current.flac"), 0);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
 
-        assert_eq!(worker.queue.front().map(|track| track.path.clone()), Some(PathBuf::from("/music/current.flac")));
+        assert_eq!(worker.queue.front().map(|track| track.key.path.clone()), Some(PathBuf::from("/music/current.flac")));
         assert!(worker.blocked_head);
 
         let mut saw_rejected = false;
@@ -3836,16 +3986,16 @@ mod tests {
     #[test]
     fn failed_seek_with_live_lookahead_leaves_no_uncancelled_preparation() {
         let next = fixture_track("decoder-tone.flac");
-        let next_path = next.path.clone();
+        let next_path = next.key.path.clone();
         let mut worker = worker_with_active_track(vec![next]);
         worker.reconcile_lookahead();
-        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.path, next_path);
+        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.key.path, next_path);
         assert!(!worker.lookahead.as_ref().unwrap().audio.cancel.load(Ordering::Acquire));
 
-        worker.seek_to(PathBuf::from("/music/current.flac"), 0);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
 
         let lookahead = worker.lookahead.as_ref().expect("the live lookahead must survive a failed seek");
-        assert_eq!(lookahead.prepared.path, next_path);
+        assert_eq!(lookahead.prepared.key.path, next_path);
         assert!(lookahead.audio.cancel.load(Ordering::Acquire), "fail_seek must cancel the mismatched lookahead");
 
         cancel_and_reap_lookahead(&mut worker);
@@ -3879,7 +4029,7 @@ mod tests {
         assert_eq!(worker.active.as_ref().unwrap().output_id, "", "test fixture: no real output device");
         worker.handle(Command::SelectOutput(Some("unchanged-output-id".into())));
 
-        worker.seek_to(PathBuf::from("/music/current.flac"), 0);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
 
         let mut seek_failed_status = None;
         while let Ok(event) = events.try_recv() {
@@ -3905,7 +4055,7 @@ mod tests {
     fn retire_preparation_cancels_the_decoder_before_retiring_it() {
         let mut worker = worker_with_active_track(Vec::new());
         let (events_tx, _events_rx) = unbounded();
-        let prep = spawn_track_preparation(fixture_track("decoder-tone.flac"), 0, events_tx).unwrap();
+        let prep = spawn_track_preparation(fixture_track("decoder-tone.flac"), 0, None, events_tx).unwrap();
         let cancel = prep.audio.cancel.clone();
 
         worker.retire_preparation(prep);
@@ -3918,12 +4068,12 @@ mod tests {
     #[test]
     fn queued_seeks_for_same_path_coalesce_and_other_commands_keep_order() {
         let (command_tx, command_rx) = unbounded::<Command>();
-        let path = PathBuf::from("/music/a.flac");
-        command_tx.send(Command::Seek { path: path.clone(), position_ms: 2_000 }).unwrap();
+        let key = TrackKey::whole_file(PathBuf::from("/music/a.flac"));
+        command_tx.send(Command::Seek { key: key.clone(), position_ms: 2_000 }).unwrap();
         command_tx.send(Command::TogglePlayback).unwrap();
-        command_tx.send(Command::Seek { path: path.clone(), position_ms: 3_000 }).unwrap();
+        command_tx.send(Command::Seek { key: key.clone(), position_ms: 3_000 }).unwrap();
 
-        let (target_ms, next_command) = drain_same_path_seeks(&command_rx, &path, 1_000);
+        let (target_ms, next_command) = drain_same_key_seeks(&command_rx, &key, 1_000);
 
         assert_eq!(target_ms, 2_000);
         assert!(matches!(next_command, Some(Command::TogglePlayback)));
@@ -3932,20 +4082,20 @@ mod tests {
 
     #[test]
     fn handle_seek_stashes_the_next_command_behind_the_workers_own_queued_seeks() {
-        // `drain_same_path_seeks` above only unit-tests the helper; this exercises the actual
+        // `drain_same_key_seeks` above only unit-tests the helper; this exercises the actual
         // wiring in `handle` (which stores `pending_command`) against the worker's own command
         // channel, which `run()` replays before the next `recv_timeout` (§4.2).
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
         let (command_tx, command_rx) = unbounded();
         worker.commands = command_rx;
-        // A path that never matches the active track: `seek_to` rejects it on the path guard,
+        // A key that never matches the active track: `seek_to` rejects it on the track guard,
         // so no hardware is ever reached.
-        let path = PathBuf::from("/music/a.flac");
-        command_tx.send(Command::Seek { path: path.clone(), position_ms: 2_000 }).unwrap();
+        let key = TrackKey::whole_file(PathBuf::from("/music/a.flac"));
+        command_tx.send(Command::Seek { key: key.clone(), position_ms: 2_000 }).unwrap();
         command_tx.send(Command::TogglePlayback).unwrap();
-        command_tx.send(Command::Seek { path: path.clone(), position_ms: 3_000 }).unwrap();
+        command_tx.send(Command::Seek { key: key.clone(), position_ms: 3_000 }).unwrap();
 
-        worker.handle(Command::Seek { path: path.clone(), position_ms: 1_000 });
+        worker.handle(Command::Seek { key: key.clone(), position_ms: 1_000 });
 
         assert!(
             matches!(worker.pending_command, Some(Command::TogglePlayback)),
@@ -3964,7 +4114,7 @@ mod tests {
 
         let prepared = worker.stop_active_now(false);
 
-        assert_eq!(prepared.map(|p| p.path), Some(PathBuf::from("/music/current.flac")));
+        assert_eq!(prepared.map(|p| p.key.path), Some(PathBuf::from("/music/current.flac")));
         assert!(worker.active.is_none());
         assert!(worker.last_stop.is_some(), "stop_active_now always records the stop for the rate-change guard");
         assert!(events.try_recv().is_err(), "no Playing event should be emitted when emit_playing is false");
@@ -4036,7 +4186,7 @@ mod tests {
 
         assert!(worker.active.is_none(), "restart_current_from_queue stops the unhealthy active track");
         assert_eq!(
-            worker.queue.front().map(|t| t.path.clone()),
+            worker.queue.front().map(|t| t.key.path.clone()),
             Some(PathBuf::from("/music/current.flac")),
             "the unhealthy track is requeued at the head for the restart attempt"
         );
@@ -4050,18 +4200,18 @@ mod tests {
         let mut worker = worker_with_active_track(vec![stale_pending]);
 
         let first = fixture_track("decoder-tone.flac");
-        let first_path = first.path.clone();
+        let first_path = first.key.path.clone();
         let second = fixture_track("decoder-tone.wav");
-        let second_path = second.path.clone();
+        let second_path = second.key.path.clone();
         worker.replace_queue(vec![first, second]);
 
         assert_eq!(
-            worker.history.last().map(|t| t.path.clone()),
+            worker.history.last().map(|t| t.key.path.clone()),
             Some(PathBuf::from("/music/current.flac")),
             "the previously active track moves to history"
         );
         assert_eq!(
-            worker.queue.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
+            worker.queue.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
             vec![first_path, second_path],
             "replace_queue discards the old pending queue and takes the new list verbatim, in order"
         );
@@ -4081,8 +4231,8 @@ mod tests {
         worker.play_next(vec![first.clone(), second.clone()]);
 
         assert_eq!(
-            worker.queue.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
-            vec![first.path, second.path, existing.path],
+            worker.queue.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
+            vec![first.key.path, second.key.path, existing.key.path],
             "play_next inserts the new tracks in order ahead of the existing pending queue"
         );
     }
@@ -4098,8 +4248,8 @@ mod tests {
 
         assert!(worker.history.is_empty(), "the popped history entry is removed");
         assert_eq!(
-            worker.queue.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
-            vec![prior.path, PathBuf::from("/music/current.flac"), queued.path],
+            worker.queue.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
+            vec![prior.key.path, PathBuf::from("/music/current.flac"), queued.key.path],
             "the previous track leads, the just-stopped current track follows, then the rest of the pending queue"
         );
         drain_retiring_decoders(&mut worker);
@@ -4119,10 +4269,10 @@ mod tests {
         worker.previous_track();
 
         assert_eq!(worker.history.len(), 1, "history is untouched: the current track restarts instead of being popped");
-        assert_eq!(worker.history.last().map(|t| t.path.clone()), Some(prior.path.clone()));
+        assert_eq!(worker.history.last().map(|t| t.key.path.clone()), Some(prior.key.path.clone()));
         assert_ne!(
-            worker.queue.front().map(|t| t.path.clone()),
-            Some(prior.path),
+            worker.queue.front().map(|t| t.key.path.clone()),
+            Some(prior.key.path),
             "the queue head must not become the history track"
         );
 
@@ -4149,8 +4299,8 @@ mod tests {
         }
 
         assert_eq!(worker.history.len(), HISTORY_LIMIT);
-        assert_eq!(worker.history.first().unwrap().path, PathBuf::from("/music/track-50.flac"));
-        assert_eq!(worker.history.last().unwrap().path, PathBuf::from("/music/track-249.flac"));
+        assert_eq!(worker.history.first().unwrap().key.path, PathBuf::from("/music/track-50.flac"));
+        assert_eq!(worker.history.last().unwrap().key.path, PathBuf::from("/music/track-249.flac"));
     }
 
     #[test]
