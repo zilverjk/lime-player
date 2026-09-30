@@ -68,12 +68,18 @@ pub fn probe_file(path: &Path) -> Result<AudioInfo, DecoderError> {
 /// plausible over a NAS share — so a mismatch on any property the output route depends on is
 /// refused instead of decoded at the stream's now-stale configuration, which would otherwise play
 /// back at the wrong speed instead of being refused (`§1.4`, "refuse rather than silently degrade").
+/// `end_frame`, when `Some`, is the absolute source-file frame to stop decoding at (exclusive) —
+/// the `TrackKey.end_frame` of a CUE sub-range track. `None` decodes to EOF, exactly as before this
+/// parameter existed (an ordinary whole-file track's `end_frame` is always `None`). Truncating a
+/// packet/block at `end_frame` is treated as a normal, successful end of decoding, never an error —
+/// the same success path as a natural EOF.
 pub fn decode_file(
     path: &Path,
     expected: &AudioInfo,
     cancelled: &AtomicBool,
     preserve_integer: bool,
     start_frame: u64,
+    end_frame: Option<u64>,
     mut output: impl FnMut(PcmSample) -> Result<(), String>,
 ) -> Result<AudioInfo, DecoderError> {
     let info = probe_file(path)?;
@@ -85,8 +91,8 @@ pub fn decode_file(
         return Err(DecoderError::Decode("The file changed since it was added; re-open it".into()));
     }
     match info.format.as_str() {
-        "WavPack" => decode_wavpack(path, &info, cancelled, preserve_integer, start_frame, &mut output)?,
-        _ => decode_symphonia(path, &info, cancelled, preserve_integer, start_frame, &mut output)?,
+        "WavPack" => decode_wavpack(path, &info, cancelled, preserve_integer, start_frame, end_frame, &mut output)?,
+        _ => decode_symphonia(path, &info, cancelled, preserve_integer, start_frame, end_frame, &mut output)?,
     }
     Ok(info)
 }
@@ -218,6 +224,7 @@ fn decode_symphonia(
     cancelled: &AtomicBool,
     preserve_integer: bool,
     start_frame: u64,
+    end_frame: Option<u64>,
     output: &mut impl FnMut(PcmSample) -> Result<(), String>,
 ) -> Result<(), DecoderError> {
     let (mut format, track_id, codec_params) = open_symphonia(path)?;
@@ -278,8 +285,8 @@ fn decode_symphonia(
         let frames_in_packet = decoded.samples_interleaved() / channels as usize;
 
         let mut skip_frames = 0usize;
+        let pts = packet.pts.get().max(0) as u64;
         if seeking {
-            let pts = packet.pts.get().max(0) as u64;
             if pts + frames_in_packet as u64 <= start_frame {
                 continue; // Entirely before the target: skip the whole packet.
             }
@@ -291,20 +298,43 @@ fn decode_symphonia(
             skip_frames = (start_frame - pts) as usize;
             seeking = false;
         }
+
+        // `end_frame` truncation (CUE sub-range tracks, `CLAUDE.md` §3): once this packet would
+        // reach or pass `end_frame`, only the samples up to (not including) it are emitted, and
+        // decoding stops cleanly afterward — the same success path as a natural EOF, never an error.
+        let mut take_frames = frames_in_packet - skip_frames;
+        let mut stop_after_this_packet = false;
+        if let Some(end_frame) = end_frame {
+            let packet_emit_start = pts + skip_frames as u64;
+            if packet_emit_start >= end_frame {
+                break; // Nothing left in range; stop before consuming any more of this packet.
+            }
+            let remaining_in_range = (end_frame - packet_emit_start) as usize;
+            if remaining_in_range < take_frames {
+                take_frames = remaining_in_range;
+                stop_after_this_packet = true;
+            }
+        }
         let skip_samples = skip_frames * channels as usize;
+        let take_samples = take_frames * channels as usize;
+        let emit_range = skip_samples..skip_samples + take_samples;
 
         if preserve_integer {
             integer_interleaved.resize(decoded.samples_interleaved(), 0);
             decoded.copy_to_slice_interleaved(&mut integer_interleaved);
-            for sample in &integer_interleaved[skip_samples..] {
+            for sample in &integer_interleaved[emit_range] {
                 validate_left_justified_sample(*sample, info.bits_per_sample)?;
                 output(PcmSample::Integer(*sample)).map_err(DecoderError::Decode)?;
             }
         } else {
             float_interleaved.resize(decoded.samples_interleaved(), 0.0);
             decoded.copy_to_slice_interleaved(&mut float_interleaved);
-            forward_float_interleaved(&float_interleaved[skip_samples..], channels, output)
+            forward_float_interleaved(&float_interleaved[emit_range], channels, output)
                 .map_err(DecoderError::Decode)?;
+        }
+
+        if stop_after_this_packet {
+            return Ok(());
         }
     }
     if seeking {
@@ -324,6 +354,7 @@ fn decode_wavpack(
     cancelled: &AtomicBool,
     preserve_integer: bool,
     start_frame: u64,
+    end_frame: Option<u64>,
     output: &mut impl FnMut(PcmSample) -> Result<(), String>,
 ) -> Result<(), DecoderError> {
     let mut reader = if start_frame == 0 {
@@ -348,14 +379,31 @@ fn decode_wavpack(
     }
     let mut raw = vec![0i32; DECODE_CHUNK_FRAMES * channels];
     let scale = 2.0f64.powi(info.bits_per_sample.saturating_sub(1) as i32);
+    // Running absolute source-frame position, seeded at `start_frame` since the reader above
+    // already starts (or seeked) there; advanced by exactly the frames emitted each chunk so
+    // `end_frame` truncation (CUE sub-range tracks) can stop mid-chunk without over-reading into
+    // the next track's data.
+    let mut absolute_frame = start_frame;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let frames = reader.unpack_samples(&mut raw)? as usize;
+        let mut frames = reader.unpack_samples(&mut raw)? as usize;
         if frames == 0 {
             break;
         }
+        let mut stop_after_this_chunk = false;
+        if let Some(end_frame) = end_frame {
+            if absolute_frame >= end_frame {
+                break;
+            }
+            let remaining_in_range = (end_frame - absolute_frame) as usize;
+            if remaining_in_range < frames {
+                frames = remaining_in_range;
+                stop_after_this_chunk = true;
+            }
+        }
+        absolute_frame += frames as u64;
         let sample_count = frames * channels;
         if info.is_float {
             for frame in raw[..sample_count].chunks_exact(channels) {
@@ -376,6 +424,9 @@ fn decode_wavpack(
                 output(PcmSample::Float(left)).map_err(DecoderError::Decode)?;
                 output(PcmSample::Float(right)).map_err(DecoderError::Decode)?;
             }
+        }
+        if stop_after_this_chunk {
+            return Ok(());
         }
     }
     Ok(())
@@ -464,7 +515,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decoder-tone.flac");
         let expected_info = probe_file(&path).unwrap();
         let mut decoded = Vec::new();
-        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, |sample| {
+        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, None, |sample| {
             decoded.push(sample);
             Ok(())
         })
@@ -483,7 +534,7 @@ mod tests {
             .join("tests/fixtures/strict-24-bit-reference.flac");
         let expected_info = probe_file(&path).unwrap();
         let mut decoded = Vec::new();
-        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), true, 0, |sample| {
+        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), true, 0, None, |sample| {
             decoded.push(sample);
             Ok(())
         })
@@ -512,7 +563,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decoder-tone.wav");
         let expected_info = probe_file(&path).unwrap();
         let mut decoded = Vec::new();
-        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, |sample| {
+        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, None, |sample| {
             decoded.push(sample);
             Ok(())
         })
@@ -530,7 +581,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decoder-tone.mp3");
         let expected_info = probe_file(&path).unwrap();
         let mut decoded = Vec::new();
-        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, |sample| {
+        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, None, |sample| {
             decoded.push(sample);
             Ok(())
         })
@@ -548,7 +599,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decoder-tone.wv");
         let expected_info = probe_file(&path).unwrap();
         let mut decoded = Vec::new();
-        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, |sample| {
+        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, None, |sample| {
             decoded.push(sample);
             Ok(())
         })
@@ -566,7 +617,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decoder-tone-float.wv");
         let expected_info = probe_file(&path).unwrap();
         let mut decoded = Vec::new();
-        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, |sample| {
+        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, None, |sample| {
             decoded.push(sample);
             Ok(())
         })
@@ -616,7 +667,7 @@ mod tests {
 
             let expected_info = probe_file(&path).unwrap();
             let mut decoded = Vec::new();
-            let info = decode_file(&path, &expected_info, &AtomicBool::new(false), true, 0, |sample| {
+            let info = decode_file(&path, &expected_info, &AtomicBool::new(false), true, 0, None, |sample| {
                 decoded.push(sample);
                 Ok(())
             })
@@ -637,7 +688,7 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decoder-tone.wav");
         let expected_info = probe_file(&path).unwrap();
         let mut decoded = Vec::new();
-        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), true, 0, |sample| {
+        let info = decode_file(&path, &expected_info, &AtomicBool::new(false), true, 0, None, |sample| {
             decoded.push(sample);
             Ok(())
         })
@@ -681,7 +732,7 @@ mod tests {
         let mut stale_expected = probe_file(&path).unwrap();
         stale_expected.sample_rate += 1;
 
-        let result = decode_file(&path, &stale_expected, &AtomicBool::new(false), false, 0, |_| Ok(()));
+        let result = decode_file(&path, &stale_expected, &AtomicBool::new(false), false, 0, None, |_| Ok(()));
 
         match result {
             Err(DecoderError::Decode(message)) => {
@@ -728,7 +779,7 @@ mod tests {
     fn assert_seek_matches_full_decode_suffix(path: &Path, preserve_integer: bool, frame_counts: &[u64]) {
         let expected_info = probe_file(path).unwrap();
         let mut full = Vec::new();
-        decode_file(path, &expected_info, &AtomicBool::new(false), preserve_integer, 0, |sample| {
+        decode_file(path, &expected_info, &AtomicBool::new(false), preserve_integer, 0, None, |sample| {
             full.push(sample);
             Ok(())
         })
@@ -736,7 +787,7 @@ mod tests {
 
         for &n in frame_counts {
             let mut seeked = Vec::new();
-            decode_file(path, &expected_info, &AtomicBool::new(false), preserve_integer, n, |sample| {
+            decode_file(path, &expected_info, &AtomicBool::new(false), preserve_integer, n, None, |sample| {
                 seeked.push(sample);
                 Ok(())
             })
@@ -807,7 +858,7 @@ mod tests {
         let expected_info = probe_file(&path).unwrap();
         // The fixture decodes to 4800 frames (`decodes_wavpack_fixture`); seeking at the last
         // frame must be refused outright, never silently clamped and never a panic.
-        let result = decode_file(&path, &expected_info, &AtomicBool::new(false), true, 4_800, |_| Ok(()));
+        let result = decode_file(&path, &expected_info, &AtomicBool::new(false), true, 4_800, None, |_| Ok(()));
         assert!(result.is_err(), "seeking to/past the last frame must be refused, got {result:?}");
     }
 
@@ -820,7 +871,7 @@ mod tests {
         let flac = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decoder-tone.flac");
         for path in [&wav, &flac] {
             let expected_info = probe_file(path).unwrap();
-            let result = decode_file(path, &expected_info, &AtomicBool::new(false), false, 4_410, |_| Ok(()));
+            let result = decode_file(path, &expected_info, &AtomicBool::new(false), false, 4_410, None, |_| Ok(()));
             assert!(result.is_err(), "seeking to the end of {path:?} must be refused, got {result:?}");
         }
     }
@@ -829,7 +880,7 @@ mod tests {
     fn mp3_seek_decodes_without_error_or_refuses_cleanly() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/decoder-tone.mp3");
         let expected_info = probe_file(&path).unwrap();
-        let result = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 200, |_| Ok(()));
+        let result = decode_file(&path, &expected_info, &AtomicBool::new(false), false, 200, None, |_| Ok(()));
         match result {
             Ok(_) => {}
             Err(DecoderError::Decode(message)) => {
@@ -837,5 +888,100 @@ mod tests {
             }
             Err(other) => panic!("expected a clean decode-error refusal, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // CUE sub-range `end_frame` truncation (`CLAUDE.md` CUE-sheet playback support)
+    // -----------------------------------------------------------------------------------------
+
+    /// A minimal, hand-rolled 16-bit stereo PCM WAV file (RIFF/WAVE/fmt /data), matching this
+    /// repo's existing temp-file convention (`rg -n "temp_dir" src` — see `metadata.rs`/`cue.rs`'s
+    /// own helpers): a unique per-process/per-nanosecond temp path, explicit cleanup by the caller.
+    /// `samples` is interleaved (L, R, L, R, ...).
+    fn build_pcm16_wav(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+        let channels: u16 = 2;
+        let bits_per_sample: u16 = 16;
+        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
+        let block_align = channels * bits_per_sample / 8;
+        let data_bytes: Vec<u8> = samples.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&sample_rate.to_le_bytes());
+        out.extend_from_slice(&byte_rate.to_le_bytes());
+        out.extend_from_slice(&block_align.to_le_bytes());
+        out.extend_from_slice(&bits_per_sample.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data_bytes);
+        out
+    }
+
+    fn temp_wav_path(name: &str) -> std::path::PathBuf {
+        let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir().join(format!("lime-player-decoder-{name}-{}-{suffix}.wav", std::process::id()))
+    }
+
+    /// Generates a few thousand 16-bit stereo frames with a known, unique-per-frame pattern
+    /// (`left = frame_index as i16`, `right = -(frame_index as i16)`), decodes a `[start_frame,
+    /// end_frame)` sub-range, and asserts the exact output sample count and values match the
+    /// corresponding slice of a full, unbounded decode — no off-by-one, no over-read into the next
+    /// track's data (`CLAUDE.md` §3).
+    #[test]
+    fn end_frame_truncation_matches_exact_sub_range_of_a_full_decode() {
+        const TOTAL_FRAMES: usize = 4_000;
+        let mut samples = Vec::with_capacity(TOTAL_FRAMES * 2);
+        for frame in 0..TOTAL_FRAMES as i16 {
+            samples.push(frame);
+            samples.push(-frame);
+        }
+        let path = temp_wav_path("end-frame-truncation");
+        std::fs::write(&path, build_pcm16_wav(&samples, 44_100)).unwrap();
+
+        let expected_info = probe_file(&path).unwrap();
+        let mut full = Vec::new();
+        decode_file(&path, &expected_info, &AtomicBool::new(false), false, 0, None, |sample| {
+            full.push(sample);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(full.len(), TOTAL_FRAMES * 2, "sanity: the full decode must cover every frame");
+
+        // A sub-range strictly inside the stream: neither the first nor the last frame.
+        let (start_frame, end_frame) = (1_000u64, 1_500u64);
+        let mut sub_range = Vec::new();
+        decode_file(&path, &expected_info, &AtomicBool::new(false), false, start_frame, Some(end_frame), |sample| {
+            sub_range.push(sample);
+            Ok(())
+        })
+        .unwrap();
+
+        let expected_sample_count = (end_frame - start_frame) as usize * 2;
+        assert_eq!(sub_range.len(), expected_sample_count, "exactly end_frame - start_frame frames must be emitted");
+        assert_eq!(
+            sub_range,
+            full[start_frame as usize * 2..end_frame as usize * 2],
+            "the sub-range must match the full decode's slice exactly, no off-by-one"
+        );
+
+        // A single-frame sub-range not aligned to any `DECODE_CHUNK_FRAMES`/symphonia packet
+        // boundary must still truncate exactly, not over-read into the next frame.
+        let (start_frame, end_frame) = (1u64, 2u64);
+        let mut single_frame = Vec::new();
+        decode_file(&path, &expected_info, &AtomicBool::new(false), false, start_frame, Some(end_frame), |sample| {
+            single_frame.push(sample);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(single_frame.len(), 2, "exactly one stereo frame (2 samples) must be emitted");
+        assert_eq!(single_frame, full[2..4], "the single-frame sub-range must match the full decode's own frame 1");
+
+        std::fs::remove_file(&path).unwrap();
     }
 }

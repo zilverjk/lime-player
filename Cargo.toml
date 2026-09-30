@@ -8,17 +8,21 @@ license = "GPL-3.0-only"
 repository = "https://github.com/zilverjk/lime-player"
 
 [dependencies]
+audioadapter-buffers = "5.1"
 cpal = "0.18.2"
 crossbeam-channel = "0.5.15"
 directories = "6.0.0"
+flacenc = { version = "0.5.1", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 rfd = "0.15.4"
 rtrb = "0.3.2"
+rubato = "5.0.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-slint = { version = "1.18.1", features = ["raw-window-handle-06"] }
+slint = { version = "1.18.1", features = ["raw-window-handle-06", "unstable-winit-030"] }
 symphonia = { version = "0.6.1", default-features = false, features = ["all-meta", "flac", "mp3", "pcm", "wav"] }
 thiserror = "2.0"
+unicode-normalization = "0.1"
 wavpack = "0.4.0"
 
 [build-dependencies]
@@ -33,3 +37,34 @@ slint = { version = "1.18.1", features = ["renderer-software", "software-rendere
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = { version = "0.14.2", default-features = false, features = ["core_audio", "audio_toolbox"] }
+
+# The macOS media session (`src/media_controls.rs`): MediaPlayer's `MPRemoteCommandCenter` (F7/F8/F9
+# and Control Center) and `MPNowPlayingInfoCenter`. Every crate but `objc2-media-player` is already
+# in the tree through winit/rfd/muda at exactly these versions, so this adds one crate. Keep
+# `default-features = false` on `objc2-media-player`: its default set pulls in AVFoundation and most
+# of MediaPlayer. Do not mix these types with winit's older objc2 0.5 line.
+objc2 = "0.6.4"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSValue", "NSDictionary", "NSArray"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-media-player = { version = "0.3.2", default-features = false, features = ["std", "block2", "objc2-app-kit", "objc2-core-foundation", "MPRemoteCommandCenter", "MPRemoteCommand", "MPRemoteCommandEvent", "MPNowPlayingInfoCenter", "MPMediaItem"] }
+
+# `fsync(2)` and its "not supported here" errno values for the repair's durable flush
+# (`src/audio/rate_repair.rs`). Already in the tree through cpal/coreaudio-rs, so this adds no crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The sample-rate repair (`src/audio/rate_repair.rs`) runs a full FLAC decode -> FFT resample -> FLAC
+# encode over a whole track. Unoptimized, that takes about a minute per track in a debug build, so
+# optimize just those dependencies (the rest of the debug build is unaffected).
+[profile.dev.package.flacenc]
+opt-level = 3
+[profile.dev.package.rubato]
+opt-level = 3
+[profile.dev.package.rustfft]
+opt-level = 3
+[profile.dev.package.realfft]
+opt-level = 3
+[profile.dev.package.primal-check]
+opt-level = 3

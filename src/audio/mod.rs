@@ -2,6 +2,7 @@ mod coreaudio;
 mod decoder;
 pub mod metadata;
 mod player;
+pub mod rate_repair;
 
 pub use decoder::{AudioInfo, probe_file};
 // `TrackMetadata` itself is only ever named inside `metadata.rs` today (callers bind

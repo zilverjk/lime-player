@@ -20,6 +20,22 @@ pub fn has_audio_extension(path: &Path) -> bool {
         .is_some_and(|ext| AUDIO_EXTENSIONS.iter().any(|candidate| candidate.eq_ignore_ascii_case(ext)))
 }
 
+/// The `.cue` file extension, case-insensitive (`has_cue_extension`). Kept apart from
+/// `AUDIO_EXTENSIONS` deliberately: a `.cue` sheet is never itself a decodable audio stream
+/// (`audio::probe_file` must never be asked to probe one; this recursive walk itself also never
+/// includes cue files in the audio list it returns), it only *describes* one or more real audio
+/// files elsewhere in the same directory. `library::scanner`'s own per-directory cue detection
+/// (`CLAUDE.md` CUE-sheet playback support) does a separate, non-recursive `read_dir` for these,
+/// keyed off the directories its requested audio paths already live in — so a folder scan need not
+/// carry cue paths through this walker's own results for cue expansion to find them.
+pub const CUE_EXTENSION: &str = "cue";
+
+/// Whether `path`'s extension is `.cue`, case-insensitive — the same convention as
+/// `has_audio_extension`.
+pub fn has_cue_extension(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case(CUE_EXTENSION))
+}
+
 /// A hidden dotfile/dotdir, or a macOS AppleDouble sidecar (`._Foo.flac`) that a NAS share copied
 /// from an HFS+/APFS volume commonly carries next to the real file — both are named starting with
 /// `.`, so one check covers both.
@@ -174,6 +190,16 @@ mod tests {
 
         assert_eq!(found.len(), 5);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cue_extension_is_recognized_case_insensitively_and_never_as_audio() {
+        for name in ["album.cue", "Album.CUE", "album.Cue"] {
+            let path = Path::new(name);
+            assert!(has_cue_extension(path), "{name} should be recognized as a cue sheet");
+            assert!(!has_audio_extension(path), "a .cue file must never be treated as a decodable audio file");
+        }
+        assert!(!has_cue_extension(Path::new("track.flac")), "an audio file must never be treated as a cue sheet");
     }
 
     #[test]

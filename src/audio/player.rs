@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -13,6 +13,7 @@ use rtrb::{Consumer, RingBuffer};
 
 use super::coreaudio::{self, DacState, HogLease};
 use super::decoder::{AudioInfo, PcmSample, decode_file};
+use crate::library::TrackKey;
 
 const RING_SAMPLES: usize = 65_536;
 const PREBUFFER_MILLISECONDS: usize = 60;
@@ -174,7 +175,7 @@ pub struct PlayerSettings {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueueTrackSnapshot {
-    pub path: PathBuf,
+    pub key: TrackKey,
     pub title: String,
     pub parent_folder: String,
     pub format: String,
@@ -197,7 +198,7 @@ impl Default for PlayerSettings {
 pub enum PlaybackEvent {
     Devices(Vec<OutputDevice>),
     Started {
-        path: PathBuf,
+        key: TrackKey,
         info: AudioInfo,
         title: String,
         album: String,
@@ -240,8 +241,8 @@ enum Command {
     PlayNext(Vec<PreparedTrack>),
     ReplaceQueue(Vec<PreparedTrack>),
     Previous,
-    /// `path` guards against a stale seek racing a track transition.
-    Seek { path: PathBuf, position_ms: u64 },
+    /// `key` guards against a stale seek racing a track transition.
+    Seek { key: TrackKey, position_ms: u64 },
     /// 0.0..=1.0 device volume scalar (`§4.5`).
     SetVolume(f32),
     SelectOutput(Option<String>),
@@ -297,8 +298,8 @@ impl AudioPlayer {
         let _ = self.commands.send(Command::Previous);
     }
 
-    pub fn seek(&self, path: PathBuf, position_ms: u64) {
-        let _ = self.commands.send(Command::Seek { path, position_ms });
+    pub fn seek(&self, key: TrackKey, position_ms: u64) {
+        let _ = self.commands.send(Command::Seek { key, position_ms });
     }
 
     /// `level` is a 0.0..=1.0 device volume scalar (`§4.5`); ignored by the worker when the
@@ -355,7 +356,7 @@ pub fn enumerate_outputs() -> Result<Vec<OutputDevice>, String> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedTrack {
-    pub path: PathBuf,
+    pub key: TrackKey,
     pub info: AudioInfo,
 }
 
@@ -614,15 +615,43 @@ impl ActivePlayback {
     }
 }
 
-/// Latency-compensated audible position for the currently active track.
+/// Latency-compensated, TRACK-RELATIVE audible position for the currently active track (0 at this
+/// track's own `key.start_frame`, per `CLAUDE.md` CUE sheet support §4 — the UI's timeline is
+/// always track-relative, never the underlying physical file's absolute position). Computes the
+/// absolute position first (`active.start_frame`, the absolute decode start this stream was built
+/// with), then subtracts `key.start_frame`'s time equivalent exactly once via
+/// `track_relative_millis`, so every caller of this helper gets the subtraction automatically and
+/// it can never be double-applied or forgotten.
 fn audible_position_for(active: &ActivePlayback) -> u64 {
-    audible_position_millis(
+    let absolute_ms = audible_position_millis(
         active.consumed_output_samples.load(Ordering::Acquire),
         active.start_frame,
         active.output_latency_nanos.load(Ordering::Relaxed),
         active.prepared.info.sample_rate,
     )
-    .unwrap_or(0)
+    .unwrap_or(0);
+    track_relative_millis(absolute_ms, active.prepared.key.start_frame, active.prepared.info.sample_rate)
+}
+
+/// Converts an absolute physical-file-frame position (already in milliseconds) to a position
+/// relative to `key_start_frame` (an active `TrackKey`'s own `start_frame`) — the CUE-track
+/// track-relative Timeline subtraction point (`CLAUDE.md` §4). A whole-file track's
+/// `key_start_frame` is always 0, so this is a no-op subtraction for every non-CUE track.
+/// Saturates rather than underflows: `absolute_ms` should never fall behind `key_start_ms` in
+/// practice, but a clamp is cheaper and safer than a panic on a hot event-emission path.
+fn track_relative_millis(absolute_ms: u64, key_start_frame: u64, sample_rate: u32) -> u64 {
+    absolute_ms.saturating_sub(frame_to_millis(key_start_frame, sample_rate))
+}
+
+/// Frame count -> milliseconds at `sample_rate`, using the same u128-rounding pattern as
+/// `consumed_samples_position_millis`/`seek_target_frame` to avoid overflow. `frame` here is a
+/// plain (non-interleaved) frame count, unlike `consumed_samples_position_millis`'s interleaved
+/// sample count.
+fn frame_to_millis(frame: u64, sample_rate: u32) -> u64 {
+    if sample_rate == 0 {
+        return 0;
+    }
+    (u128::from(frame) * 1_000 / u128::from(sample_rate)) as u64
 }
 
 fn join_decoder_until(
@@ -664,6 +693,20 @@ fn consumed_samples_position_millis(consumed_samples: u64, sample_rate: u32) -> 
     let complete_stereo_frames = u128::from(consumed_samples / 2);
     let millis = complete_stereo_frames * 1_000 / u128::from(sample_rate);
     u64::try_from(millis).ok()
+}
+
+/// `active`'s absolute consumed-samples position (no latency compensation, unlike
+/// `audible_position_for`), converted to TRACK-RELATIVE milliseconds via `track_relative_millis`
+/// (`CLAUDE.md` CUE sheet support §4). Used at the two Timeline-emission sites (a natural/graceful
+/// drain, a retained playback failure) that report the exact consumed-samples position rather than
+/// the latency-compensated audible one.
+fn active_track_relative_position_ms(active: &ActivePlayback) -> u64 {
+    let absolute_ms = consumed_samples_position_millis(
+        active.consumed_output_samples.load(Ordering::Acquire),
+        active.prepared.info.sample_rate,
+    )
+    .unwrap_or(0);
+    track_relative_millis(absolute_ms, active.prepared.key.start_frame, active.prepared.info.sample_rate)
 }
 
 fn record_output_samples_consumed(counter: &AtomicU64, delivered_samples: u64) {
@@ -868,15 +911,15 @@ fn rate_change_guard_wait(last: Option<&StoppedOutput>, uid: &str, new_rate: u32
     OUTPUT_DRAIN_GUARD.checked_sub(now.duration_since(last.at)).filter(|d| !d.is_zero())
 }
 
-/// Drains same-path `Seek` commands already queued behind the one just received, keeping only
+/// Drains same-key `Seek` commands already queued behind the one just received, keeping only
 /// the latest target so a burst of scrub events collapses into a single seek. The first
 /// non-matching command is returned (to be replayed as `pending_command`) so command order is
 /// preserved (`§4.2`).
-fn drain_same_path_seeks(commands: &Receiver<Command>, path: &Path, initial_position_ms: u64) -> (u64, Option<Command>) {
+fn drain_same_key_seeks(commands: &Receiver<Command>, key: &TrackKey, initial_position_ms: u64) -> (u64, Option<Command>) {
     let mut position_ms = initial_position_ms;
     loop {
         match commands.try_recv() {
-            Ok(Command::Seek { path: next_path, position_ms: next_position_ms }) if next_path == path => {
+            Ok(Command::Seek { key: next_key, position_ms: next_position_ms }) if next_key == *key => {
                 position_ms = next_position_ms;
             }
             Ok(other) => return (position_ms, Some(other)),
@@ -951,6 +994,7 @@ impl Drop for DecoderExitGuard {
 fn spawn_track_preparation(
     prepared: PreparedTrack,
     start_frame: u64,
+    end_frame: Option<u64>,
     events: Sender<PlaybackEvent>,
 ) -> Result<TrackPreparation, String> {
     let integer_output = uses_strict_integer_route(&prepared.info);
@@ -969,7 +1013,7 @@ fn spawn_track_preparation(
     let decoder_failure_flag = decoder_failed.clone();
     let decoder_diagnostics = diagnostics.clone();
     let decoder_error_slot = decoder_error.clone();
-    let decoder_path = prepared.path.clone();
+    let decoder_path = prepared.key.path.clone();
     // The output stream is configured from this below (`start_track_prepared`); the decoder must
     // refuse rather than decode a file that no longer matches it (`§1.4`).
     let decoder_expected_info = prepared.info.clone();
@@ -984,7 +1028,7 @@ fn spawn_track_preparation(
                 error_slot: decoder_error_slot.clone(),
             };
             let mut decoder_found_nonzero_sample = false;
-            let result = decode_file(&decoder_path, &decoder_expected_info, &decoder_cancel, integer_output, start_frame, |sample| {
+            let result = decode_file(&decoder_path, &decoder_expected_info, &decoder_cancel, integer_output, start_frame, end_frame, |sample| {
                 if decoder_cancel.load(Ordering::Acquire) {
                     return Err("Playback cancelled".into());
                 }
@@ -1065,8 +1109,18 @@ struct PlaybackWorker {
     events: Sender<PlaybackEvent>,
     queue: VecDeque<PreparedTrack>,
     lookahead: Option<TrackPreparation>,
-    failed_preparation_path: Option<PathBuf>,
+    failed_preparation_key: Option<TrackKey>,
     waiting_for_decoder_cancel: bool,
+    /// The `start_playing` the start that is waiting on `waiting_for_decoder_cancel` will be made
+    /// with, so the start `resume_start_after_decoder_cancel` makes later keeps it (Previous or Next
+    /// on a paused track loads the new one paused). While that start waits nothing is active, so this
+    /// IS the transport state the UI is being shown: `toggle_playback` flips it (and announces the
+    /// new state), and a request that is not a play/pause request itself — Previous, Next, Enqueue,
+    /// PlayNext, an output or Hog change, all through `transport_playing_while_idle` — preserves it
+    /// instead of forcing a playing start. Only an explicit request to play something
+    /// (`replace_queue`) overwrites it. Meaningful only while `waiting_for_decoder_cancel` is set:
+    /// every entry into the wait (`start_queue_head`) writes it, every start resets it to `true`.
+    pending_start_playing: bool,
     last_completed: Option<PreparedTrack>,
     blocked_head: bool,
     active: Option<ActivePlayback>,
@@ -1083,9 +1137,14 @@ struct PlaybackWorker {
     /// Tracks that left `self.active` by natural completion, a completed graceful skip, or a
     /// `ReplaceQueue` stop; capped at 200, oldest dropped first (`§3.7`).
     history: Vec<PreparedTrack>,
-    /// A command dequeued by `drain_same_path_seeks` while coalescing same-path seeks, held so
+    /// A command dequeued by `drain_same_key_seeks` while coalescing same-key seeks, held so
     /// command order is preserved across the next `run()` iteration (`§4.2`).
     pending_command: Option<Command>,
+    /// Test-only record of the `start_playing` every fresh queue-head start asked for, so a
+    /// hardware-free test can tell a paused start (Next while paused) from a playing one even though
+    /// the start itself fails without a device.
+    #[cfg(test)]
+    new_track_start_requests: Vec<bool>,
 }
 
 impl PlaybackWorker {
@@ -1097,8 +1156,9 @@ impl PlaybackWorker {
             events,
             queue: VecDeque::new(),
             lookahead: None,
-            failed_preparation_path: None,
+            failed_preparation_key: None,
             waiting_for_decoder_cancel: false,
+            pending_start_playing: true,
             last_completed: None,
             blocked_head: false,
             active: None,
@@ -1109,6 +1169,8 @@ impl PlaybackWorker {
             last_stop: None,
             history: Vec::new(),
             pending_command: None,
+            #[cfg(test)]
+            new_track_start_requests: Vec::new(),
         }
     }
 
@@ -1193,10 +1255,10 @@ impl PlaybackWorker {
             Command::PlayNext(tracks) => self.play_next(tracks),
             Command::ReplaceQueue(tracks) => self.replace_queue(tracks),
             Command::Previous => self.previous_track(),
-            Command::Seek { path, position_ms } => {
-                let (position_ms, next_command) = drain_same_path_seeks(&self.commands, &path, position_ms);
+            Command::Seek { key, position_ms } => {
+                let (position_ms, next_command) = drain_same_key_seeks(&self.commands, &key, position_ms);
                 self.pending_command = next_command;
-                self.seek_to(path, position_ms);
+                self.seek_to(key, position_ms);
             }
             Command::SelectOutput(id) => {
                 self.selected_output = id.clone();
@@ -1253,7 +1315,7 @@ impl PlaybackWorker {
         ) {
             self.emit(PlaybackEvent::Status(format!(
                 "Skipped previously failed track {}; continuing the queue.",
-                display_name(&skipped)
+                display_name(&skipped.path)
             )));
         }
         self.queue.extend(tracks);
@@ -1274,7 +1336,7 @@ impl PlaybackWorker {
         {
             self.emit(PlaybackEvent::Status(format!(
                 "Skipped previously failed track {}; continuing the queue.",
-                display_name(&skipped)
+                display_name(&skipped.path)
             )));
         }
         for track in tracks.into_iter().rev() {
@@ -1296,15 +1358,28 @@ impl PlaybackWorker {
             self.emit(PlaybackEvent::Status(RETIRING_DECODERS_BUSY_MESSAGE.into()));
             return;
         }
-        if let Some(current) = self.stop_active_now(true) {
+        // What the UI is showing right now, before the stop: a paused track, or a start that is
+        // still waiting and will be paused.
+        let showing_paused = match self.active.as_ref() {
+            Some(active) => !active.playing,
+            None => self.waiting_for_decoder_cancel && !self.pending_start_playing,
+        };
+        if let Some(current) = self.stop_active_now() {
             self.push_history(current);
         }
         self.queue.clear();
         self.queue.extend(tracks);
         self.blocked_head = false;
-        self.failed_preparation_path = None;
+        self.failed_preparation_key = None;
         self.emit_queue_snapshot();
-        self.start_next();
+        self.start_next_after_stop(None, true);
+        if showing_paused && self.active.is_none() && self.waiting_for_decoder_cancel {
+            // A replaced queue plays (a double click is a play request) but this start is only waiting
+            // for a lookahead decoder, and the UI still shows Paused: a Play pressed in that gap would
+            // toggle `pending_start_playing` off. Announce what is going to happen so Play/Pause acts
+            // on what the user sees. (While playing the UI already shows it, so nothing is sent.)
+            self.emit(PlaybackEvent::Playing(true));
+        }
     }
 
     /// `pos < 3 s` (or an empty history) goes back to the previous track; otherwise the current
@@ -1317,8 +1392,8 @@ impl PlaybackWorker {
                 if unhealthy {
                     self.restart_current_from_queue();
                 } else {
-                    let path = active.prepared.path.clone();
-                    self.seek_to(path, 0); // position 0 needs no known duration
+                    let key = active.prepared.key.clone();
+                    self.seek_to(key, 0); // position 0 needs no known duration
                 }
                 return;
             }
@@ -1331,13 +1406,44 @@ impl PlaybackWorker {
             self.emit(PlaybackEvent::Status("No previous track in this session.".into()));
             return;
         };
-        if let Some(current) = self.stop_active_now(true) {
+        // Going back keeps the transport state, as a seek does: Previous on a paused track loads the
+        // previous one paused (the Next-while-paused rule, `skip_paused_to_next`), so F9 then F7 on a
+        // paused player never starts audio nobody asked for. With nothing active, Previous plays —
+        // unless a start is already waiting for a lookahead decoder, whose pending state is then the
+        // transport state (a second F7 on a paused player must not turn the first one's paused start
+        // into a playing one).
+        let was_playing = match self.active.as_ref() {
+            Some(active) => active.playing,
+            None => self.transport_playing_while_idle(),
+        };
+        if let Some(current) = self.stop_active_now() {
             self.queue.push_front(current);
         }
         self.queue.push_front(prev);
         self.blocked_head = false;
         self.emit_queue_snapshot();
-        self.start_next();
+        self.start_next_after_stop(None, was_playing);
+    }
+
+    /// Next while the active track is paused (`NextAction::AdvancePaused`): a graceful skip only
+    /// completes once the callback drains the ring buffer, which never happens on a paused stream, so
+    /// the skip would sit pending ("Resume playback to finish the safe skip.") and a media key or
+    /// Control Center "next" would look dead. Instead the paused track is stopped right now (the
+    /// same immediate stop `previous_track` uses to go back) and the queue head starts PAUSED — the
+    /// way Apple Music behaves — through the ordinary start path, so device, Hog lease and rate
+    /// handling are exactly a normal start's. The left track joins history, as a completed graceful
+    /// skip does; it is not `last_completed` (it did not finish naturally).
+    fn skip_paused_to_next(&mut self) {
+        if self.retiring_decoders_at_capacity() {
+            self.emit(PlaybackEvent::Status(RETIRING_DECODERS_BUSY_MESSAGE.into()));
+            return;
+        }
+        // No `Playing(false)` here: the track was already paused, and the paused start below
+        // reports `Playing(false)` itself, so the UI never sees a transient playing state.
+        if let Some(current) = self.stop_active_now() {
+            self.push_history(current);
+        }
+        self.start_next_paused();
     }
 
     /// Re-prepares the current (unhealthy) track from the queue head, from frame 0, with the
@@ -1347,12 +1453,12 @@ impl PlaybackWorker {
             self.emit(PlaybackEvent::Status(RETIRING_DECODERS_BUSY_MESSAGE.into()));
             return;
         }
-        if let Some(current) = self.stop_active_now(true) {
+        if let Some(current) = self.stop_active_now() {
             self.queue.push_front(current);
         }
         self.blocked_head = false;
         self.emit_queue_snapshot();
-        self.start_next();
+        self.start_next_after_stop(None, true);
     }
 
     fn current_position_ms(&self, active: &ActivePlayback) -> u64 {
@@ -1372,7 +1478,14 @@ impl PlaybackWorker {
     /// may block); it moves to `retiring_decoders` for `reap_retiring_decoders` to reclaim.
     /// Returns the stopped track so the caller decides where it goes next (history, the queue
     /// head, or straight into a reseek).
-    fn stop_active_now(&mut self, emit_playing: bool) -> Option<PreparedTrack> {
+    ///
+    /// Emits no `Playing(false)`: every caller starts something right after (a seek's restart, a
+    /// replacement, the previous track), and the start reports the transport state itself
+    /// (`Started` + `Playing(..)`). Announcing the stop first would let the UI — and the OS Now
+    /// Playing widget, which mirrors it — show Paused for as long as that start blocks (the DAC
+    /// prime, the prebuffer wait: hundreds of ms, up to 30 s on a NAS). A caller whose start may not
+    /// happen uses `start_next_after_stop`, which reports the stop only when nothing took over.
+    fn stop_active_now(&mut self) -> Option<PreparedTrack> {
         let mut active = self.active.take()?;
         self.last_stop = Some(StoppedOutput {
             at: Instant::now(),
@@ -1397,9 +1510,6 @@ impl PlaybackWorker {
             active.prepared.info.sample_rate,
         ) {
             self.emit(PlaybackEvent::Status(message));
-        }
-        if emit_playing {
-            self.emit(PlaybackEvent::Playing(false));
         }
         Some(active.prepared.clone())
     }
@@ -1457,12 +1567,12 @@ impl PlaybackWorker {
 
     /// Seeks the active track to `position_ms`, pinned to its current output device and Hog
     /// mode so the seek can never trigger a device change or a Hog acquire/release (`§4.2`).
-    fn seek_to(&mut self, path: PathBuf, position_ms: u64) {
+    fn seek_to(&mut self, key: TrackKey, position_ms: u64) {
         let Some(active) = self.active.as_ref() else {
             self.reject_seek("Seek ignored: no track is active.");
             return;
         };
-        if active.prepared.path != path {
+        if active.prepared.key != key {
             // Covers the race where `advance_if_drained` already moved on this tick.
             self.reject_seek("Seek ignored: the track changed.");
             return;
@@ -1484,18 +1594,24 @@ impl PlaybackWorker {
             return;
         }
 
-        let start_frame = if position_ms == 0 {
+        // `info.duration_ms` is already the *sub-range* duration for a CUE track (overridden by
+        // the scanner at expansion time), so `seek_target_frame`'s clamp is against the sub-range's
+        // own length, and its result is already track-relative (0 at this track's own start) —
+        // `key.start_frame` is added below to get the absolute physical-file decode frame.
+        let relative_frame = if position_ms == 0 {
             0
         } else {
             seek_target_frame(position_ms, active.prepared.info.sample_rate, active.prepared.info.duration_ms.unwrap())
         };
+        let start_frame = active.prepared.key.start_frame + relative_frame;
+        let end_frame = active.prepared.key.end_frame;
         let was_playing = active.playing;
         let pinned = pinned_output(active);
 
         // Guards above already confirmed `self.active` is `Some`.
-        let Some(prepared) = self.stop_active_now(false) else { return };
+        let Some(prepared) = self.stop_active_now() else { return };
 
-        match spawn_track_preparation(prepared.clone(), start_frame, self.events.clone()) {
+        match spawn_track_preparation(prepared.clone(), start_frame, end_frame, self.events.clone()) {
             Ok(preparation) => {
                 let options = StartOptions {
                     start_frame,
@@ -1511,11 +1627,51 @@ impl PlaybackWorker {
         }
     }
 
+    /// Starts the queue head for a request that is not itself a play/pause request (Enqueue,
+    /// PlayNext, an output or Hog change, Next with nothing active): it plays, except while a start is
+    /// already waiting for a lookahead decoder (`transport_playing_while_idle`), where it must keep
+    /// what that start was asked to do. Toggle/Play asks `start_queue_head(None, true)` directly.
     fn start_next(&mut self) {
-        self.start_next_from_drain(None);
+        self.start_queue_head(None, self.transport_playing_while_idle());
     }
 
-    fn start_next_from_drain(&mut self, worker_drain_observed_at: Option<Instant>) {
+    /// With nothing active, whether a start that nobody explicitly asked to play or pause should play:
+    /// yes, unless a start is already waiting for a lookahead decoder to stop
+    /// (`waiting_for_decoder_cancel`). Then that start's `pending_start_playing` IS the transport
+    /// state (the UI still shows what it showed before the wait), so a later Previous, Next, Enqueue,
+    /// PlayNext, output or Hog change preserves it instead of forcing `true`.
+    fn transport_playing_while_idle(&self) -> bool {
+        !self.waiting_for_decoder_cancel || self.pending_start_playing
+    }
+
+    /// Starts the queue head after the previous track left `self.active` without the UI hearing about
+    /// it (a natural drain, Previous, a replaced queue, a restart): the stop is only announced as
+    /// `Playing(false)` when no track took over. When the start succeeds, its own `Started` +
+    /// `Playing(start_playing)` replace the announcement; sending it first would show the transport
+    /// as paused for the whole (blocking) start, and a `Play` media command arriving in that gap would
+    /// toggle the freshly started track back to paused. The paths where nothing starts — an empty
+    /// queue (`Stopped`) or a failed start (`Inactive`) — end with `self.active` still `None`, and the
+    /// UI hears it here. A start that is only waiting for a lookahead decoder to stop
+    /// (`waiting_for_decoder_cancel`) is not one of them: it will happen, so the announcement moves to
+    /// `resume_start_after_decoder_cancel`, which makes that start (with the `start_playing` asked for
+    /// here, `pending_start_playing`) and reports the stop if it turns out there is nothing to start.
+    /// Announcing it now would show Paused, and hand the OS Now Playing widget a stale paused track,
+    /// for as long as the decoder takes to stop — the normal path for `replace_queue`, whose new head
+    /// almost never matches the old next-track lookahead.
+    fn start_next_after_stop(&mut self, worker_drain_observed_at: Option<Instant>, start_playing: bool) {
+        self.start_queue_head(worker_drain_observed_at, start_playing);
+        if self.active.is_none() && !self.waiting_for_decoder_cancel {
+            self.emit(PlaybackEvent::Playing(false));
+        }
+    }
+
+    /// Starts the queue head with its stream paused: the track is loaded, `Started` is reported and
+    /// the UI shows it, but no audio flows until the user resumes (`skip_paused_to_next`).
+    fn start_next_paused(&mut self) {
+        self.start_queue_head(None, false);
+    }
+
+    fn start_queue_head(&mut self, worker_drain_observed_at: Option<Instant>, start_playing: bool) {
         if self.active.is_some() {
             return;
         }
@@ -1528,7 +1684,12 @@ impl PlaybackWorker {
         let preparation = match self.preparation_for_start(&prepared) {
             Ok(preparation) => preparation,
             Err(error) => {
-                if !self.waiting_for_decoder_cancel {
+                if self.waiting_for_decoder_cancel {
+                    // Not a failure: the head starts once the lookahead decoder has stopped
+                    // (`resume_start_after_decoder_cancel`), and it must start the way this call was
+                    // asked to — a paused Previous/Next would otherwise begin playing.
+                    self.pending_start_playing = start_playing;
+                } else {
                     self.hog_lease.take();
                     self.blocked_head = true;
                     self.emit_queue_snapshot();
@@ -1542,12 +1703,9 @@ impl PlaybackWorker {
                 return;
             }
         };
-        let options = StartOptions {
-            start_frame: 0,
-            start_playing: true,
-            reason: StartReason::NewTrack,
-            pinned_output: None,
-        };
+        #[cfg(test)]
+        self.new_track_start_requests.push(start_playing);
+        let options = new_track_start_options(&prepared, start_playing);
         if let Err((error, mut preparation)) =
             self.start_track(prepared, preparation, worker_drain_observed_at, options)
         {
@@ -1572,13 +1730,14 @@ impl PlaybackWorker {
         self.queue.pop_front();
         self.blocked_head = false;
         self.waiting_for_decoder_cancel = false;
+        self.pending_start_playing = true;
         self.emit_queue_snapshot();
         self.reconcile_lookahead();
     }
 
     fn preparation_for_start(&mut self, prepared: &PreparedTrack) -> Result<TrackPreparation, String> {
         if let Some(mut preparation) = self.lookahead.take() {
-            if preparation.prepared.path == prepared.path
+            if preparation.prepared.key == prepared.key
                 && !preparation.audio.cancel.load(Ordering::Acquire)
             {
                 return Ok(preparation);
@@ -1596,9 +1755,9 @@ impl PlaybackWorker {
                 return Err("A previous next-track decoder is still stopping.".into());
             }
         }
-        self.failed_preparation_path = None;
+        self.failed_preparation_key = None;
         self.waiting_for_decoder_cancel = false;
-        spawn_track_preparation(prepared.clone(), 0, self.events.clone())
+        spawn_track_preparation(prepared.clone(), prepared.key.start_frame, prepared.key.end_frame, self.events.clone())
     }
 
     fn reconcile_lookahead(&mut self) {
@@ -1625,12 +1784,12 @@ impl PlaybackWorker {
             }
             return;
         };
-        if self.failed_preparation_path.as_ref().is_some_and(|path| path != &prepared.path) {
-            self.failed_preparation_path = None;
+        if self.failed_preparation_key.as_ref().is_some_and(|key| key != &prepared.key) {
+            self.failed_preparation_key = None;
         }
 
         let has_current_head = self.lookahead.as_ref().is_some_and(|preparation| {
-            preparation.prepared.path == prepared.path
+            preparation.prepared.key == prepared.key
                 && !preparation.audio.cancel.load(Ordering::Acquire)
         });
         if has_current_head {
@@ -1660,16 +1819,16 @@ impl PlaybackWorker {
             self.lookahead = None;
         }
 
-        if self.failed_preparation_path.as_ref() == Some(&prepared.path) {
+        if self.failed_preparation_key.as_ref() == Some(&prepared.key) {
             return;
         }
-        match spawn_track_preparation(prepared.clone(), 0, self.events.clone()) {
+        match spawn_track_preparation(prepared.clone(), prepared.key.start_frame, prepared.key.end_frame, self.events.clone()) {
             Ok(preparation) => {
-                self.failed_preparation_path = None;
+                self.failed_preparation_key = None;
                 self.lookahead = Some(preparation);
             }
             Err(error) => {
-                self.failed_preparation_path = Some(prepared.path.clone());
+                self.failed_preparation_key = Some(prepared.key.clone());
                 self.emit(PlaybackEvent::Status(format!(
                     "Could not prepare next track audio: {error}"
                 )));
@@ -1692,8 +1851,15 @@ impl PlaybackWorker {
             preparation.audio.reap_finished_decoder();
         }
         self.waiting_for_decoder_cancel = false;
+        let start_playing = std::mem::replace(&mut self.pending_start_playing, true);
         if self.active.is_none() && !self.blocked_head && !self.queue.is_empty() {
-            self.start_next();
+            // The start that had to wait was announced by nobody (`start_next_after_stop`): it is
+            // announced here, once it has run — as `Playing(false)` only if it did not take over.
+            self.start_next_after_stop(None, start_playing);
+        } else if self.active.is_none() {
+            // Nothing left to start (the queue was emptied or the head blocked while waiting): the
+            // stop that the waiting start held back is still owed to the UI.
+            self.emit(PlaybackEvent::Playing(false));
         }
     }
 
@@ -1986,10 +2152,10 @@ impl PlaybackWorker {
 
         match options.reason {
             StartReason::NewTrack => {
-                let title = display_name(&prepared.path);
-                let parent = prepared.path.parent().map(display_path).unwrap_or_else(|| "Audio file".into());
+                let title = display_name(&prepared.key.path);
+                let parent = prepared.key.path.parent().map(display_path).unwrap_or_else(|| "Audio file".into());
                 self.emit(PlaybackEvent::Started {
-                    path: prepared.path.clone(),
+                    key: prepared.key.clone(),
                     info: prepared.info.clone(),
                     title,
                     album: parent,
@@ -2002,7 +2168,9 @@ impl PlaybackWorker {
                     position_ms: 0,
                     duration_ms: prepared.info.duration_ms,
                 });
-                self.emit(PlaybackEvent::Playing(true));
+                // `false` only for a track started paused by Next (`skip_paused_to_next`); the stream
+                // was paused above, so the UI must not show it playing.
+                self.emit(PlaybackEvent::Playing(options.start_playing));
                 // A new track may have started on a different device than whatever the slider
                 // last showed; refresh now rather than wait for the 1 s poll (`§4.5`). `self.active`
                 // is not assigned yet, so this still resolves through `self.selected_output`,
@@ -2011,7 +2179,7 @@ impl PlaybackWorker {
                 self.refresh_volume(true);
                 if let Some(worker_drain_observed_at) = worker_drain_observed_at {
                     let diagnostic = handoff_timing_diagnostic(
-                        &prepared.path.display().to_string(),
+                        &prepared.key.path.display().to_string(),
                         &prepared.info.format,
                         prepared.info.sample_rate,
                         stream_play_returned_at.saturating_duration_since(worker_drain_observed_at),
@@ -2027,8 +2195,13 @@ impl PlaybackWorker {
             }
             StartReason::Seek => {
                 // No `Started` and no handoff diagnostic: the track itself has not changed.
-                let position_ms =
+                // `consumed_samples_position_millis` gives the *absolute* file position; the
+                // emitted Timeline must be track-relative (0 at this track's own `key.start_frame`),
+                // subtracted here via `track_relative_millis` so it is never double-subtracted or
+                // forgotten on this code path (`CLAUDE.md` CUE sheet support, §4).
+                let absolute_ms =
                     consumed_samples_position_millis(options.start_frame * 2, prepared.info.sample_rate).unwrap_or(0);
+                let position_ms = track_relative_millis(absolute_ms, prepared.key.start_frame, prepared.info.sample_rate);
                 self.emit(PlaybackEvent::Timeline { position_ms, duration_ms: prepared.info.duration_ms });
                 self.emit(PlaybackEvent::Playing(options.start_playing));
             }
@@ -2098,11 +2271,7 @@ impl PlaybackWorker {
             self.emit(PlaybackEvent::Status(message));
         }
         self.emit(PlaybackEvent::Timeline {
-            position_ms: consumed_samples_position_millis(
-                active.consumed_output_samples.load(Ordering::Acquire),
-                active.prepared.info.sample_rate,
-            )
-            .unwrap_or(0),
+            position_ms: active_track_relative_position_ms(&active),
             duration_ms: active.prepared.info.duration_ms,
         });
         let naturally_completed = (!active.skip_requested).then(|| active.prepared.clone());
@@ -2114,8 +2283,11 @@ impl PlaybackWorker {
         if let Some(prepared) = naturally_completed {
             self.last_completed = Some(prepared);
         }
-        self.emit(PlaybackEvent::Playing(false));
-        self.start_next_from_drain(Some(worker_drain_observed_at));
+        // Announced as `Playing(false)` only if no next track starts (`start_next_after_stop`): the
+        // start below blocks through the rate-change guard, the DAC prime and the prebuffer wait, and
+        // a `Playing(false)` sent before it would show the transport (and the OS Now Playing widget)
+        // as paused across every track change.
+        self.start_next_after_stop(Some(worker_drain_observed_at), true);
     }
 
     /// Signal-flag changes (decoded/callback nonzero) are developer diagnostics: emitted
@@ -2299,15 +2471,24 @@ impl PlaybackWorker {
 
     fn toggle_playback(&mut self) {
         let Some(active) = self.active.as_mut() else {
-            if self.queue.is_empty() {
-                if !restore_last_completed_track(&mut self.queue, self.last_completed.as_ref()) {
-                    self.emit(PlaybackEvent::Status("Open an audio file to start playback.".into()));
-                    return;
-                }
-                self.start_next();
-            } else {
-                self.start_next();
+            if self.waiting_for_decoder_cancel && !self.queue.is_empty() {
+                // A start is waiting for a lookahead decoder to stop, so nothing is active yet the UI
+                // still shows the state it had (playing after a replaced queue or Previous while
+                // playing, paused after a paused Previous/Next): the pending state IS the transport
+                // state, and Play/Pause flips it, exactly as it would flip an active track. Starting
+                // the head here instead would re-enter the wait as a playing start and lose a Pause.
+                self.pending_start_playing = !self.pending_start_playing;
+                self.emit(PlaybackEvent::Playing(self.pending_start_playing));
+                return;
             }
+            if self.queue.is_empty()
+                && !restore_last_completed_track(&mut self.queue, self.last_completed.as_ref())
+            {
+                self.emit(PlaybackEvent::Status("Open an audio file to start playback.".into()));
+                return;
+            }
+            // An explicit Play: always a playing start, whatever a stale wait remembers.
+            self.start_queue_head(None, true);
             return;
         };
         let Some(stream) = active.stream.as_ref() else { return; };
@@ -2335,16 +2516,15 @@ impl PlaybackWorker {
         if let Some(active) = self.active.as_mut() {
             let active_failed = active.decoder_failed.load(Ordering::Acquire)
                 || active.output_failed.load(Ordering::Acquire);
-            if !can_next_skip(!self.queue.is_empty(), active_failed) {
-                self.emit(PlaybackEvent::Status("The queue is empty.".into()));
-                return;
+            match next_action(!self.queue.is_empty(), active_failed, active.cancel.load(Ordering::Acquire), active.playing) {
+                NextAction::QueueEmpty => self.emit(PlaybackEvent::Status("The queue is empty.".into())),
+                NextAction::SkipPending => self.emit(PlaybackEvent::Status("A safe skip is already pending.".into())),
+                NextAction::AdvancePaused => self.skip_paused_to_next(),
+                NextAction::GracefulSkip => {
+                    let status = request_graceful_skip(&active.cancel, &mut active.skip_requested, active.playing);
+                    self.emit(PlaybackEvent::Status(status.into()));
+                }
             }
-            if active.cancel.load(Ordering::Acquire) {
-                self.emit(PlaybackEvent::Status("A safe skip is already pending.".into()));
-                return;
-            }
-            let status = request_graceful_skip(&active.cancel, &mut active.skip_requested, active.playing);
-            self.emit(PlaybackEvent::Status(status.into()));
             return;
         }
         if self.queue.is_empty() {
@@ -2353,9 +2533,20 @@ impl PlaybackWorker {
         }
         // With no active stream, Next explicitly skips a queue item left blocked by a
         // prior output/Hog/rate setup error.
-        self.queue.pop_front();
+        let skipped = self.queue.pop_front();
+        if self.waiting_for_decoder_cancel {
+            // The head was not blocked: it is the track a Previous or Next whose start is still
+            // waiting for a decoder was going to load (often one Previous just took out of history).
+            // Skipping it is what Next does to a loaded track, so it joins history — otherwise it
+            // would vanish from both the queue and the history.
+            if let Some(skipped) = skipped {
+                self.push_history(skipped);
+            }
+        }
         self.blocked_head = false;
         self.emit_queue_snapshot();
+        // Keeps the transport state a waiting start holds (`start_next`): F7 then F9 on a paused
+        // player must not start audio.
         self.start_next();
     }
 
@@ -2376,11 +2567,7 @@ impl PlaybackWorker {
             active.prepared.info.sample_rate,
         );
         self.emit(PlaybackEvent::Timeline {
-            position_ms: consumed_samples_position_millis(
-                active.consumed_output_samples.load(Ordering::Acquire),
-                active.prepared.info.sample_rate,
-            )
-            .unwrap_or(0),
+            position_ms: active_track_relative_position_ms(&active),
             duration_ms: active.prepared.info.duration_ms,
         });
         if status.is_none() {
@@ -2393,11 +2580,11 @@ impl PlaybackWorker {
         self.blocked_head = status.is_some();
         if status.is_some() {
             // The track is retained at the queue head, blocked, with no further start attempt
-            // in this call (unlike the `None` branch below, which immediately tries `start_next`):
+            // in this call (unlike the `None` branch below, which immediately tries a start):
             // the UI must not keep showing the pre-failure route status or a seekable bar (`§1.4`).
             self.emit(PlaybackEvent::Inactive);
+            self.emit(PlaybackEvent::Playing(false));
         }
-        self.emit(PlaybackEvent::Playing(false));
         self.emit_queue_snapshot();
         if let Some((underrun_message, _)) = underrun_status {
             self.emit(PlaybackEvent::Status(underrun_message));
@@ -2409,8 +2596,9 @@ impl PlaybackWorker {
             };
             self.emit(PlaybackEvent::Status(message));
         } else {
-            // Advancing here is only allowed after an explicit user Next request.
-            self.start_next();
+            // Advancing here is only allowed after an explicit user Next request. `Playing(false)`
+            // is left to `start_next_after_stop`, which sends it only if that start does not happen.
+            self.start_next_after_stop(None, true);
         }
     }
 
@@ -2437,9 +2625,10 @@ fn queue_snapshot(queue: &VecDeque<PreparedTrack>) -> Vec<QueueTrackSnapshot> {
     queue
         .iter()
         .map(|prepared| QueueTrackSnapshot {
-            path: prepared.path.clone(),
-            title: display_name(&prepared.path),
+            key: prepared.key.clone(),
+            title: display_name(&prepared.key.path),
             parent_folder: prepared
+                .key
                 .path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -2482,17 +2671,61 @@ fn can_next_skip(queue_has_successor: bool, active_failed: bool) -> bool {
     queue_has_successor || active_failed
 }
 
+/// What `next_track` does with a Next request while a track is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextAction {
+    /// Nothing follows and the active track is healthy.
+    QueueEmpty,
+    /// A graceful skip is already draining; a second Next is ignored.
+    SkipPending,
+    /// Paused (no audio flowing, so a graceful skip could never drain): leave the track now and start
+    /// the next one paused (`skip_paused_to_next`).
+    AdvancePaused,
+    /// Playing: cancel the decoder and let the buffered audio drain before advancing.
+    GracefulSkip,
+}
+
+/// Decides `next_track`'s action for an active track. A paused track with a successor advances
+/// immediately, even when an earlier graceful skip is still pending (the user paused after pressing
+/// Next: it can never drain, and they clearly want to leave the track). A paused track with nothing
+/// queued after it (only reachable when it failed) keeps the old pending-skip behavior. Playing
+/// behavior is unchanged.
+fn next_action(queue_has_successor: bool, active_failed: bool, skip_pending: bool, playing: bool) -> NextAction {
+    if !can_next_skip(queue_has_successor, active_failed) {
+        NextAction::QueueEmpty
+    } else if !playing && queue_has_successor {
+        NextAction::AdvancePaused
+    } else if skip_pending {
+        NextAction::SkipPending
+    } else {
+        NextAction::GracefulSkip
+    }
+}
+
+/// `StartOptions` for starting a queue item fresh (not a seek restart): from the track's own start
+/// frame, on the selected output (no pinning), playing unless it is being started paused.
+fn new_track_start_options(prepared: &PreparedTrack, start_playing: bool) -> StartOptions {
+    StartOptions {
+        // A CUE sub-range track's fresh (non-seek) start decodes from its own INDEX 01, not
+        // absolute file frame 0; a whole-file track's `key.start_frame` is always 0.
+        start_frame: prepared.key.start_frame,
+        start_playing,
+        reason: StartReason::NewTrack,
+        pinned_output: None,
+    }
+}
+
 fn recover_blocked_head_for_enqueue(
     queue: &mut VecDeque<PreparedTrack>,
     blocked_head: &mut bool,
     has_active_playback: bool,
-) -> Option<PathBuf> {
+) -> Option<TrackKey> {
     if has_active_playback || !*blocked_head {
         return None;
     }
-    let failed_path = queue.pop_front().map(|track| track.path);
+    let failed_key = queue.pop_front().map(|track| track.key);
     *blocked_head = false;
-    failed_path
+    failed_key
 }
 
 fn restore_last_completed_track(
@@ -2772,6 +3005,7 @@ fn display_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use super::super::decoder::probe_file;
+    use std::path::PathBuf;
 
     #[test]
     fn handoff_timing_diagnostic_labels_transition_stages_and_unmeasured_gap() {
@@ -2849,7 +3083,7 @@ mod tests {
 
     fn test_track(name: &str) -> PreparedTrack {
         PreparedTrack {
-            path: PathBuf::from(name),
+            key: TrackKey::whole_file(PathBuf::from(name)),
             info: AudioInfo {
                 sample_rate: 44_100,
                 duration_ms: Some(1_000),
@@ -2883,7 +3117,7 @@ mod tests {
             snapshot,
             vec![
                 QueueTrackSnapshot {
-                    path: PathBuf::from("/nas/album/first.flac"),
+                    key: TrackKey::whole_file(PathBuf::from("/nas/album/first.flac")),
                     title: "first".into(),
                     parent_folder: "album".into(),
                     format: "FLAC".into(),
@@ -2893,7 +3127,7 @@ mod tests {
                     duration_ms: Some(95_000),
                 },
                 QueueTrackSnapshot {
-                    path: PathBuf::from("/nas/other/second.mp3"),
+                    key: TrackKey::whole_file(PathBuf::from("/nas/other/second.mp3")),
                     title: "second".into(),
                     parent_folder: "other".into(),
                     format: "MPEG Audio".into(),
@@ -2909,7 +3143,49 @@ mod tests {
     fn fixture_track(name: &str) -> PreparedTrack {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
         let info = probe_file(&path).expect("decoder fixture should be probeable");
-        PreparedTrack { path, info }
+        PreparedTrack { key: TrackKey::whole_file(path), info }
+    }
+
+    /// A minimal, hardware-free `ActivePlayback` for a track identified by `key`, for tests that
+    /// only need to exercise pure position/timeline math (`audible_position_for` and friends), not
+    /// the full worker/queue machinery `worker_with_active_track_and_events` sets up.
+    fn test_active_playback_with_key(key: TrackKey) -> ActivePlayback {
+        let info = AudioInfo {
+            sample_rate: 44_100,
+            duration_ms: Some(10_000),
+            source_channels: 2,
+            bits_per_sample: 16,
+            is_float: false,
+            integer_pcm: true,
+            format: "FLAC".into(),
+        };
+        ActivePlayback {
+            prepared: PreparedTrack { key, info },
+            stream: None,
+            decoder: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            drained: Arc::new(AtomicBool::new(false)),
+            decoder_failed: Arc::new(AtomicBool::new(false)),
+            output_failed: Arc::new(AtomicBool::new(false)),
+            format_mismatch: Arc::new(AtomicU8::new(0)),
+            diagnostics: Arc::new(AudioDiagnostics::default()),
+            reported_diagnostics: AudioDiagnosticsSnapshot::default(),
+            reported_underrun_samples: 0,
+            underrun_reported_at: Instant::now(),
+            stream_play_returned_stream_time: StreamInstant::ZERO,
+            stream_play_returned_unix_ms: unix_time_millis(),
+            first_output_pcm_callback_reported: false,
+            consumed_output_samples: Arc::new(AtomicU64::new(0)),
+            output_latency_nanos: Arc::new(AtomicU64::new(0)),
+            start_frame: 0,
+            timeline_reported_samples: 0,
+            timeline_reported_at: Instant::now(),
+            drain_started: None,
+            playing: true,
+            skip_requested: false,
+            output_id: String::new(),
+            hog_mode: false,
+        }
     }
 
     fn worker_with_active_track(queue: Vec<PreparedTrack>) -> PlaybackWorker {
@@ -3076,19 +3352,19 @@ mod tests {
     #[test]
     fn next_track_preparation_does_not_mutate_active_output_state() {
         let next = fixture_track("decoder-tone.flac");
-        let next_path = next.path.clone();
+        let next_path = next.key.path.clone();
         let mut worker = worker_with_active_track(vec![next]);
         let output_id = worker.selected_output.clone();
         let hog_mode = worker.settings.hog_mode_enabled;
 
         worker.reconcile_lookahead();
 
-        assert_eq!(worker.active.as_ref().unwrap().prepared.path, PathBuf::from("/music/current.flac"));
+        assert_eq!(worker.active.as_ref().unwrap().prepared.key.path, PathBuf::from("/music/current.flac"));
         assert_eq!(worker.selected_output, output_id);
         assert_eq!(worker.settings.hog_mode_enabled, hog_mode);
         assert!(worker.hog_lease.is_none());
-        assert_eq!(worker.queue.front().unwrap().path, next_path);
-        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.path, next_path);
+        assert_eq!(worker.queue.front().unwrap().key.path, next_path);
+        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.key.path, next_path);
         cancel_and_reap_lookahead(&mut worker);
     }
 
@@ -3096,7 +3372,7 @@ mod tests {
     fn replacing_queue_head_waits_for_cancelled_decoder_before_replacement() {
         let old = fixture_track("decoder-tone.flac");
         let new = fixture_track("decoder-tone.wv");
-        let new_path = new.path.clone();
+        let new_path = new.key.path.clone();
         let mut worker = worker_with_active_track(vec![old.clone()]);
         worker.reconcile_lookahead();
         let old_finished = worker.lookahead.as_ref().unwrap().audio.eof.clone();
@@ -3105,7 +3381,7 @@ mod tests {
         worker.queue.push_front(new);
         worker.reconcile_lookahead();
 
-        if worker.lookahead.as_ref().is_some_and(|prep| prep.prepared.path == old.path) {
+        if worker.lookahead.as_ref().is_some_and(|prep| prep.prepared.key.path == old.key.path) {
             assert!(worker.lookahead.as_ref().unwrap().audio.cancel.load(Ordering::Acquire));
             for _ in 0..1_000 {
                 if worker.lookahead.as_ref().unwrap().audio.decoder_finished() {
@@ -3118,7 +3394,7 @@ mod tests {
         }
 
         assert!(old_finished.load(Ordering::Acquire));
-        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.path, new_path);
+        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.key.path, new_path);
         cancel_and_reap_lookahead(&mut worker);
     }
 
@@ -3126,7 +3402,7 @@ mod tests {
     fn speculative_decode_error_keeps_active_track_and_queue_head_intact() {
         let mut missing = test_track("/nas/missing-next-track.flac");
         missing.info = fixture_track("decoder-tone.flac").info;
-        let missing_path = missing.path.clone();
+        let missing_path = missing.key.path.clone();
         let mut worker = worker_with_active_track(vec![missing]);
 
         worker.reconcile_lookahead();
@@ -3140,8 +3416,8 @@ mod tests {
         let preparation = worker.lookahead.as_ref().unwrap();
         assert!(preparation.audio.eof.load(Ordering::Acquire));
         assert!(preparation.audio.decoder_failed.load(Ordering::Acquire));
-        assert_eq!(worker.active.as_ref().unwrap().prepared.path, PathBuf::from("/music/current.flac"));
-        assert_eq!(worker.queue.front().unwrap().path, missing_path);
+        assert_eq!(worker.active.as_ref().unwrap().prepared.key.path, PathBuf::from("/music/current.flac"));
+        assert_eq!(worker.queue.front().unwrap().key.path, missing_path);
         assert_eq!(worker.selected_output.as_deref(), Some("unchanged-output-id"));
         assert!(worker.settings.hog_mode_enabled);
         cancel_and_reap_lookahead(&mut worker);
@@ -3154,7 +3430,7 @@ mod tests {
 
         let status = retain_failed_track(&mut queue, failed.clone(), PlaybackFailure::Decoder, false);
 
-        assert_eq!(queue.front().unwrap().path, failed.path);
+        assert_eq!(queue.front().unwrap().key.path, failed.key.path);
         assert_eq!(status, Some(PlaybackFailure::Decoder.status()));
     }
 
@@ -3165,7 +3441,7 @@ mod tests {
 
         let status = retain_failed_track(&mut queue, failed.clone(), PlaybackFailure::Output, false);
 
-        assert_eq!(queue.front().unwrap().path, failed.path);
+        assert_eq!(queue.front().unwrap().key.path, failed.key.path);
         assert_eq!(status, Some(PlaybackFailure::Output.status()));
     }
 
@@ -3176,7 +3452,7 @@ mod tests {
 
         let status = retain_failed_track(&mut queue, failed, PlaybackFailure::Decoder, true);
 
-        assert_eq!(queue.front().unwrap().path, PathBuf::from("/music/next.flac"));
+        assert_eq!(queue.front().unwrap().key.path, PathBuf::from("/music/next.flac"));
         assert_eq!(status, None);
     }
 
@@ -3192,7 +3468,7 @@ mod tests {
         assert!(worker.active.is_none());
         assert!(!worker.blocked_head, "a completed skip is not a retained failure");
         assert_eq!(
-            worker.history.last().map(|t| t.path.clone()),
+            worker.history.last().map(|t| t.key.path.clone()),
             Some(PathBuf::from("/music/current.flac")),
             "an output-failed track that finished a requested skip must still join history (§3.7), \
              so Previous can return to it"
@@ -3219,9 +3495,9 @@ mod tests {
 
         let skipped = recover_blocked_head_for_enqueue(&mut queue, &mut blocked_head, false);
 
-        assert_eq!(skipped, Some(failed.path));
+        assert_eq!(skipped, Some(failed.key.clone()));
         assert!(!blocked_head);
-        assert_eq!(queue.front().unwrap().path, newly_opened.path);
+        assert_eq!(queue.front().unwrap().key.path, newly_opened.key.path);
     }
 
     #[test]
@@ -3234,7 +3510,7 @@ mod tests {
 
         assert_eq!(skipped, None);
         assert!(blocked_head);
-        assert_eq!(queue.front().unwrap().path, queued.path);
+        assert_eq!(queue.front().unwrap().key.path, queued.key.path);
     }
 
     #[test]
@@ -3245,7 +3521,7 @@ mod tests {
         assert!(restore_last_completed_track(&mut queue, Some(&completed)));
 
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.front().unwrap().path, completed.path);
+        assert_eq!(queue.front().unwrap().key.path, completed.key.path);
     }
 
     #[test]
@@ -3257,7 +3533,7 @@ mod tests {
         assert!(!restore_last_completed_track(&mut queue, Some(&completed)));
 
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.front().unwrap().path, queued.path);
+        assert_eq!(queue.front().unwrap().key.path, queued.key.path);
     }
 
     #[test]
@@ -3706,7 +3982,7 @@ mod tests {
 
         assert!(worker.active.is_none(), "a failed output must clear the active slot");
         assert_eq!(
-            worker.queue.front().map(|track| track.path.clone()),
+            worker.queue.front().map(|track| track.key.path.clone()),
             Some(PathBuf::from("/music/current.flac")),
             "a non-skip output failure keeps the track at the queue head"
         );
@@ -3746,14 +4022,71 @@ mod tests {
         assert_eq!(seek_target_frame(50_000, 44_100, 10_000), 9_500 * 44_100 / 1_000);
     }
 
+    /// The CUE sub-range seek composition (`CLAUDE.md` §4): given a `TrackKey` with a nonzero
+    /// `start_frame`, a track-relative `position_ms` and a sample rate, the absolute decode frame
+    /// `seek_to` hands to `spawn_track_preparation` is exactly `key.start_frame +
+    /// seek_target_frame(position_ms, rate, sub_range_duration_ms)` — using the *sub-range's own*
+    /// duration for the clamp, never the physical file's whole duration. This locks down the exact
+    /// composition `seek_to` performs (see its own `relative_frame`/`start_frame` computation).
+    #[test]
+    fn cue_sub_range_seek_offset_composes_key_start_frame_with_track_relative_seek_target() {
+        let key = TrackKey { path: PathBuf::from("/music/album.flac"), start_frame: 44_100 * 60, end_frame: Some(44_100 * 120) };
+        let sample_rate = 44_100;
+        // The sub-range spans 60 s (120s - 60s of the physical file), never the whole file's
+        // duration, which could be much longer.
+        let sub_range_duration_ms = 60_000;
+
+        let relative_frame = seek_target_frame(30_000, sample_rate, sub_range_duration_ms);
+        let absolute_frame = key.start_frame + relative_frame;
+        assert_eq!(relative_frame, 30_000 * sample_rate as u64 / 1_000, "30 s into a 60 s sub-range, track-relative");
+        assert_eq!(absolute_frame, key.start_frame + relative_frame);
+        assert!(absolute_frame > key.start_frame, "an absolute seek frame must land inside the sub-range, past its own start");
+        assert!(
+            absolute_frame < key.end_frame.unwrap(),
+            "an absolute seek frame must never land at or past this track's own end_frame"
+        );
+
+        // A seek near the end of the sub-range clamps against the *sub-range's* own duration
+        // (60_000 ms), not the physical file's: requesting past it still lands within 500 ms of
+        // this track's own end, never anywhere near the physical file's true end.
+        let clamped_relative = seek_target_frame(120_000, sample_rate, sub_range_duration_ms);
+        let clamped_absolute = key.start_frame + clamped_relative;
+        assert_eq!(clamped_relative, (60_000 - 500) * sample_rate as u64 / 1_000);
+        assert!(clamped_absolute < key.end_frame.unwrap(), "the clamp must stay strictly inside this track's own end_frame");
+    }
+
+    /// The Timeline track-relative subtraction (`CLAUDE.md` §4): a CUE track's `key.start_frame`
+    /// equivalent in time must be subtracted from the absolute audible position before it is
+    /// emitted, so the UI's timeline always reads 0 at this track's own start — `audible_position_for`
+    /// is the single point that performs this subtraction (via `track_relative_millis`).
+    #[test]
+    fn audible_position_is_relative_to_the_tracks_own_key_start_frame() {
+        let key = TrackKey { path: PathBuf::from("/music/album.flac"), start_frame: 44_100 * 10, end_frame: Some(44_100 * 20) };
+        let mut active = test_active_playback_with_key(key.clone());
+        // 12 s into the physical file: 2 s into this track's own 10 s sub-range.
+        active.start_frame = key.start_frame;
+        active.consumed_output_samples.store(44_100 * 12 * 2, Ordering::Release);
+
+        let position_ms = audible_position_for(&active);
+
+        assert_eq!(position_ms, 2_000, "2 s into the sub-range, not 12 s into the physical file");
+    }
+
+    /// A whole-file track's `key.start_frame` is always 0, so `track_relative_millis` must be a
+    /// pure no-op for it — the pre-existing (non-CUE) behavior must be unchanged.
+    #[test]
+    fn track_relative_millis_is_a_no_op_for_a_whole_file_key() {
+        assert_eq!(track_relative_millis(5_000, 0, 44_100), 5_000);
+    }
+
     #[test]
     fn seek_with_stale_path_is_ignored() {
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
         let queue_before: Vec<_> = worker.queue.iter().cloned().collect();
 
-        worker.seek_to(PathBuf::from("/music/other-track.flac"), 1_000);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/other-track.flac")), 1_000);
 
-        assert_eq!(worker.active.as_ref().unwrap().prepared.path, PathBuf::from("/music/current.flac"));
+        assert_eq!(worker.active.as_ref().unwrap().prepared.key.path, PathBuf::from("/music/current.flac"));
         assert_eq!(worker.queue.iter().cloned().collect::<Vec<_>>(), queue_before);
 
         let mut saw_status = false;
@@ -3774,7 +4107,7 @@ mod tests {
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
         worker.active.as_mut().unwrap().prepared.info.duration_ms = None;
 
-        worker.seek_to(PathBuf::from("/music/current.flac"), 5_000);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 5_000);
 
         assert!(worker.active.is_some(), "a duration-guard refusal must not touch the active track");
         let mut duration_guard_status = None;
@@ -3791,7 +4124,7 @@ mod tests {
         // Position 0 needs no known duration, so it proceeds past this specific guard and
         // attempts a real restart, which then fails for an unrelated reason (no real output
         // device is configured in this hardware-free unit test).
-        worker.seek_to(PathBuf::from("/music/current.flac"), 0);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
 
         assert!(worker.active.is_none(), "stop_active_now always clears the active slot before restarting");
         let mut saw_seek_failed_status = false;
@@ -3811,9 +4144,9 @@ mod tests {
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
         assert_eq!(worker.active.as_ref().unwrap().output_id, "", "test fixture: no real output device");
 
-        worker.seek_to(PathBuf::from("/music/current.flac"), 0);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
 
-        assert_eq!(worker.queue.front().map(|track| track.path.clone()), Some(PathBuf::from("/music/current.flac")));
+        assert_eq!(worker.queue.front().map(|track| track.key.path.clone()), Some(PathBuf::from("/music/current.flac")));
         assert!(worker.blocked_head);
 
         let mut saw_rejected = false;
@@ -3836,16 +4169,16 @@ mod tests {
     #[test]
     fn failed_seek_with_live_lookahead_leaves_no_uncancelled_preparation() {
         let next = fixture_track("decoder-tone.flac");
-        let next_path = next.path.clone();
+        let next_path = next.key.path.clone();
         let mut worker = worker_with_active_track(vec![next]);
         worker.reconcile_lookahead();
-        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.path, next_path);
+        assert_eq!(worker.lookahead.as_ref().unwrap().prepared.key.path, next_path);
         assert!(!worker.lookahead.as_ref().unwrap().audio.cancel.load(Ordering::Acquire));
 
-        worker.seek_to(PathBuf::from("/music/current.flac"), 0);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
 
         let lookahead = worker.lookahead.as_ref().expect("the live lookahead must survive a failed seek");
-        assert_eq!(lookahead.prepared.path, next_path);
+        assert_eq!(lookahead.prepared.key.path, next_path);
         assert!(lookahead.audio.cancel.load(Ordering::Acquire), "fail_seek must cancel the mismatched lookahead");
 
         cancel_and_reap_lookahead(&mut worker);
@@ -3879,7 +4212,7 @@ mod tests {
         assert_eq!(worker.active.as_ref().unwrap().output_id, "", "test fixture: no real output device");
         worker.handle(Command::SelectOutput(Some("unchanged-output-id".into())));
 
-        worker.seek_to(PathBuf::from("/music/current.flac"), 0);
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
 
         let mut seek_failed_status = None;
         while let Ok(event) = events.try_recv() {
@@ -3905,7 +4238,7 @@ mod tests {
     fn retire_preparation_cancels_the_decoder_before_retiring_it() {
         let mut worker = worker_with_active_track(Vec::new());
         let (events_tx, _events_rx) = unbounded();
-        let prep = spawn_track_preparation(fixture_track("decoder-tone.flac"), 0, events_tx).unwrap();
+        let prep = spawn_track_preparation(fixture_track("decoder-tone.flac"), 0, None, events_tx).unwrap();
         let cancel = prep.audio.cancel.clone();
 
         worker.retire_preparation(prep);
@@ -3918,12 +4251,12 @@ mod tests {
     #[test]
     fn queued_seeks_for_same_path_coalesce_and_other_commands_keep_order() {
         let (command_tx, command_rx) = unbounded::<Command>();
-        let path = PathBuf::from("/music/a.flac");
-        command_tx.send(Command::Seek { path: path.clone(), position_ms: 2_000 }).unwrap();
+        let key = TrackKey::whole_file(PathBuf::from("/music/a.flac"));
+        command_tx.send(Command::Seek { key: key.clone(), position_ms: 2_000 }).unwrap();
         command_tx.send(Command::TogglePlayback).unwrap();
-        command_tx.send(Command::Seek { path: path.clone(), position_ms: 3_000 }).unwrap();
+        command_tx.send(Command::Seek { key: key.clone(), position_ms: 3_000 }).unwrap();
 
-        let (target_ms, next_command) = drain_same_path_seeks(&command_rx, &path, 1_000);
+        let (target_ms, next_command) = drain_same_key_seeks(&command_rx, &key, 1_000);
 
         assert_eq!(target_ms, 2_000);
         assert!(matches!(next_command, Some(Command::TogglePlayback)));
@@ -3932,20 +4265,20 @@ mod tests {
 
     #[test]
     fn handle_seek_stashes_the_next_command_behind_the_workers_own_queued_seeks() {
-        // `drain_same_path_seeks` above only unit-tests the helper; this exercises the actual
+        // `drain_same_key_seeks` above only unit-tests the helper; this exercises the actual
         // wiring in `handle` (which stores `pending_command`) against the worker's own command
         // channel, which `run()` replays before the next `recv_timeout` (§4.2).
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
         let (command_tx, command_rx) = unbounded();
         worker.commands = command_rx;
-        // A path that never matches the active track: `seek_to` rejects it on the path guard,
+        // A key that never matches the active track: `seek_to` rejects it on the track guard,
         // so no hardware is ever reached.
-        let path = PathBuf::from("/music/a.flac");
-        command_tx.send(Command::Seek { path: path.clone(), position_ms: 2_000 }).unwrap();
+        let key = TrackKey::whole_file(PathBuf::from("/music/a.flac"));
+        command_tx.send(Command::Seek { key: key.clone(), position_ms: 2_000 }).unwrap();
         command_tx.send(Command::TogglePlayback).unwrap();
-        command_tx.send(Command::Seek { path: path.clone(), position_ms: 3_000 }).unwrap();
+        command_tx.send(Command::Seek { key: key.clone(), position_ms: 3_000 }).unwrap();
 
-        worker.handle(Command::Seek { path: path.clone(), position_ms: 1_000 });
+        worker.handle(Command::Seek { key: key.clone(), position_ms: 1_000 });
 
         assert!(
             matches!(worker.pending_command, Some(Command::TogglePlayback)),
@@ -3959,15 +4292,15 @@ mod tests {
     }
 
     #[test]
-    fn stop_active_now_without_emit_sends_no_playing_event() {
+    fn stop_active_now_sends_no_playing_event() {
         let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
 
-        let prepared = worker.stop_active_now(false);
+        let prepared = worker.stop_active_now();
 
-        assert_eq!(prepared.map(|p| p.path), Some(PathBuf::from("/music/current.flac")));
+        assert_eq!(prepared.map(|p| p.key.path), Some(PathBuf::from("/music/current.flac")));
         assert!(worker.active.is_none());
         assert!(worker.last_stop.is_some(), "stop_active_now always records the stop for the rate-change guard");
-        assert!(events.try_recv().is_err(), "no Playing event should be emitted when emit_playing is false");
+        assert!(events.try_recv().is_err(), "the start that follows an immediate stop reports the transport state, not the stop");
     }
 
     #[test]
@@ -3977,7 +4310,7 @@ mod tests {
         // just because the track is leaving `self.active` through an immediate stop.
         worker.active.as_ref().unwrap().diagnostics.underrun_samples.store(882, Ordering::Release);
 
-        worker.stop_active_now(false);
+        worker.stop_active_now();
 
         let mut saw_underrun_status = false;
         while let Ok(event) = events.try_recv() {
@@ -3986,7 +4319,7 @@ mod tests {
                     assert!(message.starts_with("Playback underrun"), "unexpected status: {message}");
                     saw_underrun_status = true;
                 }
-                PlaybackEvent::Playing(_) => panic!("no Playing event should be emitted when emit_playing is false"),
+                PlaybackEvent::Playing(_) => panic!("an immediate stop must not emit a Playing event"),
                 _ => {}
             }
         }
@@ -4036,7 +4369,7 @@ mod tests {
 
         assert!(worker.active.is_none(), "restart_current_from_queue stops the unhealthy active track");
         assert_eq!(
-            worker.queue.front().map(|t| t.path.clone()),
+            worker.queue.front().map(|t| t.key.path.clone()),
             Some(PathBuf::from("/music/current.flac")),
             "the unhealthy track is requeued at the head for the restart attempt"
         );
@@ -4050,18 +4383,18 @@ mod tests {
         let mut worker = worker_with_active_track(vec![stale_pending]);
 
         let first = fixture_track("decoder-tone.flac");
-        let first_path = first.path.clone();
+        let first_path = first.key.path.clone();
         let second = fixture_track("decoder-tone.wav");
-        let second_path = second.path.clone();
+        let second_path = second.key.path.clone();
         worker.replace_queue(vec![first, second]);
 
         assert_eq!(
-            worker.history.last().map(|t| t.path.clone()),
+            worker.history.last().map(|t| t.key.path.clone()),
             Some(PathBuf::from("/music/current.flac")),
             "the previously active track moves to history"
         );
         assert_eq!(
-            worker.queue.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
+            worker.queue.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
             vec![first_path, second_path],
             "replace_queue discards the old pending queue and takes the new list verbatim, in order"
         );
@@ -4081,8 +4414,8 @@ mod tests {
         worker.play_next(vec![first.clone(), second.clone()]);
 
         assert_eq!(
-            worker.queue.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
-            vec![first.path, second.path, existing.path],
+            worker.queue.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
+            vec![first.key.path, second.key.path, existing.key.path],
             "play_next inserts the new tracks in order ahead of the existing pending queue"
         );
     }
@@ -4098,8 +4431,8 @@ mod tests {
 
         assert!(worker.history.is_empty(), "the popped history entry is removed");
         assert_eq!(
-            worker.queue.iter().map(|t| t.path.clone()).collect::<Vec<_>>(),
-            vec![prior.path, PathBuf::from("/music/current.flac"), queued.path],
+            worker.queue.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
+            vec![prior.key.path, PathBuf::from("/music/current.flac"), queued.key.path],
             "the previous track leads, the just-stopped current track follows, then the rest of the pending queue"
         );
         drain_retiring_decoders(&mut worker);
@@ -4119,10 +4452,10 @@ mod tests {
         worker.previous_track();
 
         assert_eq!(worker.history.len(), 1, "history is untouched: the current track restarts instead of being popped");
-        assert_eq!(worker.history.last().map(|t| t.path.clone()), Some(prior.path.clone()));
+        assert_eq!(worker.history.last().map(|t| t.key.path.clone()), Some(prior.key.path.clone()));
         assert_ne!(
-            worker.queue.front().map(|t| t.path.clone()),
-            Some(prior.path),
+            worker.queue.front().map(|t| t.key.path.clone()),
+            Some(prior.key.path),
             "the queue head must not become the history track"
         );
 
@@ -4149,8 +4482,8 @@ mod tests {
         }
 
         assert_eq!(worker.history.len(), HISTORY_LIMIT);
-        assert_eq!(worker.history.first().unwrap().path, PathBuf::from("/music/track-50.flac"));
-        assert_eq!(worker.history.last().unwrap().path, PathBuf::from("/music/track-249.flac"));
+        assert_eq!(worker.history.first().unwrap().key.path, PathBuf::from("/music/track-50.flac"));
+        assert_eq!(worker.history.last().unwrap().key.path, PathBuf::from("/music/track-249.flac"));
     }
 
     #[test]
@@ -4268,6 +4601,705 @@ mod tests {
 
         release.store(true, Ordering::Release);
         drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn next_action_covers_every_playing_and_paused_case() {
+        // Nothing follows and the track is healthy: nothing to skip to, playing or paused.
+        assert_eq!(next_action(false, false, false, true), NextAction::QueueEmpty);
+        assert_eq!(next_action(false, false, false, false), NextAction::QueueEmpty);
+        // Playing: the unchanged graceful skip, and a second Next while one drains is ignored.
+        assert_eq!(next_action(true, false, false, true), NextAction::GracefulSkip);
+        assert_eq!(next_action(true, false, true, true), NextAction::SkipPending);
+        // Paused with a successor: leave now, since a graceful skip could never drain.
+        assert_eq!(next_action(true, false, false, false), NextAction::AdvancePaused);
+        assert_eq!(next_action(true, false, true, false), NextAction::AdvancePaused, "a skip requested before the pause");
+        assert_eq!(next_action(true, true, false, false), NextAction::AdvancePaused, "a failed paused track too");
+        // A failed track with nothing after it keeps the old pending-skip behavior.
+        assert_eq!(next_action(false, true, false, false), NextAction::GracefulSkip);
+        assert_eq!(next_action(false, true, true, false), NextAction::SkipPending);
+        assert_eq!(next_action(false, true, false, true), NextAction::GracefulSkip);
+    }
+
+    #[test]
+    fn new_track_start_options_carry_the_paused_flag_and_the_cue_start_frame() {
+        let mut cue = test_track("/music/album.flac");
+        cue.key = TrackKey { path: PathBuf::from("/music/album.flac"), start_frame: 441_000, end_frame: Some(882_000) };
+
+        let playing = new_track_start_options(&cue, true);
+        assert!(playing.start_playing);
+        let paused = new_track_start_options(&cue, false);
+        assert!(!paused.start_playing);
+        for options in [playing, paused] {
+            assert_eq!(options.start_frame, 441_000, "a CUE track starts at its own INDEX 01");
+            assert!(options.reason == StartReason::NewTrack);
+            assert!(options.pinned_output.is_none(), "a fresh start uses the selected output, unlike a seek");
+        }
+    }
+
+    fn drain_events(events: &Receiver<PlaybackEvent>) -> Vec<PlaybackEvent> {
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    fn statuses(events: &[PlaybackEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PlaybackEvent::Status(message) => Some(message.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn next_while_paused_leaves_the_track_now_and_starts_the_next_one_paused() {
+        let next = test_track("/music/next.flac");
+        let (mut worker, events) = worker_with_active_track_and_events(vec![next.clone()]);
+        worker.active.as_mut().unwrap().playing = false;
+
+        worker.next_track();
+
+        assert!(worker.active.is_none(), "the paused track is stopped at once instead of waiting for a drain that never comes");
+        assert_eq!(
+            worker.history.last().map(|t| t.key.path.clone()),
+            Some(PathBuf::from("/music/current.flac")),
+            "the left track joins history, as a completed graceful skip does"
+        );
+        assert!(worker.last_completed.is_none(), "a skip is not a natural completion");
+        assert_eq!(worker.new_track_start_requests, vec![false], "the queue head is started PAUSED");
+        // A unit test has no output device, so that start fails: the head stays queued (blocked) for a retry.
+        assert_eq!(worker.queue.front().map(|t| t.key.path.clone()), Some(next.key.path));
+        assert!(worker.blocked_head);
+
+        let events = drain_events(&events);
+        assert!(
+            !events.iter().any(|event| matches!(event, PlaybackEvent::Playing(_))),
+            "leaving a paused track emits no transient Playing event; only the paused start reports the state"
+        );
+        assert!(
+            !statuses(&events).iter().any(|message| message.contains("Resume playback")),
+            "the skip no longer waits for a resume: {:?}",
+            statuses(&events)
+        );
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn next_while_paused_completes_a_skip_that_was_pending_before_the_pause() {
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+        // Next while playing, then pause before the buffer drained: the skip can never finish on its own.
+        worker.next_track();
+        assert!(worker.active.as_ref().unwrap().cancel.load(Ordering::Acquire));
+        worker.active.as_mut().unwrap().playing = false;
+
+        worker.next_track();
+
+        assert!(worker.active.is_none());
+        assert_eq!(worker.history.len(), 1);
+        assert_eq!(worker.new_track_start_requests, vec![false]);
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn next_while_playing_still_waits_for_a_graceful_skip() {
+        let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+
+        worker.next_track();
+
+        let active = worker.active.as_ref().expect("a playing track is not stopped by Next");
+        assert!(active.cancel.load(Ordering::Acquire), "the decoder is cancelled so the buffered audio drains");
+        assert!(active.skip_requested);
+        assert!(worker.history.is_empty(), "history is pushed only when the skip completes");
+        assert!(worker.new_track_start_requests.is_empty(), "no start until the drain");
+        assert_eq!(statuses(&drain_events(&events)), vec!["Skipping after buffered audio drains."]);
+
+        // A second Next while that skip drains is still ignored.
+        worker.next_track();
+        assert_eq!(statuses(&drain_events(&events)), vec!["A safe skip is already pending."]);
+        assert!(worker.new_track_start_requests.is_empty());
+    }
+
+    #[test]
+    fn next_while_paused_with_nothing_queued_reports_it_and_keeps_the_track() {
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        worker.active.as_mut().unwrap().playing = false;
+
+        worker.next_track();
+
+        assert!(worker.active.is_some(), "with nothing to advance to, the paused track stays put");
+        assert!(worker.history.is_empty());
+        assert_eq!(statuses(&drain_events(&events)), vec!["The queue is empty."]);
+    }
+
+    #[test]
+    fn next_while_paused_is_refused_when_retiring_decoders_are_at_capacity() {
+        let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+        worker.active.as_mut().unwrap().playing = false;
+        let release = fill_retiring_decoders_to_capacity(&mut worker);
+
+        worker.next_track();
+
+        assert!(worker.active.is_some(), "the active track must not have been stopped");
+        assert!(worker.history.is_empty(), "history must be untouched by a refused Next");
+        assert_eq!(worker.queue.len(), 1);
+        assert!(worker.new_track_start_requests.is_empty());
+        assert!(
+            statuses(&drain_events(&events)).contains(&RETIRING_DECODERS_BUSY_MESSAGE),
+            "expected the retiring-decoders-busy refusal"
+        );
+
+        release.store(true, Ordering::Release);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn ordinary_starts_still_request_playback() {
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+        worker.active = None;
+
+        worker.start_next();
+
+        assert_eq!(worker.new_track_start_requests, vec![true]);
+        cancel_and_reap_lookahead(&mut worker);
+    }
+
+    // -- transport state across a track change ------------------------------------------------
+    //
+    // A unit test cannot complete a start (no output device), so "the next track started" is modelled
+    // by leaving an active track in place — `start_queue_head` returns at once for it, exactly what
+    // a start that took over looks like from outside — and "nothing started" by an empty active slot.
+
+    fn playing_events(events: &[PlaybackEvent]) -> Vec<usize> {
+        events.iter().enumerate().filter_map(|(index, event)| matches!(event, PlaybackEvent::Playing(_)).then_some(index)).collect()
+    }
+
+    #[test]
+    fn a_stop_is_not_announced_as_paused_when_the_next_track_takes_over() {
+        let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+
+        worker.start_next_after_stop(None, true);
+
+        let events = drain_events(&events);
+        assert!(
+            playing_events(&events).is_empty(),
+            "the successful start reports Playing itself; announcing the stop first is the flicker: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_with_nothing_to_start_is_announced_after_the_attempt() {
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        worker.active = None;
+
+        worker.start_next_after_stop(None, true);
+
+        let events = drain_events(&events);
+        let stopped = events.iter().position(|event| matches!(event, PlaybackEvent::Stopped)).expect("an empty queue reports Stopped");
+        assert_eq!(playing_events(&events), vec![events.len() - 1], "exactly one Playing, and it is the last event");
+        assert!(matches!(events.last(), Some(PlaybackEvent::Playing(false))));
+        assert!(stopped < events.len() - 1);
+    }
+
+    #[test]
+    fn a_natural_track_change_that_cannot_start_reports_paused_after_the_failed_attempt() {
+        let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+        {
+            let active = worker.active.as_mut().unwrap();
+            active.drained.store(true, Ordering::Release);
+            active.drain_started = Some(Instant::now() - OUTPUT_DRAIN_GUARD);
+        }
+
+        worker.advance_if_drained();
+
+        assert!(worker.active.is_none());
+        assert_eq!(worker.history.len(), 1, "the drained track joins history");
+        let events = drain_events(&events);
+        let inactive = events.iter().position(|event| matches!(event, PlaybackEvent::Inactive)).expect("the failed start reports Inactive");
+        let playing = playing_events(&events);
+        assert_eq!(playing.len(), 1, "one Playing for the whole change: {events:?}");
+        assert!(playing[0] > inactive, "Playing(false) must not precede the start attempt: {events:?}");
+        assert!(matches!(events[playing[0]], PlaybackEvent::Playing(false)));
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn replacing_the_queue_does_not_announce_paused_before_the_new_start() {
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+
+        worker.replace_queue(vec![fixture_track("decoder-tone.flac")]);
+
+        let events = drain_events(&events);
+        let inactive = events.iter().position(|event| matches!(event, PlaybackEvent::Inactive)).expect("the failed start reports Inactive");
+        let playing = playing_events(&events);
+        assert_eq!(playing.len(), 1, "{events:?}");
+        assert!(playing[0] > inactive, "Playing(false) must come after the start attempt, not before it: {events:?}");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn a_completed_graceful_skip_that_failed_does_not_announce_paused_before_the_next_start() {
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        {
+            let active = worker.active.as_mut().unwrap();
+            active.output_failed.store(true, Ordering::Release);
+            active.skip_requested = true;
+        }
+
+        worker.finish_active_failure(PlaybackFailure::Output, None);
+
+        let events = drain_events(&events);
+        let stopped = events.iter().position(|event| matches!(event, PlaybackEvent::Stopped)).expect("an empty queue reports Stopped");
+        let playing = playing_events(&events);
+        assert_eq!(playing.len(), 1, "{events:?}");
+        assert!(playing[0] > stopped, "{events:?}");
+    }
+
+    #[test]
+    fn a_retained_failure_still_reports_inactive_then_paused() {
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        worker.active.as_ref().unwrap().output_failed.store(true, Ordering::Release);
+
+        worker.finish_active_failure(PlaybackFailure::Output, None);
+
+        let events = drain_events(&events);
+        let inactive = events.iter().position(|event| matches!(event, PlaybackEvent::Inactive)).expect("a retained failure reports Inactive");
+        assert_eq!(playing_events(&events), vec![inactive + 1], "Playing(false) follows Inactive directly: {events:?}");
+    }
+
+    #[test]
+    fn previous_while_paused_goes_back_paused() {
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![test_track("/music/queued.flac")]);
+        worker.history.push(test_track("/music/prior.flac"));
+        worker.active.as_mut().unwrap().playing = false;
+
+        worker.previous_track();
+
+        assert!(worker.history.is_empty(), "under 3 s with history goes back");
+        assert_eq!(worker.new_track_start_requests, vec![false], "the previous track is loaded PAUSED, as Next does while paused");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn previous_while_playing_still_starts_the_previous_track_playing() {
+        let (mut worker, _events) = worker_with_active_track_and_events(Vec::new());
+        worker.history.push(test_track("/music/prior.flac"));
+
+        worker.previous_track();
+
+        assert_eq!(worker.new_track_start_requests, vec![true]);
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn previous_with_nothing_active_plays_the_previous_track() {
+        let (mut worker, _events) = worker_with_active_track_and_events(Vec::new());
+        worker.active = None;
+        worker.history.push(test_track("/music/prior.flac"));
+
+        worker.previous_track();
+
+        assert_eq!(worker.new_track_start_requests, vec![true], "with no track to keep the state of, Previous plays");
+        cancel_and_reap_lookahead(&mut worker);
+    }
+
+    // -- a start that has to wait for a lookahead decoder to stop --------------------------------
+    //
+    // `reconcile_lookahead` keeps a decoder running for the queue's next track whenever a track is
+    // active, paused or not. A Previous, Next or replacement whose new head is not that track cancels
+    // it and usually finds it still winding down (it polls its cancel flag; a NAS read may not even do
+    // that), so the start waits (`waiting_for_decoder_cancel`) and `resume_start_after_decoder_cancel`
+    // makes it on a later loop iteration. The tests below model that decoder as a thread that only
+    // exits when released.
+
+    /// Installs a lookahead for `path` whose decoder thread keeps running, whatever `cancel` says,
+    /// until the returned flag is set.
+    fn install_stuck_lookahead(worker: &mut PlaybackWorker, path: &str) -> Arc<AtomicBool> {
+        let release = Arc::new(AtomicBool::new(false));
+        let thread_release = release.clone();
+        let decoder = thread::spawn(move || {
+            while !thread_release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        worker.lookahead = Some(TrackPreparation {
+            prepared: test_track(path),
+            audio: empty_audio_preparation(Some(decoder)),
+            started_at: Instant::now(),
+            prebuffer_ready_observed_at: None,
+        });
+        release
+    }
+
+    /// Lets the stuck decoder exit and waits until it has, as the controller loop's next iteration
+    /// would find it.
+    fn release_stuck_lookahead(worker: &PlaybackWorker, release: &AtomicBool) {
+        release.store(true, Ordering::Release);
+        for _ in 0..2_000 {
+            if worker.lookahead.as_ref().is_none_or(|preparation| preparation.audio.decoder_finished()) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the stuck fixture decoder should exit once released");
+    }
+
+    #[test]
+    fn previous_while_paused_still_goes_back_paused_when_the_start_waits_for_a_lookahead_decoder() {
+        // The F9-then-F7 shape: the paused track has a lookahead for the queue's next track, and going
+        // back puts a different track at the head.
+        let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/queued.flac")]);
+        worker.history.push(test_track("/music/prior.flac"));
+        worker.active.as_mut().unwrap().playing = false;
+        let release = install_stuck_lookahead(&mut worker, "/music/queued.flac");
+
+        worker.previous_track();
+
+        assert!(worker.waiting_for_decoder_cancel, "the mismatched lookahead is still stopping, so the start waits");
+        assert!(worker.active.is_none());
+        assert!(worker.new_track_start_requests.is_empty(), "no start yet");
+        worker.resume_start_after_decoder_cancel();
+        assert!(worker.new_track_start_requests.is_empty(), "still no start while the decoder runs");
+        drain_events(&events);
+
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert_eq!(
+            worker.new_track_start_requests,
+            vec![false],
+            "the wait must not turn Previous-while-paused into a playing start"
+        );
+        assert_eq!(worker.queue.front().map(|t| t.key.path.clone()), Some(PathBuf::from("/music/prior.flac")));
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn next_while_paused_still_starts_paused_when_the_start_waits_for_a_lookahead_decoder() {
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+        worker.active.as_mut().unwrap().playing = false;
+        // A lookahead for a track that is no longer the head (the queue was edited under it).
+        let release = install_stuck_lookahead(&mut worker, "/music/stale.flac");
+
+        worker.next_track();
+
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(worker.new_track_start_requests.is_empty());
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert_eq!(worker.new_track_start_requests, vec![false], "Next while paused loads the next track paused, waiting or not");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn a_start_that_waited_is_playing_again_once_something_asks_for_playback() {
+        // The latest request wins: Play pressed while a paused Next/Previous is still waiting.
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+        worker.active.as_mut().unwrap().playing = false;
+        let release = install_stuck_lookahead(&mut worker, "/music/stale.flac");
+        worker.next_track();
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(!worker.pending_start_playing, "the paused Next is what the wait remembers");
+
+        worker.toggle_playback();
+        assert!(worker.pending_start_playing, "Play while waiting asks for a playing start");
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert_eq!(worker.new_track_start_requests, vec![true]);
+        assert!(worker.pending_start_playing, "the remembered state is consumed");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    // While a start waits for a lookahead decoder nothing is active, and `pending_start_playing` is the
+    // transport state: only Play/Pause changes it, everything else that ends in a start preserves it.
+
+    #[test]
+    fn a_second_previous_during_a_paused_previous_wait_stays_paused() {
+        // F7 then F7 on a paused player (a normal double tap to go back two tracks), the decoder of the
+        // lookahead for the queue's next track still stuck in a NAS read.
+        let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/queued.flac")]);
+        worker.history.push(test_track("/music/prior-1.flac"));
+        worker.history.push(test_track("/music/prior-2.flac"));
+        worker.active.as_mut().unwrap().playing = false;
+        let release = install_stuck_lookahead(&mut worker, "/music/queued.flac");
+
+        worker.previous_track();
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(!worker.pending_start_playing, "the first Previous, from a paused track, asked for a paused start");
+        worker.previous_track();
+
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(!worker.pending_start_playing, "the second Previous has no active track, but must not turn the wait into a playing start");
+        assert!(worker.history.is_empty(), "both tracks were taken out of history");
+        assert_eq!(
+            worker.queue.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
+            vec![
+                PathBuf::from("/music/prior-1.flac"),
+                PathBuf::from("/music/prior-2.flac"),
+                PathBuf::from("/music/current.flac"),
+                PathBuf::from("/music/queued.flac"),
+            ]
+        );
+        assert!(worker.new_track_start_requests.is_empty(), "no start yet");
+        let while_waiting = drain_events(&events);
+        assert!(playing_events(&while_waiting).is_empty(), "{while_waiting:?}");
+
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert_eq!(worker.new_track_start_requests, vec![false], "the double Previous ends in a paused start");
+        assert_eq!(worker.queue.front().map(|t| t.key.path.clone()), Some(PathBuf::from("/music/prior-1.flac")));
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn next_after_a_paused_previous_wait_keeps_the_skipped_track_in_history_and_stays_paused() {
+        // F7 then F9 on a paused player: Previous took `prior` out of history and its start is waiting,
+        // so Next skips a track that never loaded.
+        let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/queued.flac")]);
+        worker.history.push(test_track("/music/prior.flac"));
+        worker.active.as_mut().unwrap().playing = false;
+        let release = install_stuck_lookahead(&mut worker, "/music/queued.flac");
+
+        worker.previous_track();
+        assert!(worker.history.is_empty());
+        worker.next_track();
+
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(!worker.pending_start_playing, "Next during a paused wait must not start audio");
+        assert_eq!(
+            worker.history.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
+            vec![PathBuf::from("/music/prior.flac")],
+            "the track Next skipped goes back to history instead of vanishing from it and the queue"
+        );
+        assert_eq!(
+            worker.queue.iter().map(|t| t.key.path.clone()).collect::<Vec<_>>(),
+            vec![PathBuf::from("/music/current.flac"), PathBuf::from("/music/queued.flac")]
+        );
+        assert!(worker.new_track_start_requests.is_empty(), "no start yet");
+        let while_waiting = drain_events(&events);
+        assert!(playing_events(&while_waiting).is_empty(), "{while_waiting:?}");
+
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert_eq!(worker.new_track_start_requests, vec![false]);
+        assert_eq!(worker.queue.front().map(|t| t.key.path.clone()), Some(PathBuf::from("/music/current.flac")));
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn a_blocked_head_skipped_by_next_without_a_wait_still_stays_out_of_history() {
+        // The no-wait branch is unchanged: a head that never started (a setup error) is dropped, not
+        // remembered as a track that played.
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![test_track("/music/blocked.flac"), test_track("/music/after.flac")]);
+        worker.active = None;
+        worker.blocked_head = true;
+
+        worker.next_track();
+
+        assert!(worker.history.is_empty());
+        assert_eq!(worker.queue.front().map(|t| t.key.path.clone()), Some(PathBuf::from("/music/after.flac")));
+        assert_eq!(worker.new_track_start_requests, vec![true]);
+        cancel_and_reap_lookahead(&mut worker);
+    }
+
+    #[test]
+    fn queue_edits_and_settings_changes_during_a_paused_wait_do_not_turn_it_into_a_playing_start() {
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+        worker.active.as_mut().unwrap().playing = false;
+        let release = install_stuck_lookahead(&mut worker, "/music/stale.flac");
+        worker.next_track();
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(!worker.pending_start_playing);
+
+        worker.enqueue(vec![test_track("/music/added.flac")]);
+        assert!(!worker.pending_start_playing, "Enqueue");
+        worker.play_next(vec![test_track("/music/soon.flac")]);
+        assert!(!worker.pending_start_playing, "PlayNext");
+        worker.handle(Command::SetHogMode(false));
+        assert!(!worker.pending_start_playing, "SetHogMode");
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(worker.new_track_start_requests.is_empty(), "no start yet");
+
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert_eq!(worker.new_track_start_requests, vec![false]);
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn a_stale_pending_state_does_not_leak_into_a_start_that_is_not_waiting() {
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![test_track("/music/next.flac")]);
+        worker.active = None;
+        worker.pending_start_playing = false; // left over from an earlier wait; meaningless without one
+        assert!(!worker.waiting_for_decoder_cancel);
+
+        worker.start_next();
+
+        assert_eq!(worker.new_track_start_requests, vec![true]);
+        cancel_and_reap_lookahead(&mut worker);
+    }
+
+    #[test]
+    fn pause_during_a_replaced_queues_wait_loads_the_new_track_paused() {
+        // Double-clicking another row while playing: the UI keeps showing Playing through the wait (the
+        // start announces nothing), so a Pause pressed in that gap must act on it.
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        let release = install_stuck_lookahead(&mut worker, "/music/old-next.flac");
+        worker.replace_queue(vec![fixture_track("decoder-tone.flac")]);
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(worker.pending_start_playing);
+        drain_events(&events);
+
+        worker.toggle_playback();
+
+        assert!(worker.waiting_for_decoder_cancel, "Pause does not start anything itself");
+        assert!(!worker.pending_start_playing, "Pause during the wait is remembered");
+        assert!(worker.new_track_start_requests.is_empty());
+        let after_pause = drain_events(&events);
+        assert!(matches!(after_pause.as_slice(), [PlaybackEvent::Playing(false)]), "the UI is told what will happen: {after_pause:?}");
+
+        // Pressing it again (the button now offers Play) flips it back, and a third press pauses again.
+        worker.toggle_playback();
+        assert!(worker.pending_start_playing);
+        let after_play = drain_events(&events);
+        assert!(matches!(after_play.as_slice(), [PlaybackEvent::Playing(true)]), "{after_play:?}");
+        worker.toggle_playback();
+        assert!(!worker.pending_start_playing);
+        drain_events(&events);
+
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert_eq!(worker.new_track_start_requests, vec![false], "the explicit Pause survives the wait");
+        assert!(worker.pending_start_playing, "the remembered state is consumed");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn replacing_the_queue_from_a_paused_state_announces_the_playing_start_it_waits_for() {
+        // A paused track, or a paused Previous still waiting: the UI shows Paused, the replaced queue
+        // will play, so a Play pressed in the gap must not toggle that off. Announced once the start is
+        // known to be waiting; while playing (the test right below this one) nothing is sent.
+        for paused_wait in [false, true] {
+            let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/queued.flac")]);
+            worker.active.as_mut().unwrap().playing = false;
+            let release = install_stuck_lookahead(&mut worker, if paused_wait { "/music/queued.flac" } else { "/music/old-next.flac" });
+            if paused_wait {
+                worker.history.push(test_track("/music/prior.flac"));
+                worker.previous_track();
+                assert!(worker.waiting_for_decoder_cancel && !worker.pending_start_playing);
+            }
+            drain_events(&events);
+
+            worker.replace_queue(vec![fixture_track("decoder-tone.flac")]);
+
+            assert!(worker.waiting_for_decoder_cancel, "paused_wait={paused_wait}");
+            assert!(worker.pending_start_playing, "a replaced queue asks for a playing start");
+            let while_waiting = drain_events(&events);
+            assert_eq!(playing_events(&while_waiting).len(), 1, "paused_wait={paused_wait}: {while_waiting:?}");
+            assert!(while_waiting.iter().any(|event| matches!(event, PlaybackEvent::Playing(true))), "{while_waiting:?}");
+
+            // The UI now shows Playing, so a press in the gap is a Pause: it flips the state just shown.
+            worker.toggle_playback();
+            assert!(!worker.pending_start_playing);
+            release_stuck_lookahead(&worker, &release);
+            worker.resume_start_after_decoder_cancel();
+            assert_eq!(worker.new_track_start_requests, vec![false], "paused_wait={paused_wait}");
+            cancel_and_reap_lookahead(&mut worker);
+            drain_retiring_decoders(&mut worker);
+        }
+    }
+
+    #[test]
+    fn replacing_the_queue_over_a_running_lookahead_does_not_announce_paused_while_it_waits() {
+        // Double-clicking another row while playing: the old next-track lookahead almost never matches
+        // the new head, so waiting for its decoder is the normal path. The UI (and the OS Now Playing
+        // widget mirroring it) must keep showing the track that is still on screen as playing until
+        // the new start reports its own state.
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        let release = install_stuck_lookahead(&mut worker, "/music/old-next.flac");
+
+        worker.replace_queue(vec![fixture_track("decoder-tone.flac")]);
+
+        assert!(worker.waiting_for_decoder_cancel);
+        assert!(worker.active.is_none());
+        let while_waiting = drain_events(&events);
+        assert!(
+            playing_events(&while_waiting).is_empty(),
+            "no Playing(false) while a start is only waiting for a decoder: {while_waiting:?}"
+        );
+        assert!(
+            !while_waiting.iter().any(|event| matches!(event, PlaybackEvent::Inactive | PlaybackEvent::Stopped)),
+            "and nothing else that would blank the transport: {while_waiting:?}"
+        );
+
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert_eq!(worker.new_track_start_requests, vec![true], "a replaced queue plays");
+        // A unit test has no output device, so the start itself fails: that is the one place the
+        // paused state is reported, after the attempt.
+        let after = drain_events(&events);
+        let inactive = after.iter().position(|event| matches!(event, PlaybackEvent::Inactive)).expect("the failed start reports Inactive");
+        let playing = playing_events(&after);
+        assert_eq!(playing.len(), 1, "one Playing for the whole change: {after:?}");
+        assert!(playing[0] > inactive && matches!(after[playing[0]], PlaybackEvent::Playing(false)), "{after:?}");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn previous_over_a_running_lookahead_does_not_announce_paused_while_it_waits() {
+        let (mut worker, events) = worker_with_active_track_and_events(vec![test_track("/music/queued.flac")]);
+        worker.history.push(test_track("/music/prior.flac"));
+        let release = install_stuck_lookahead(&mut worker, "/music/queued.flac");
+
+        worker.previous_track();
+
+        assert!(worker.waiting_for_decoder_cancel);
+        let while_waiting = drain_events(&events);
+        assert!(playing_events(&while_waiting).is_empty(), "{while_waiting:?}");
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+        assert_eq!(worker.new_track_start_requests, vec![true], "Previous while playing goes back playing");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn a_wait_that_ends_with_nothing_to_start_still_reports_the_stop() {
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        let release = install_stuck_lookahead(&mut worker, "/music/old-next.flac");
+        worker.replace_queue(vec![fixture_track("decoder-tone.flac")]);
+        assert!(worker.waiting_for_decoder_cancel);
+        drain_events(&events);
+        // The queue is emptied while the decoder stops (another command ran in between).
+        worker.queue.clear();
+
+        release_stuck_lookahead(&worker, &release);
+        worker.resume_start_after_decoder_cancel();
+
+        assert!(worker.new_track_start_requests.is_empty(), "nothing to start");
+        let events = drain_events(&events);
+        assert_eq!(playing_events(&events).len(), 1, "the held-back stop is announced once: {events:?}");
+        assert!(matches!(events.last(), Some(PlaybackEvent::Playing(false))));
     }
 
     #[test]

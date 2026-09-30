@@ -1,6 +1,7 @@
 mod app_state;
 mod audio;
 mod library;
+mod media_controls;
 mod settings;
 mod view_model;
 #[cfg(test)]
@@ -9,7 +10,7 @@ mod ui_snapshot;
 slint::include_modules!();
 
 use std::cell::{Cell, RefCell};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,11 +20,16 @@ use app_state::{
     unavailable_label,
 };
 use audio::{AudioInfo, AudioPlayer, OutputDevice, PlaybackEvent, PlayerSettings, PreparedTrack, QueueTrackSnapshot, enumerate_outputs};
-use library::TrackRecord;
+use library::{TrackKey, TrackRecord};
 use library::format::{format_clock, format_scan_failures_summary, playback_progress};
+use library::repair::{RateRepairConfig, RepairNotes};
 use library::scanner::{LibraryEvent, LibraryScanner, ScanFailurePhase};
 use library::store::LibrarySources;
 use library::walker::AUDIO_EXTENSIONS;
+use media_controls::{
+    HoldSeek, HoldSeekInput, HoldSeekTick, MediaCommand, MediaSession, NowPlayingArtwork, NowPlayingState, PublishedTransport,
+    TransportAction, TransportSnapshot, plan_media_command, plan_transport_publish, timeline_needs_publish,
+};
 use settings::Preferences;
 use slint::{ModelRc, SharedString, Timer, TimerMode, VecModel};
 use view_model::{perform_album_action, prepared_suffix, project_library, project_queue_rows};
@@ -32,11 +38,11 @@ use view_model::{perform_album_action, prepared_suffix, project_library, project
 /// (the session library and its artwork cache), but pending-seek/volume state stays here until
 /// Stage 4/5 actually needs to share it with more than `main.rs`.
 struct PendingSeek {
-    // Not yet consulted by `accept_timeline` (`Timeline` events carry no path to compare
+    // Not yet consulted by `accept_timeline` (`Timeline` events carry no key to compare
     // against); kept because `Started`/a future per-track staleness check will need it once
     // this moves into `app_state.rs` (`§5.10`).
     #[allow(dead_code)]
-    path: PathBuf,
+    key: TrackKey,
     target_ms: u64,
     requested_at: Instant,
 }
@@ -52,6 +58,150 @@ fn accept_timeline(pending: &PendingSeek, position_ms: u64, now: Instant) -> boo
 /// `Timeline` applies normally (`§5.10`).
 fn clear_pending_seek(pending_seek: &mut Option<PendingSeek>) {
     *pending_seek = None;
+}
+
+/// What the UI shows the instant a seek to `target_ms` is requested: the target clamped to the
+/// track's length and the matching progress-bar fraction. The controller clamps the real seek the same
+/// way (`seek_target_frame`), so a target past the end can never leave the bar beyond it.
+fn seek_ui_target(target_ms: u64, duration_ms: u64) -> (u64, f32) {
+    let target_ms = target_ms.min(duration_ms);
+    (target_ms, playback_progress(target_ms, Some(duration_ms)))
+}
+
+/// The one way the UI asks for a seek (`§5.10`): the scrubber, a Control Center scrub
+/// (`MediaCommand::SetPosition`) and every hold-to-seek step all go through `request`, so they share
+/// the same guards, optimistic UI and `PendingSeek` bookkeeping. The state is `Rc`-shared with the
+/// event timer that reads it back (`accept_timeline`, `SeekRejected`).
+struct SeekRequester {
+    player: Arc<AudioPlayer>,
+    now_playing_key: Rc<RefCell<Option<TrackKey>>>,
+    now_playing_duration_ms: Rc<RefCell<Option<u64>>>,
+    pending_seek: Rc<RefCell<Option<PendingSeek>>>,
+    /// Set so the OS Now Playing widget shows the new position right away (`sync_media_session`).
+    media_dirty: Rc<Cell<bool>>,
+}
+
+impl SeekRequester {
+    /// Seeks the playing track to `target_ms` (track-relative). Returns whether a seek was actually
+    /// sent: there must be a seekable playing track with a known length.
+    fn request(&self, window: &MainWindow, target_ms: u64) -> bool {
+        if !window.get_can_seek() {
+            return false;
+        }
+        let Some(key) = self.now_playing_key.borrow().clone() else { return false; };
+        let Some(duration_ms) = *self.now_playing_duration_ms.borrow() else { return false; };
+        let (target_ms, progress) = seek_ui_target(target_ms, duration_ms);
+        // Update immediately (optimistic UI); the worker's next Timeline confirms or the
+        // pending-seek tolerance window (`accept_timeline`) holds the value until it does.
+        window.set_playback_progress(progress);
+        window.set_playback_elapsed(format_clock(target_ms).into());
+        *self.pending_seek.borrow_mut() = Some(PendingSeek { key: key.clone(), target_ms, requested_at: Instant::now() });
+        self.media_dirty.set(true);
+        self.player.seek(key, target_ms);
+        true
+    }
+
+    /// The scrubber's entry point: `fraction` of the track's length.
+    fn request_fraction(&self, window: &MainWindow, fraction: f32) -> bool {
+        let Some(duration_ms) = *self.now_playing_duration_ms.borrow() else { return false; };
+        self.request(window, (f64::from(fraction) * duration_ms as f64).round() as u64)
+    }
+}
+
+/// Which track table the user can see and click right now, from the window's own navigation state:
+/// the Search view's songs table while a search is active (it covers every other view), else the
+/// table of the current view. `None` for views with no track table (Home, Albums, Artists, ...).
+/// A selection made in a table that is not on screen resolves to nothing (`visible_selection`).
+fn visible_track_list(view: View, search_active: bool) -> Option<TrackListKind> {
+    if search_active {
+        return Some(TrackListKind::Search);
+    }
+    match view {
+        View::Songs => Some(TrackListKind::Songs),
+        View::RecentlyAdded => Some(TrackListKind::RecentlyAdded),
+        View::AlbumDetail => Some(TrackListKind::Album),
+        View::Queue => Some(TrackListKind::Queue),
+        _ => None,
+    }
+}
+
+/// The rows the window currently renders in `kind`'s table.
+fn track_table_model(window: &MainWindow, kind: TrackListKind) -> ModelRc<TrackRowData> {
+    match kind {
+        TrackListKind::Songs => window.get_songs(),
+        TrackListKind::RecentlyAdded => window.get_recent_songs(),
+        TrackListKind::Album => window.get_album_tracks(),
+        TrackListKind::Queue => window.get_queue_rows(),
+        TrackListKind::Search => window.get_search_songs(),
+    }
+}
+
+/// The position of the row showing the track `selected_key` (a `TrackRowData.key`), if there is one.
+/// The selection is a key, not a position (`MainWindow.selected-track-key`): the rows are replaced by
+/// every library re-projection, so the key is looked up again each time it is needed.
+fn row_of_key(rows: &impl slint::Model<Data = TrackRowData>, selected_key: &str) -> Option<usize> {
+    if selected_key.is_empty() {
+        return None;
+    }
+    rows.iter().position(|row| row.key == selected_key)
+}
+
+/// The selected track's row in the table the user can see right now, resolved at the moment Space is
+/// pressed: `None` when nothing is selected, when the selection was made in a table that is not on
+/// screen (`visible_track_list`), or when the selected track is no longer in the visible list (it
+/// left the library, or a search or another album no longer shows it) — the selection is dropped, not
+/// moved to whatever row now sits at its old position.
+fn visible_selection(window: &MainWindow) -> Option<(TrackListKind, i32)> {
+    let kind = visible_track_list(window.get_view(), window.get_search_active())?;
+    let row = row_of_key(&track_table_model(window, kind), window.get_selected_track_key().as_str())?;
+    Some((kind, i32::try_from(row).ok()?))
+}
+
+/// Forgets the row the user last clicked. Called on every navigation (`sync_navigation`) and on every
+/// search edit that changes the list on screen (`apply_search_edit`): a selection belongs to the page
+/// it was made on.
+fn clear_track_selection(window: &MainWindow) {
+    window.set_selected_track_key(SharedString::default());
+}
+
+/// What Space does (`CLAUDE.md` "Media controls" -> "Spacebar").
+// No `Eq`: Slint's generated `TrackListKind` derives `PartialEq` only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SpaceAction {
+    /// The on-screen play button's own action (`AudioPlayer::toggle_playback`): pause or resume the
+    /// playing track, start the queue head, or restore the last finished track — and, with none of
+    /// those, its "Open an audio file" status.
+    TogglePlayback,
+    /// Play the selected row exactly like a double click on it (`track-activated`).
+    ActivateSelection { kind: TrackListKind, index: i32 },
+}
+
+/// Whether the player bar's play button does anything: the enabling expression of `PlayerBar`'s
+/// button in `ui/app.slint` (a title is shown, or the queue is not empty), which a contract test pins
+/// next to this helper's truth table. Space (`plan_space_action`) and the OS media session's decision
+/// to keep the media keys (`TransportSnapshot::can_resume`) both ask it, so the keyboard, the media
+/// keys and the button can never disagree about whether there is something to play or retry. The
+/// title is never cleared once a track has played, so this is false only before anything has played
+/// this session and while the queue is empty.
+fn play_button_enabled(now_playing_title: &str, queue_count: i32) -> bool {
+    !now_playing_title.is_empty() || queue_count > 0
+}
+
+/// `play_button_enabled` for what `window` shows right now.
+fn window_play_button_enabled(window: &MainWindow) -> bool {
+    play_button_enabled(window.get_now_playing_title().as_str(), window.get_queue_count())
+}
+
+/// Decides what Space does. `play_button_enabled` is whether the player bar's play button would do
+/// something (the helper of the same name). While it is true, Space is that button — including with a
+/// row selected, since a track that is playing, waiting or restorable wins over a row that merely has
+/// the highlight. Only in the library-only state does a selected row get played; with no selection
+/// either, Space falls back to the button so the user still gets its status message.
+fn plan_space_action(play_button_enabled: bool, selection: Option<(TrackListKind, i32)>) -> SpaceAction {
+    match selection {
+        Some((kind, index)) if !play_button_enabled => SpaceAction::ActivateSelection { kind, index },
+        _ => SpaceAction::TogglePlayback,
+    }
 }
 
 /// Status shown once a real output device is selected, whether that happens at startup (a saved
@@ -125,7 +275,46 @@ fn batch_reports_failures_inline(kind: BatchKind) -> bool {
     kind != BatchKind::StartupRestore
 }
 
+/// Drops every `track` whose `TrackKey` is in `sources.excluded_tracks` (`CLAUDE.md` "Library
+/// exclusions") — applied to a `LibraryEvent::Probed` batch before it can be enqueued or added to
+/// the library, so a rescan of an already-persisted folder/file (chiefly the startup restore) never
+/// silently brings back a track the user explicitly removed. A pure, directly testable filter, kept
+/// separate from `LibrarySources::is_excluded` itself so a test can assert on the whole-batch
+/// behavior (order preserved, non-excluded tracks untouched) in one call.
+fn exclude_removed_tracks(tracks: Vec<PreparedTrack>, sources: &LibrarySources) -> Vec<PreparedTrack> {
+    tracks.into_iter().filter(|track| !sources.is_excluded(&track.key)).collect()
+}
+
+/// A file's display name for a status line: its last path component, or the whole path when it has none.
+fn file_name_of(path: &std::path::Path) -> String {
+    path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// Prints a developer-only `DIAG` line to stderr, never surfaced in the UI — the same convention as
+/// `PlaybackEvent::Diagnostic`, and just as unable to panic on a closed stderr pipe.
+fn write_diagnostic(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "DIAG {line}");
+}
+
 fn main() -> Result<(), slint::PlatformError> {
+    // Unified title bar (`§6` Stage 5b): must run before any window is created (`MainWindow::new()`
+    // below), on macOS only. `with_titlebar_transparent`/`with_title_hidden` hide the native
+    // "Lime Player" title bar strip; `with_fullsize_content_view` lets the content view (and so
+    // `Sidebar`/`TopBar`) extend under where the title bar used to be, so only the traffic lights
+    // float over it. `MainWindow.title` stays "Lime Player" (still used for Mission Control/the
+    // Window menu); it is only hidden in the titlebar itself. Every other platform keeps Slint's
+    // normal decorated window untouched.
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::winit::platform::macos::WindowAttributesExtMacOS;
+        slint::BackendSelector::new()
+            .with_winit_window_attributes_hook(|attributes| {
+                attributes.with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true)
+            })
+            .select()?;
+    }
+
     let preferences = Rc::new(RefCell::new(Preferences::load()));
     let settings_save_error = Rc::new(RefCell::new(None::<String>));
     // Persisted library sources (`library.json`, next to `settings.json`): loaded here, restored
@@ -151,13 +340,19 @@ fn main() -> Result<(), slint::PlatformError> {
     // The scanner probes opened files and reads their tags/artwork on its own thread, keeping that
     // work off both the UI thread and the audio controller thread (`§6` Stage 3); `app_state`
     // holds the session library it fills and the decoded-artwork cache built from it.
-    let library_scanner = Arc::new(LibraryScanner::new());
+    // With the sample-rate repair on (`Preferences::repair_nonstandard_sample_rates`, default), the
+    // scanner also converts FLAC files no output device can play (`CLAUDE.md` "Sample-rate repair").
+    let rate_repair_backup_dir = settings::rate_repair_backup_dir().filter(|_| preferences.borrow().repair_nonstandard_sample_rates);
+    let library_scanner = Arc::new(match rate_repair_backup_dir {
+        Some(backup_dir) => LibraryScanner::with_rate_repair(RateRepairConfig { backup_dir }),
+        None => LibraryScanner::new(),
+    });
     let app_state = Rc::new(RefCell::new(AppState::new()));
     // Rust-owned navigation (`§3.6`, Stage 5): current view, sidebar highlight and back stack.
     let navigation = Rc::new(RefCell::new(Navigation::new()));
     // The now-playing path/duration come from the last `Started`/`Timeline` events (`§6` Stage 2);
     // `on_seek_requested` needs both to turn a fraction into a `player.seek(path, ms)` call.
-    let now_playing_path = Rc::new(RefCell::new(None::<PathBuf>));
+    let now_playing_key = Rc::new(RefCell::new(None::<TrackKey>));
     let now_playing_duration_ms = Rc::new(RefCell::new(None::<u64>));
     // The last `Started` event's own fallback title/album and the `AudioInfo` of what is actually
     // playing, kept so a later `Scanned` record for the same path can re-project the now-playing
@@ -193,6 +388,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // failures too, still never counting them as "not added" (`§1.4`, "refuse rather than silently
     // degrade").
     let batch_failures = Rc::new(RefCell::new(std::collections::HashMap::<u64, BatchFailures>::new()));
+    // What the sample-rate repair did per batch, reported once when the batch finishes.
+    let batch_repairs = Rc::new(RefCell::new(std::collections::HashMap::<u64, RepairNotes>::new()));
     // What every in-flight (or not-yet-reported) scan batch is for, keyed by the id `scan`/
     // `scan_folder` returned synchronously at call time (`BatchKind`). Never guessed from an
     // event: `Probed`/`Failed`/`BatchDone` only carry the batch id, not why it was requested.
@@ -201,10 +398,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // rows, in the same order (`§3.4`, `§3.7`). `on_track_activated` maps a clicked row back to a
     // path through the latter; both are recomputed together by `project_and_set_queue`.
     let queue_pending = Rc::new(RefCell::new(Vec::<QueueTrackSnapshot>::new()));
-    let queue_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
-    // The current search box text (`§3.4` "search-edited... stores the query and marks the library
-    // dirty"). Read by every library projection alongside `Navigation`'s artist filter/album key.
-    let search_query = Rc::new(RefCell::new(String::new()));
+    let queue_paths = Rc::new(RefCell::new(Vec::<TrackKey>::new()));
     // Set by anything that can change a library projection's *inputs* in a way too frequent to
     // reproject inline (typing in the search box, a batch of scanner events): the 40 ms timer
     // reprojects once per tick while this is set, then clears it (`§3.4`). Navigation events
@@ -229,15 +423,54 @@ fn main() -> Result<(), slint::PlatformError> {
     // The paths behind the Songs/Recently Added/album-detail tables' currently rendered rows, in
     // the same order as those rows, so `on_track_activated` can map a clicked row back to
     // `library.prepared(path)` (`§3.4`, mirrors `queue_paths` above).
-    let songs_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
-    let recent_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
-    let album_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+    let songs_paths = Rc::new(RefCell::new(Vec::<TrackKey>::new()));
+    let recent_paths = Rc::new(RefCell::new(Vec::<TrackKey>::new()));
+    let album_paths = Rc::new(RefCell::new(Vec::<TrackKey>::new()));
+    // The paths behind the dedicated Search view's (capped) Songs section rows, same idea as
+    // `songs_paths` above (`§3.4` "Search").
+    let search_paths = Rc::new(RefCell::new(Vec::<TrackKey>::new()));
 
     let window = MainWindow::new()?;
+    // Drives `Sidebar`'s reserved 52 px traffic-light strip and `TopBar`'s title text (`ui/app.slint`
+    // `MainWindow.unified-title-bar`); matches the `BackendSelector` hook installed above.
+    #[cfg(target_os = "macos")]
+    window.set_unified_title_bar(true);
+    // `window-drag-requested`/`window-zoom-requested` only fire from the `TouchArea`s `ui/app.slint`
+    // shows when `unified-title-bar` is true, i.e. only on macOS, so the handlers are macOS-only
+    // too. `drag_window()`/`set_maximized()` are winit 0.30 APIs reached through
+    // `slint::winit_030::WinitWindowAccessor` (`§6` Stage 5b).
+    #[cfg(target_os = "macos")]
+    {
+        use slint::winit_030::WinitWindowAccessor;
+
+        let drag_window = window.as_weak();
+        window.on_window_drag_requested(move || {
+            if let Some(window) = drag_window.upgrade() {
+                window.window().with_winit_window(|winit_window| {
+                    let _ = winit_window.drag_window();
+                });
+            }
+        });
+
+        let zoom_window = window.as_weak();
+        window.on_window_zoom_requested(move || {
+            if let Some(window) = zoom_window.upgrade() {
+                window.window().with_winit_window(|winit_window| {
+                    winit_window.set_maximized(!winit_window.is_maximized());
+                });
+            }
+        });
+    }
     window.set_hog_mode_enabled(preferences.borrow().hog_mode_enabled);
     set_device_model(&window, &output_devices.borrow());
     sync_navigation(&window, &navigation.borrow());
-    project_and_set_library(&window, &app_state.borrow(), &navigation.borrow(), &search_query.borrow(), &songs_paths, &recent_paths, &album_paths);
+    project_and_set_library(
+        &window,
+        &app_state.borrow(),
+        &navigation.borrow(),
+        navigation.borrow().search_query(),
+        LibraryViewPaths { songs: &songs_paths, recent: &recent_paths, album: &album_paths, search: &search_paths },
+    );
     let initial_index = preferences
         .borrow()
         .output_device_id
@@ -294,14 +527,42 @@ fn main() -> Result<(), slint::PlatformError> {
                     set_playback_status(&window, format!("Reading {} files…", paths.len()), &status_save_error);
                 }
                 scanning_batches.set(scanning_batches.get() + 1);
-                let batch = scanner.scan(paths.clone());
+                // Explicitly re-opening a file overrides any earlier "Remove from Library" on it
+                // (`CLAUDE.md` "Library exclusions"): lifted before `scan()` is even dispatched, so
+                // the `Probed`/`Scanned` events this batch produces are never filtered back out. A
+                // re-opened `.cue` sheet needs its own path, since a CUE-derived `TrackKey.path` is
+                // the underlying audio file the sheet resolves to, never the `.cue` path itself
+                // (`LibrarySources::include_cue_sheet`'s doc comment).
+                {
+                    let mut sources = sources.borrow_mut();
+                    for path in &paths {
+                        if library::walker::has_cue_extension(path) {
+                            sources.include_cue_sheet(path);
+                        } else {
+                            sources.include_path(path);
+                        }
+                    }
+                }
+                // `explicit_selection: true` — this is the user's own complete "Open Files…" pick,
+                // so cue expansion must not silently claim sibling files they never selected
+                // (`CLAUDE.md` "Over-broad CUE claim on Open Files"). The exclusions are snapshotted
+                // here, after the lift above, so the scanner never counts a track the user just
+                // re-opened as one whose record gets dropped (`ScanRequest::excluded`).
+                let excluded = sources.borrow().excluded_tracks.clone();
+                let batch = scanner.scan(paths.clone(), true, excluded);
                 batch_kinds.borrow_mut().insert(batch, BatchKind::OpenFiles);
                 // Persisted so these files are re-scanned (never re-enqueued) at the next startup
                 // (`CLAUDE.md` "Persistent library"). A save failure is reported but never blocks
-                // opening/playing the files that were just selected.
+                // opening/playing the files that were just selected. A directly-opened `.cue` sheet
+                // is tracked separately (`cue_files`) so its own folder's cue expansion runs again
+                // on restore, the same way a saved `files`/`folders` entry does.
                 let mut sources = sources.borrow_mut();
                 for path in &paths {
-                    sources.add_file(path.clone());
+                    if library::walker::has_cue_extension(path) {
+                        sources.add_cue_file(path.clone());
+                    } else {
+                        sources.add_file(path.clone());
+                    }
                 }
                 if let Err(error) = sources.save() {
                     *status_save_error.borrow_mut() = Some(format!("Could not save library.json: {error}"));
@@ -340,7 +601,11 @@ fn main() -> Result<(), slint::PlatformError> {
                     set_playback_status(&window, format!("Scanning {}…", folder.display()), &status_save_error);
                 }
                 scanning_batches.set(scanning_batches.get() + 1);
-                let batch = scanner.scan_folder(folder.clone());
+                // Same override rule as "Open Files…" above, for every track under the re-added
+                // folder (`CLAUDE.md` "Library exclusions").
+                sources.borrow_mut().include_folder(&folder);
+                let excluded = sources.borrow().excluded_tracks.clone();
+                let batch = scanner.scan_folder(folder.clone(), excluded);
                 batch_kinds.borrow_mut().insert(batch, BatchKind::OpenFolder);
                 // Added to the library only (`batch_should_enqueue(BatchKind::OpenFolder)` is
                 // false) and persisted so it is re-walked at every startup, picking up files added
@@ -369,12 +634,23 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let sources = library_sources.borrow();
         if !sources.files.is_empty() {
-            let batch = library_scanner.scan(sources.files.clone());
+            // `explicit_selection: false` — a restore behaves like the whole directory was already
+            // requested, keeping full cue expansion exactly like `OpenFolder` (`CLAUDE.md` "Over-
+            // broad CUE claim on Open Files"); nothing here is enqueued or played regardless.
+            let batch = library_scanner.scan(sources.files.clone(), false, sources.excluded_tracks.clone());
+            batch_kinds.borrow_mut().insert(batch, BatchKind::StartupRestore);
+            scanning_batches.set(scanning_batches.get() + 1);
+        }
+        // A directly-opened `.cue` sheet re-scans through the same `scan()` request as ordinary
+        // files: the scanner's per-directory cue expansion (`library::scanner`) detects it from its
+        // own path exactly like a freshly opened one.
+        if !sources.cue_files.is_empty() {
+            let batch = library_scanner.scan(sources.cue_files.clone(), false, sources.excluded_tracks.clone());
             batch_kinds.borrow_mut().insert(batch, BatchKind::StartupRestore);
             scanning_batches.set(scanning_batches.get() + 1);
         }
         for folder in &sources.folders {
-            let batch = library_scanner.scan_folder(folder.clone());
+            let batch = library_scanner.scan_folder(folder.clone(), sources.excluded_tracks.clone());
             batch_kinds.borrow_mut().insert(batch, BatchKind::StartupRestore);
             scanning_batches.set(scanning_batches.get() + 1);
         }
@@ -453,25 +729,21 @@ fn main() -> Result<(), slint::PlatformError> {
     let player_for_previous = Arc::clone(&audio_player);
     window.on_previous_track_requested(move || player_for_previous.previous());
 
-    let player_for_seek = Arc::clone(&audio_player);
+    // Marked by everything that changes what the OS Now Playing widget should show; the event timer
+    // publishes at most once per tick from the final UI state (`sync_media_session`).
+    let media_dirty = Rc::new(Cell::new(false));
+    let seek_requester = Rc::new(SeekRequester {
+        player: Arc::clone(&audio_player),
+        now_playing_key: Rc::clone(&now_playing_key),
+        now_playing_duration_ms: Rc::clone(&now_playing_duration_ms),
+        pending_seek: Rc::clone(&pending_seek),
+        media_dirty: Rc::clone(&media_dirty),
+    });
     let seek_window = window.as_weak();
-    let seek_now_playing_path = Rc::clone(&now_playing_path);
-    let seek_duration = Rc::clone(&now_playing_duration_ms);
-    let seek_pending = Rc::clone(&pending_seek);
+    let scrubber_seek = Rc::clone(&seek_requester);
     window.on_seek_requested(move |fraction| {
         let Some(window) = seek_window.upgrade() else { return; };
-        if !window.get_can_seek() {
-            return;
-        }
-        let Some(path) = seek_now_playing_path.borrow().clone() else { return; };
-        let Some(duration_ms) = *seek_duration.borrow() else { return; };
-        let target_ms = (f64::from(fraction) * duration_ms as f64).round() as u64;
-        // Update immediately (optimistic UI); the worker's next Timeline confirms or the
-        // pending-seek tolerance window (`accept_timeline`) holds the value until it does.
-        window.set_playback_progress(fraction);
-        window.set_playback_elapsed(format_clock(target_ms).into());
-        *seek_pending.borrow_mut() = Some(PendingSeek { path: path.clone(), target_ms, requested_at: Instant::now() });
-        player_for_seek.seek(path, target_ms);
+        scrubber_seek.request_fraction(&window, fraction);
     });
 
     // The Slint handler already set `volume-level` optimistically (`§5.10` "Pending volume")
@@ -497,10 +769,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_nav_selected = Rc::clone(&navigation);
     let nav_selected_window = window.as_weak();
     let nav_selected_app_state = Rc::clone(&app_state);
-    let nav_selected_search_query = Rc::clone(&search_query);
     let nav_selected_songs_paths = Rc::clone(&songs_paths);
     let nav_selected_recent_paths = Rc::clone(&recent_paths);
     let nav_selected_album_paths = Rc::clone(&album_paths);
+    let nav_selected_search_paths = Rc::clone(&search_paths);
     window.on_nav_selected(move |view| {
         navigation_for_nav_selected.borrow_mut().nav_selected(view);
         if let Some(window) = nav_selected_window.upgrade() {
@@ -509,10 +781,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &nav_selected_app_state.borrow(),
                 &navigation_for_nav_selected.borrow(),
-                &nav_selected_search_query.borrow(),
-                &nav_selected_songs_paths,
-                &nav_selected_recent_paths,
-                &nav_selected_album_paths,
+                navigation_for_nav_selected.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &nav_selected_songs_paths,
+                    recent: &nav_selected_recent_paths,
+                    album: &nav_selected_album_paths,
+                    search: &nav_selected_search_paths,
+                },
             );
         }
     });
@@ -520,10 +795,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_back = Rc::clone(&navigation);
     let back_window = window.as_weak();
     let back_app_state = Rc::clone(&app_state);
-    let back_search_query = Rc::clone(&search_query);
     let back_songs_paths = Rc::clone(&songs_paths);
     let back_recent_paths = Rc::clone(&recent_paths);
     let back_album_paths = Rc::clone(&album_paths);
+    let back_search_paths = Rc::clone(&search_paths);
     window.on_back_requested(move || {
         navigation_for_back.borrow_mut().back_requested();
         if let Some(window) = back_window.upgrade() {
@@ -532,10 +807,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &back_app_state.borrow(),
                 &navigation_for_back.borrow(),
-                &back_search_query.borrow(),
-                &back_songs_paths,
-                &back_recent_paths,
-                &back_album_paths,
+                navigation_for_back.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &back_songs_paths,
+                    recent: &back_recent_paths,
+                    album: &back_album_paths,
+                    search: &back_search_paths,
+                },
             );
         }
     });
@@ -543,10 +821,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_album_opened = Rc::clone(&navigation);
     let album_opened_window = window.as_weak();
     let album_opened_app_state = Rc::clone(&app_state);
-    let album_opened_search_query = Rc::clone(&search_query);
     let album_opened_songs_paths = Rc::clone(&songs_paths);
     let album_opened_recent_paths = Rc::clone(&recent_paths);
     let album_opened_album_paths = Rc::clone(&album_paths);
+    let album_opened_search_paths = Rc::clone(&search_paths);
     window.on_album_opened(move |key| {
         navigation_for_album_opened.borrow_mut().album_opened(&key);
         if let Some(window) = album_opened_window.upgrade() {
@@ -555,10 +833,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &album_opened_app_state.borrow(),
                 &navigation_for_album_opened.borrow(),
-                &album_opened_search_query.borrow(),
-                &album_opened_songs_paths,
-                &album_opened_recent_paths,
-                &album_opened_album_paths,
+                navigation_for_album_opened.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &album_opened_songs_paths,
+                    recent: &album_opened_recent_paths,
+                    album: &album_opened_album_paths,
+                    search: &album_opened_search_paths,
+                },
             );
         }
     });
@@ -566,10 +847,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_artist_opened = Rc::clone(&navigation);
     let artist_opened_window = window.as_weak();
     let artist_opened_app_state = Rc::clone(&app_state);
-    let artist_opened_search_query = Rc::clone(&search_query);
     let artist_opened_songs_paths = Rc::clone(&songs_paths);
     let artist_opened_recent_paths = Rc::clone(&recent_paths);
     let artist_opened_album_paths = Rc::clone(&album_paths);
+    let artist_opened_search_paths = Rc::clone(&search_paths);
     window.on_artist_opened(move |name| {
         navigation_for_artist_opened.borrow_mut().artist_opened(&name);
         if let Some(window) = artist_opened_window.upgrade() {
@@ -578,10 +859,13 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &artist_opened_app_state.borrow(),
                 &navigation_for_artist_opened.borrow(),
-                &artist_opened_search_query.borrow(),
-                &artist_opened_songs_paths,
-                &artist_opened_recent_paths,
-                &artist_opened_album_paths,
+                navigation_for_artist_opened.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &artist_opened_songs_paths,
+                    recent: &artist_opened_recent_paths,
+                    album: &artist_opened_album_paths,
+                    search: &artist_opened_search_paths,
+                },
             );
         }
     });
@@ -591,13 +875,13 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_now_playing_album = Rc::clone(&navigation);
     let now_playing_album_window = window.as_weak();
     let now_playing_album_app_state = Rc::clone(&app_state);
-    let now_playing_album_path = Rc::clone(&now_playing_path);
-    let now_playing_album_search_query = Rc::clone(&search_query);
+    let now_playing_album_key = Rc::clone(&now_playing_key);
     let now_playing_album_songs_paths = Rc::clone(&songs_paths);
     let now_playing_album_recent_paths = Rc::clone(&recent_paths);
     let now_playing_album_album_paths = Rc::clone(&album_paths);
+    let now_playing_album_search_paths = Rc::clone(&search_paths);
     window.on_now_playing_album_requested(move || {
-        let key = now_playing_album_path
+        let key = now_playing_album_key
             .borrow()
             .as_ref()
             .and_then(|path| now_playing_album_app_state.borrow().library.get(path).map(library::album_key));
@@ -609,21 +893,30 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &now_playing_album_app_state.borrow(),
                 &navigation_for_now_playing_album.borrow(),
-                &now_playing_album_search_query.borrow(),
-                &now_playing_album_songs_paths,
-                &now_playing_album_recent_paths,
-                &now_playing_album_album_paths,
+                navigation_for_now_playing_album.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &now_playing_album_songs_paths,
+                    recent: &now_playing_album_recent_paths,
+                    album: &now_playing_album_album_paths,
+                    search: &now_playing_album_search_paths,
+                },
             );
         }
     });
 
-    // `search-edited` (`§3.4`): stores the query and marks the library dirty; the 40 ms timer
-    // reprojects at most once per tick, batching fast typing the same way a scan batch is batched.
-    let search_query_for_edit = Rc::clone(&search_query);
+    // `search-edited` (`§3.4`): stores the query in `Navigation` and marks the library dirty; the
+    // 40 ms timer reprojects at most once per tick, batching fast typing the same way a scan batch
+    // is batched. `search-active` is pushed to the window immediately, not left for that tick,
+    // so the Search view swaps in/out on every keystroke instead of trailing it by up to 40 ms
+    // (`apply_search_edit`, which also forgets the row selection when the list on screen changes).
+    let navigation_for_search_edited = Rc::clone(&navigation);
+    let search_edited_window = window.as_weak();
     let library_dirty_for_search = Rc::clone(&library_dirty);
     window.on_search_edited(move |query| {
-        *search_query_for_edit.borrow_mut() = query.to_string();
         library_dirty_for_search.set(true);
+        if let Some(window) = search_edited_window.upgrade() {
+            apply_search_edit(&window, &mut navigation_for_search_edited.borrow_mut(), query.to_string());
+        }
     });
 
     // `shuffle-all` (Home, `§3.7`): shuffles the whole library, not just one album.
@@ -643,15 +936,69 @@ fn main() -> Result<(), slint::PlatformError> {
         perform_album_action(action, tracks, shuffle_seed(), player_for_album_action.as_ref());
     });
 
+    // "Remove from Library" (album card's three-dot menu, every grid — Home, Albums, Search,
+    // artist albums, `CLAUDE.md` "Library exclusions"). Non-destructive and library-only: this
+    // drops the album's tracks from the *session library* (`Library::remove_album`) and persists an
+    // exclusion so the startup restore does not bring them back, but it deliberately never touches
+    // `AudioPlayer` — the queue and the active stream are separate, session-only state from the
+    // library (`CLAUDE.md` "Session library and view layer"), so a track from the removed album
+    // that is currently playing or queued keeps playing/queued untouched; only the browsable
+    // catalog loses it.
+    let navigation_for_remove_album = Rc::clone(&navigation);
+    let remove_album_window = window.as_weak();
+    let app_state_for_remove_album = Rc::clone(&app_state);
+    let library_sources_for_remove_album = Rc::clone(&library_sources);
+    let save_error_for_remove_album = Rc::clone(&settings_save_error);
+    let remove_album_songs_paths = Rc::clone(&songs_paths);
+    let remove_album_recent_paths = Rc::clone(&recent_paths);
+    let remove_album_album_paths = Rc::clone(&album_paths);
+    let remove_album_search_paths = Rc::clone(&search_paths);
+    window.on_remove_album_requested(move |key| {
+        let Some(album) = app_state_for_remove_album.borrow().library.album(&key) else { return; };
+        let title = album.title.clone();
+        let removed_keys = app_state_for_remove_album.borrow_mut().remove_album(&key);
+        if removed_keys.is_empty() {
+            return;
+        }
+        {
+            let mut sources = library_sources_for_remove_album.borrow_mut();
+            sources.exclude_tracks(removed_keys);
+            if let Err(error) = sources.save() {
+                *save_error_for_remove_album.borrow_mut() = Some(format!("Could not save library.json: {error}"));
+            }
+        }
+        // If the album-detail page for the just-removed album is currently open, it has nothing
+        // left to show — navigate back automatically instead of leaving it stranded on an empty
+        // header.
+        navigation_for_remove_album.borrow_mut().remove_album(&key);
+        if let Some(window) = remove_album_window.upgrade() {
+            sync_navigation(&window, &navigation_for_remove_album.borrow());
+            project_and_set_library(
+                &window,
+                &app_state_for_remove_album.borrow(),
+                &navigation_for_remove_album.borrow(),
+                navigation_for_remove_album.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &remove_album_songs_paths,
+                    recent: &remove_album_recent_paths,
+                    album: &remove_album_album_paths,
+                    search: &remove_album_search_paths,
+                },
+            );
+            set_playback_status(&window, format!("Removed \u{201c}{title}\u{201d} from the library."), &save_error_for_remove_album);
+        }
+    });
+
     // `track-activated` (`§3.7`): every kind maps a clicked row to the suffix of prepared tracks
     // starting there, through whichever path list backs that table (`songs_paths`/`recent_paths`/
-    // `album_paths`/`queue_paths`), then replaces the queue with it.
+    // `album_paths`/`queue_paths`/`search_paths`), then replaces the queue with it.
     let player_for_track_activated = Arc::clone(&audio_player);
     let app_state_for_track_activated = Rc::clone(&app_state);
     let queue_paths_for_activated = Rc::clone(&queue_paths);
     let songs_paths_for_activated = Rc::clone(&songs_paths);
     let recent_paths_for_activated = Rc::clone(&recent_paths);
     let album_paths_for_activated = Rc::clone(&album_paths);
+    let search_paths_for_activated = Rc::clone(&search_paths);
     window.on_track_activated(move |kind, index| {
         let Ok(index) = usize::try_from(index) else { return; };
         let paths = match kind {
@@ -659,6 +1006,7 @@ fn main() -> Result<(), slint::PlatformError> {
             TrackListKind::Songs => &songs_paths_for_activated,
             TrackListKind::RecentlyAdded => &recent_paths_for_activated,
             TrackListKind::Album => &album_paths_for_activated,
+            TrackListKind::Search => &search_paths_for_activated,
         };
         let tracks = prepared_suffix(&app_state_for_track_activated.borrow().library, &paths.borrow(), index);
         // The UI never sends an empty `ReplaceQueue`: the worker would just ignore it, but a path
@@ -668,13 +1016,29 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Space, from `MainWindow`'s window-wide `key-root` (plain Space only: never a key repeat, never
+    // typed into the search field). The row last clicked is `MainWindow.selected-track-key`, a track
+    // key that `visible_selection` resolves to a row of the visible table only now, so a re-projection
+    // that moved or removed the track in between cannot make Space play another one. A selected row
+    // plays through `track-activated`, the same handler a double click reaches, so the two can never
+    // disagree about which rows a click queues.
+    let player_for_space = Arc::clone(&audio_player);
+    let space_window = window.as_weak();
+    window.on_space_pressed(move || {
+        let Some(window) = space_window.upgrade() else { return; };
+        match plan_space_action(window_play_button_enabled(&window), visible_selection(&window)) {
+            SpaceAction::TogglePlayback => player_for_space.toggle_playback(),
+            SpaceAction::ActivateSelection { kind, index } => window.invoke_track_activated(kind, index),
+        }
+    });
+
     let events = audio_player.events();
     let library_events = library_scanner.events();
     let event_window = window.as_weak();
     let event_devices = Rc::clone(&output_devices);
     let event_preferences = Rc::clone(&preferences);
     let event_save_error = Rc::clone(&settings_save_error);
-    let event_now_playing_path = Rc::clone(&now_playing_path);
+    let event_now_playing_key = Rc::clone(&now_playing_key);
     let event_duration = Rc::clone(&now_playing_duration_ms);
     let event_fallback = Rc::clone(&now_playing_fallback);
     let event_info = Rc::clone(&now_playing_info);
@@ -684,7 +1048,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let event_last_worker_volume = Rc::clone(&last_worker_volume);
     let event_active_route_status = Rc::clone(&active_route_status);
     let event_batch_failures = Rc::clone(&batch_failures);
+    let event_batch_repairs = Rc::clone(&batch_repairs);
     let event_batch_kinds = Rc::clone(&batch_kinds);
+    let event_library_sources = Rc::clone(&library_sources);
     let event_scanning_batches = Rc::clone(&scanning_batches);
     let event_library_last_projected = Rc::clone(&library_last_projected_at);
     let event_app_state = Rc::clone(&app_state);
@@ -692,11 +1058,26 @@ fn main() -> Result<(), slint::PlatformError> {
     let event_queue_pending = Rc::clone(&queue_pending);
     let event_queue_paths = Rc::clone(&queue_paths);
     let event_navigation = Rc::clone(&navigation);
-    let event_search_query = Rc::clone(&search_query);
     let event_library_dirty = Rc::clone(&library_dirty);
     let event_songs_paths = Rc::clone(&songs_paths);
     let event_recent_paths = Rc::clone(&recent_paths);
     let event_album_paths = Rc::clone(&album_paths);
+    let event_search_paths = Rc::clone(&search_paths);
+    // The OS media session (macOS media keys, Control Center; inert elsewhere). Registered once, here
+    // in `main()` and never from anything `MainWindow::new()` reaches. Its handlers only push into
+    // this channel, which the event timer drains on the UI thread; the session and the hold-to-seek
+    // state below live inside that timer closure, the only thing that uses them.
+    let (media_tx, media_rx) = crossbeam_channel::unbounded::<MediaCommand>();
+    let mut media_session = MediaSession::new(media_tx);
+    let mut hold_seek = HoldSeek::default();
+    // What the OS was last told, to notice a timeline that drifted from the widget's extrapolation.
+    let mut media_published = None::<PublishedTransport>;
+    // What the now-playing panel last showed (`PanelNowPlaying`): the widget mirrors it, and it
+    // outlives `Stopped`/`Inactive`, like the panel's own title and cover do.
+    let mut panel_now_playing = None::<PanelNowPlaying>;
+    let event_media_dirty = Rc::clone(&media_dirty);
+    let event_seek_requester = Rc::clone(&seek_requester);
+    let event_player_for_media = Arc::clone(&audio_player);
     let _event_timer = Timer::default();
     _event_timer.start(TimerMode::Repeated, Duration::from_millis(40), move || {
         // `§3.4`: "projections run once per dirty flag, so large scans are batched." Every event
@@ -705,6 +1086,31 @@ fn main() -> Result<(), slint::PlatformError> {
         // times (a `TrackRowData` plus a fresh `VecModel` per rebuild) against a queue of up to N
         // pending tracks, an O(n^2) cost on the UI thread for one open of N files.
         let mut queue_dirty = false;
+        // OS media commands first, so the playback events they cause are seen this tick or the next.
+        // Every command is a `DIAG` line: whether a physical hold arrives as Begin/End, and whether
+        // a tap also sends a seek pair, can only be settled on real hardware (`CLAUDE.md`).
+        let mut media_ui_playing = None::<bool>;
+        while let Ok(command) = media_rx.try_recv() {
+            let Some(window) = event_window.upgrade() else { return; };
+            write_diagnostic(&format!("media command {command:?}"));
+            // Two toggles in one drain must not both read the same stale button state.
+            let ui_playing = *media_ui_playing.get_or_insert_with(|| window.get_is_playing());
+            match plan_media_command(command, ui_playing) {
+                TransportAction::TogglePlayback => {
+                    event_player_for_media.toggle_playback();
+                    media_ui_playing = Some(!ui_playing);
+                }
+                TransportAction::Next => event_player_for_media.next(),
+                // The controller applies the restart-after-3 s rule itself.
+                TransportAction::Previous => event_player_for_media.previous(),
+                TransportAction::SeekTo { position_ms } => {
+                    event_seek_requester.request(&window, position_ms);
+                }
+                TransportAction::BeginHoldSeek(direction) => hold_seek.begin(direction, Instant::now()),
+                TransportAction::EndHoldSeek(direction) => hold_seek.end(direction),
+                TransportAction::Ignore => {}
+            }
+        }
         while let Ok(event) = events.try_recv() {
             let Some(window) = event_window.upgrade() else { return; };
             match event {
@@ -727,7 +1133,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
                 PlaybackEvent::Started {
-                    path,
+                    key,
                     info,
                     title,
                     album,
@@ -736,19 +1142,23 @@ fn main() -> Result<(), slint::PlatformError> {
                     hog_mode,
                     integer_output_verified,
                 } => {
-                    *event_now_playing_path.borrow_mut() = Some(path.clone());
+                    *event_now_playing_key.borrow_mut() = Some(key.clone());
                     *event_fallback.borrow_mut() = (title, album);
                     *event_info.borrow_mut() = Some(info.clone());
                     clear_pending_seek(&mut event_pending_seek.borrow_mut());
+                    // A new track: stepping on from the old one's position would be wrong.
+                    hold_seek.disarm();
+                    event_media_dirty.set(true);
                     // A single `borrow_mut()` call, not a split lookup-then-mutate: edition 2024's
                     // `if let` rescoping keeps a `Ref` from the scrutinee alive through the whole
                     // then-block, so `event_app_state.borrow().library.get(...)` followed by
                     // `event_app_state.borrow_mut()` in the same block panicked with "already
                     // borrowed" on every `Started` (`§6` Stage 5 fix).
-                    event_app_state.borrow_mut().note_played_path(&path);
-                    apply_now_playing_projection(&window, &event_app_state.borrow(), &path, &info, &event_fallback.borrow());
+                    event_app_state.borrow_mut().note_played_key(&key);
+                    panel_now_playing =
+                        Some(apply_now_playing_projection(&window, &event_app_state.borrow(), &key, &info, &event_fallback.borrow()));
                     queue_dirty = true;
-                    // `note_played_path` may have pushed a new album to the front of Home's "Jump
+                    // `note_played_key` may have pushed a new album to the front of Home's "Jump
                     // back in" shelf (`§5.10` "Recently played").
                     event_library_dirty.set(true);
                     // `active-output-name`, not `output-name`: the latter is the *selected* device
@@ -788,13 +1198,26 @@ fn main() -> Result<(), slint::PlatformError> {
                         );
                         window.set_playback_progress(playback_progress(position_ms, duration_ms));
                         *event_last_timeline.borrow_mut() = (position_ms, duration_ms);
+                        // Not every ~50 ms tick: the OS widget extrapolates from the last publish, so
+                        // only a position that drifted from that (a seek landed, a stall) or a
+                        // late-discovered duration republishes.
+                        if timeline_needs_publish(media_published.as_ref(), position_ms, duration_ms, Instant::now()) {
+                            event_media_dirty.set(true);
+                        }
                     }
                     window.set_can_seek(duration_ms.is_some_and(|duration_ms| duration_ms > 0));
                     window.set_duration_ms(duration_ms.unwrap_or(0) as i32);
                 }
-                PlaybackEvent::Playing(playing) => window.set_is_playing(playing),
+                PlaybackEvent::Playing(playing) => {
+                    window.set_is_playing(playing);
+                    event_media_dirty.set(true);
+                }
                 PlaybackEvent::SeekRejected => {
                     clear_pending_seek(&mut event_pending_seek.borrow_mut());
+                    // A rejected seek ends a hold (its next step would be refused the same way), and
+                    // the widget must go back from the requested target to the true position.
+                    hold_seek.disarm();
+                    event_media_dirty.set(true);
                     // Nothing guarantees a fresh Timeline follows a rejection (a reject with no
                     // active track sends none): restore the last truthful position ourselves so
                     // the bar never keeps showing the clicked-but-never-applied target (`§1.4`).
@@ -827,6 +1250,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
                 PlaybackEvent::Stopped => {
+                    hold_seek.disarm();
+                    event_media_dirty.set(true);
                     window.set_is_playing(false);
                     // No track is active once Stopped is emitted, so seeking must not stay
                     // enabled on a bar with nothing to seek (`§1.4`).
@@ -834,7 +1259,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     *event_active_route_status.borrow_mut() = None;
                     // Nothing is active anymore (unlike a pause, which only sends `Playing(false)`):
                     // the Queue view's "Now Playing" section must not keep showing a stopped track.
-                    *event_now_playing_path.borrow_mut() = None;
+                    *event_now_playing_key.borrow_mut() = None;
                     *event_info.borrow_mut() = None;
                     // Clears the "now playing" accent marker in Songs/Albums/Queue rows, which
                     // otherwise stays on a track that is no longer active (`§5.10`). The bar's
@@ -851,10 +1276,12 @@ fn main() -> Result<(), slint::PlatformError> {
                     // queue itself being cleared (a failed seek, a retained playback failure, or a
                     // failed automatic advance) — unlike `Stopped`, its own `Status` explains why,
                     // so this must not touch the status line (`§1.4`).
+                    hold_seek.disarm();
+                    event_media_dirty.set(true);
                     window.set_is_playing(false);
                     window.set_can_seek(false);
                     *event_active_route_status.borrow_mut() = None;
-                    *event_now_playing_path.borrow_mut() = None;
+                    *event_now_playing_key.borrow_mut() = None;
                     *event_info.borrow_mut() = None;
                     window.set_now_playing_key("".into());
                     window.set_active_output_name("".into());
@@ -869,11 +1296,33 @@ fn main() -> Result<(), slint::PlatformError> {
                 }
             }
         }
+        // Hold-to-seek steps, after the playback events above so the pending-seek and timeline state
+        // they read is this tick's final one.
+        if hold_seek.is_armed() && let Some(window) = event_window.upgrade() {
+            let input = {
+                let pending = event_pending_seek.borrow();
+                HoldSeekInput {
+                    seek_pending: pending.is_some(),
+                    position_ms: pending.as_ref().map_or_else(|| event_last_timeline.borrow().0, |seek| seek.target_ms),
+                    duration_ms: *event_duration.borrow(),
+                }
+            };
+            if let HoldSeekTick::Step { target_ms } = hold_seek.tick(Instant::now(), input) {
+                event_seek_requester.request(&window, target_ms);
+            }
+        }
         while let Ok(event) = library_events.try_recv() {
             let Some(window) = event_window.upgrade() else { return; };
             match event {
                 LibraryEvent::Probed { batch, tracks } => {
                     let kind = event_batch_kinds.borrow().get(&batch).copied().unwrap_or(BatchKind::OpenFiles);
+                    // Drops any track "Remove from Library" excluded (`CLAUDE.md` "Library
+                    // exclusions") before it can be enqueued or added back to the library — chiefly
+                    // matters for the startup restore rescanning a persisted folder/file; an
+                    // "Open Files…"/"Open Folder…" batch never actually contains an excluded track
+                    // in the first place, since re-opening a path lifts its exclusion synchronously
+                    // before `scan()`/`scan_folder()` is even dispatched (see the callbacks above).
+                    let tracks = exclude_removed_tracks(tracks, &event_library_sources.borrow());
                     if batch_should_enqueue(kind) {
                         event_player_for_library.enqueue(tracks.clone());
                     }
@@ -907,18 +1356,47 @@ fn main() -> Result<(), slint::PlatformError> {
                     }
                 }
                 LibraryEvent::Scanned(record) => {
-                    let path = record.path.clone();
-                    // `apply_scanned` reports a rekey when phase 2's tags moved this path off its
-                    // phase-1 `dir:` album key (`§6` Stage 6 fix): rewrite `Navigation` immediately
-                    // so an open album-detail page or a back-stack entry stays resolvable.
-                    if let Some((old_key, new_key)) = event_app_state.borrow_mut().apply_scanned(*record) {
+                    // Same exclusion as `Probed` above: a phase-2 record for an excluded track must
+                    // never reach `AppState` either, or it would resurrect the track that `Probed`
+                    // already correctly skipped (`CLAUDE.md` "Library exclusions").
+                    if event_library_sources.borrow().is_excluded(&record.key) {
+                        continue;
+                    }
+                    let key = record.key.clone();
+                    // The playing track's album picture as it is before this record lands, to tell
+                    // below whether this scan replaced it (`AppState::artwork_revision_of`).
+                    let now_playing_key = event_now_playing_key.borrow().clone();
+                    let art_before = now_playing_key.as_ref().and_then(|now_playing| event_app_state.borrow().artwork_revision_of(now_playing));
+                    // `apply_scanned` reports every album-key transition this scan caused — not only
+                    // this record's own phase-1 `dir:`-to-tagged move (`§6` Stage 6 fix), but also any
+                    // sibling's key silently shifted by group re-resolution (`CLAUDE.md` "Album
+                    // grouping"): rewrite `Navigation` for each one immediately so an open
+                    // album-detail page or a back-stack entry stays resolvable.
+                    for (old_key, new_key) in event_app_state.borrow_mut().apply_scanned(*record) {
                         event_navigation.borrow_mut().rekey_album(&old_key, &new_key);
                     }
-                    let is_now_playing = event_now_playing_path.borrow().as_deref() == Some(path.as_path());
-                    if is_now_playing
+                    // Re-project now-playing for its own record (real tags replace the filename
+                    // fallback) and when this scan replaced the picture of ITS album: a SIBLING
+                    // track's higher-tier picture (e.g. `cover.jpg` in `CD2/` replacing the embedded
+                    // picture `CD1/` showed) must reach the panel that is already displaying the older
+                    // one (`CLAUDE.md` "Album grouping" -> "Artwork"). Never for another album's
+                    // picture, nor for a playing track that is no longer in the library (removed while
+                    // it plays): its projection would fall back to the filename and drop the art and
+                    // lyrics the panel is showing.
+                    if let Some(now_playing_key) = now_playing_key
+                        && (now_playing_key == key
+                            || event_app_state.borrow().artwork_revision_of(&now_playing_key) != art_before)
                         && let Some(info) = event_info.borrow().clone()
                     {
-                        apply_now_playing_projection(&window, &event_app_state.borrow(), &path, &info, &event_fallback.borrow());
+                        panel_now_playing = Some(apply_now_playing_projection(
+                            &window,
+                            &event_app_state.borrow(),
+                            &now_playing_key,
+                            &info,
+                            &event_fallback.borrow(),
+                        ));
+                        // Real tags or a better cover for the playing track: the OS widget mirrors the panel.
+                        event_media_dirty.set(true);
                     }
                     // A scanned record can belong to a track already sitting in the Queue view or
                     // any library view (or be the now-playing one, handled above): re-project so
@@ -951,14 +1429,24 @@ fn main() -> Result<(), slint::PlatformError> {
                             }
                             entry.metadata.push((name, error));
                         }
+                        // A `.cue` sheet failed to parse or resolve: like `Probe`, nothing it would
+                        // have claimed ever reached the queue or the library — its files fall
+                        // through to ordinary whole-file scanning instead (`library::scanner`).
+                        ScanFailurePhase::Cue => {
+                            if show_inline {
+                                set_playback_status(&window, format!("Could not read cue sheet {name}: {error}"), &event_save_error);
+                            }
+                            entry.probe.push((name, error));
+                        }
                     }
                 }
-                LibraryEvent::BatchDone { batch, requested, .. } => {
+                LibraryEvent::BatchDone { batch, requested, count } => {
                     // One fewer request in flight; reaching zero lifts the reprojection throttle
                     // below immediately, so the library always gets a final, up-to-date pass right
                     // after a scan finishes instead of waiting out the rest of the interval.
                     event_scanning_batches.set(event_scanning_batches.get().saturating_sub(1));
                     let kind = event_batch_kinds.borrow_mut().remove(&batch).unwrap_or(BatchKind::OpenFiles);
+                    let had_scan_failures = event_batch_failures.borrow().get(&batch).is_some_and(|failures| !failures.is_empty());
                     match event_batch_failures.borrow_mut().remove(&batch) {
                         Some(failures) if !failures.is_empty() => {
                             let message = if kind == BatchKind::StartupRestore {
@@ -980,16 +1468,44 @@ fn main() -> Result<(), slint::PlatformError> {
                             set_playback_status(&window, message, &event_save_error);
                         }
                         _ if kind == BatchKind::OpenFolder => {
-                            set_playback_status(&window, format!("Added {requested} tracks"), &event_save_error);
+                            // `count` is the real resulting track count (post-cue-expansion), not
+                            // `requested` (the pre-expansion file count the walker found) — a cue
+                            // sheet that expands one physical file into several tracks, or claims
+                            // several files into fewer tracks than files, must be reported
+                            // accurately (`CLAUDE.md` "Wrong track count in the Added N tracks
+                            // status").
+                            set_playback_status(&window, format!("Added {count} tracks"), &event_save_error);
                         }
                         // `StartupRestore` with no failures stays silent (`active_route_status` is
                         // still `None` at startup, so this is a no-op there too); "Open Files…"
                         // keeps restoring whatever route status `Started` last set.
                         _ => restore_active_route_status(&window, &event_active_route_status, &event_save_error),
                     }
+                    // A file the sample-rate repair rewrote (or could not) is reported last, and
+                    // only when the batch had no scan failures to show — those take the status
+                    // line. The quiet startup restore still says what it rewrote on disk, but
+                    // leaves repair failures to the stderr diagnostic.
+                    let repair_notes = event_batch_repairs.borrow_mut().remove(&batch);
+                    if !had_scan_failures
+                        && let Some(message) = repair_notes.and_then(|notes| notes.summary(kind != BatchKind::StartupRestore))
+                    {
+                        set_playback_status(&window, message, &event_save_error);
+                    }
                 }
                 LibraryEvent::FolderScanProgress { root, found } => {
                     set_playback_status(&window, format!("Scanning {}: {found} tracks found", root.display()), &event_save_error);
+                }
+                LibraryEvent::RateRepaired { batch, path, from_rate, to_rate, backup } => {
+                    write_diagnostic(&format!(
+                        "rate repair: converted {} from {from_rate} Hz to {to_rate} Hz (original saved at {})",
+                        path.display(),
+                        backup.display()
+                    ));
+                    event_batch_repairs.borrow_mut().entry(batch).or_default().record_repaired(file_name_of(&path), from_rate, to_rate);
+                }
+                LibraryEvent::RateRepairFailed { batch, path, error } => {
+                    write_diagnostic(&format!("rate repair: left {} unchanged: {error}", path.display()));
+                    event_batch_repairs.borrow_mut().entry(batch).or_default().record_failed(file_name_of(&path), error);
                 }
             }
         }
@@ -998,7 +1514,7 @@ fn main() -> Result<(), slint::PlatformError> {
             project_and_set_queue(
                 &window,
                 &event_app_state.borrow(),
-                event_now_playing_path.borrow().as_deref(),
+                event_now_playing_key.borrow().as_ref(),
                 event_info.borrow().as_ref(),
                 &event_fallback.borrow(),
                 &event_queue_pending.borrow(),
@@ -1017,13 +1533,31 @@ fn main() -> Result<(), slint::PlatformError> {
                 &window,
                 &event_app_state.borrow(),
                 &event_navigation.borrow(),
-                &event_search_query.borrow(),
-                &event_songs_paths,
-                &event_recent_paths,
-                &event_album_paths,
+                event_navigation.borrow().search_query(),
+                LibraryViewPaths {
+                    songs: &event_songs_paths,
+                    recent: &event_recent_paths,
+                    album: &event_album_paths,
+                    search: &event_search_paths,
+                },
             );
             event_library_dirty.set(false);
             event_library_last_projected.set(Some(Instant::now()));
+        }
+        // The OS Now Playing widget, once per tick from the final UI state, not per event (several
+        // events of one tick — `Started`, `Playing`, a `Scanned` re-projection — describe one change).
+        if event_media_dirty.replace(false) && let Some(window) = event_window.upgrade() {
+            let snapshot = TransportSnapshot {
+                has_track: event_now_playing_key.borrow().is_some() && event_info.borrow().is_some(),
+                // The play button's own rule: with no active track, the session stays (paused) for as
+                // long as the button could still retry or replay something (`plan_transport_publish`).
+                can_resume: window_play_button_enabled(&window),
+                ui_playing: window.get_is_playing(),
+                duration_ms: *event_duration.borrow(),
+                last_applied_ms: event_last_timeline.borrow().0,
+                pending_seek_ms: event_pending_seek.borrow().as_ref().map(|seek| seek.target_ms),
+            };
+            sync_media_session(&mut media_session, &mut media_published, &snapshot, panel_now_playing.as_ref());
         }
         // A rejected `Volume` echo otherwise never gets corrected: the worker only emits again on
         // a real change, so without this the slider could show a level the device never reached
@@ -1042,11 +1576,36 @@ fn main() -> Result<(), slint::PlatformError> {
 }
 
 /// Sets every now-playing property from `app_state::project_now_playing` (`§5.8`, `§5.10`
-/// "Now-playing projection"). Called on `Started` and again on a `Scanned` record for the
-/// currently playing path, so real tags/art/lyrics replace the filename fallback as soon as the
-/// scanner's second pass reaches it.
-fn apply_now_playing_projection(window: &MainWindow, app_state: &AppState, path: &Path, info: &AudioInfo, fallback: &(String, String)) {
-    let projection = project_now_playing(app_state, path, info, fallback);
+/// "Now-playing projection"). Called on `Started` for whatever track started, in the library or not
+/// (a queued track of an album removed from the library still starts, and then projects only the
+/// filename fallback with no art); again on a `Scanned` record for the currently playing track, so
+/// real tags/art/lyrics replace the filename fallback as soon as the scanner's second pass reaches
+/// it; and again when a `Scanned` record of a sibling replaced the picture of the playing track's own
+/// album, so the panel picks up the better one. That `Scanned` path never re-projects a playing track
+/// that is no longer in the library (`AppState::artwork_revision_of` is `None` for it), since the
+/// filename fallback would blank the art, artist and lyrics the panel is showing.
+///
+/// Returns what it put on the panel that the OS Now Playing widget mirrors (`PanelNowPlaying`); the
+/// caller keeps it, so the widget shows the panel's own last projection instead of projecting again.
+fn apply_now_playing_projection(
+    window: &MainWindow,
+    app_state: &AppState,
+    key: &TrackKey,
+    info: &AudioInfo,
+    fallback: &(String, String),
+) -> PanelNowPlaying {
+    let projection = project_now_playing(app_state, key, info, fallback);
+    let shown = PanelNowPlaying {
+        title: projection.title.clone(),
+        artist: projection.artist.clone(),
+        album: projection.album.clone(),
+        // The revision of the picture this projection resolved, taken at the same moment: the two
+        // come from the same `shown_artwork`, so they are both present or both absent.
+        artwork: app_state
+            .artwork_revision_of(key)
+            .zip(projection.art.clone())
+            .map(|(revision, image)| NowPlayingArtwork { revision, image }),
+    };
     window.set_now_playing_key(projection.key.into());
     window.set_now_playing_title(projection.title.into());
     window.set_now_playing_artist(projection.artist.into());
@@ -1062,6 +1621,51 @@ fn apply_now_playing_projection(window: &MainWindow, app_state: &AppState, path:
     }
     window.set_lyrics(projection.lyrics.into());
     window.set_has_lyrics(projection.has_lyrics);
+    shown
+}
+
+/// What the now-playing panel last showed for the track (`apply_now_playing_projection`), and so what
+/// the OS Now Playing widget shows. Kept as the panel's own snapshot rather than re-derived on every
+/// publish: the panel deliberately keeps its tags and cover for a playing track that "Remove from
+/// Library" took out of the library (and after `Stopped`/`Inactive`), where a fresh projection would
+/// fall back to the file name, "Unknown Artist" and no cover and the widget would stop matching the
+/// app.
+struct PanelNowPlaying {
+    title: String,
+    artist: String,
+    album: String,
+    /// The cover with the `AppState::artwork_revision_of` it had when projected, so the session
+    /// converts it once per picture, not per publish.
+    artwork: Option<NowPlayingArtwork>,
+}
+
+/// Shows the panel's track in the OS Now Playing widget, or clears the session when there is nothing
+/// to show or resume (`plan_transport_publish`; and nothing to show also means no session before a
+/// first track has ever started, whatever the queue holds): a fresh, complete state every time. Title, artist,
+/// album and cover are what the now-playing panel shows (`PanelNowPlaying`), so the widget cannot
+/// disagree with the app; the transport half follows the UI (`TransportSnapshot`). Records what was
+/// published in `published`.
+fn sync_media_session(
+    session: &mut MediaSession,
+    published: &mut Option<PublishedTransport>,
+    snapshot: &TransportSnapshot,
+    panel: Option<&PanelNowPlaying>,
+) {
+    let (Some(plan), Some(panel)) = (plan_transport_publish(snapshot), panel) else {
+        session.clear();
+        *published = None;
+        return;
+    };
+    session.publish(&NowPlayingState {
+        title: panel.title.clone(),
+        artist: panel.artist.clone(),
+        album: panel.album.clone(),
+        duration_ms: plan.duration_ms,
+        elapsed_ms: plan.elapsed_ms,
+        playing: plan.playing,
+        artwork: panel.artwork.clone(),
+    });
+    *published = Some(PublishedTransport::new(&plan, Instant::now()));
 }
 
 /// Re-projects the Queue view (`§5.7`, `§3.7`) from the worker's latest pending snapshot plus
@@ -1072,14 +1676,14 @@ fn apply_now_playing_projection(window: &MainWindow, app_state: &AppState, path:
 fn project_and_set_queue(
     window: &MainWindow,
     app_state: &AppState,
-    now_playing_path: Option<&Path>,
+    now_playing_key: Option<&TrackKey>,
     now_playing_info: Option<&AudioInfo>,
     now_playing_fallback: &(String, String),
     pending: &[QueueTrackSnapshot],
-    queue_paths: &Rc<RefCell<Vec<PathBuf>>>,
+    queue_paths: &Rc<RefCell<Vec<TrackKey>>>,
 ) {
-    let now_playing = match (now_playing_path, now_playing_info) {
-        (Some(path), Some(info)) => Some((path, info, now_playing_fallback.0.as_str(), now_playing_fallback.1.as_str())),
+    let now_playing = match (now_playing_key, now_playing_info) {
+        (Some(key), Some(info)) => Some((key, info, now_playing_fallback.0.as_str(), now_playing_fallback.1.as_str())),
         _ => None,
     };
     let has_current = now_playing.is_some();
@@ -1090,21 +1694,26 @@ fn project_and_set_queue(
     *queue_paths.borrow_mut() = paths;
 }
 
-/// Re-projects every library-driven view (Home, Albums, Artists, Songs, Recently Added and album
-/// detail) from `app_state`, `navigation`'s current artist filter/album key, and `query` (`§6`
-/// Stage 6, `view_model::project_library`), and records each table's visible-path list so
-/// `on_track_activated` can map a clicked row back to a path. Called once at startup, immediately
-/// after every navigation mutation that can change `artist_filter`/`album_key`, and once per 40 ms
-/// tick while `library_dirty` is set (search edits and scanner events, `§3.4`).
-fn project_and_set_library(
-    window: &MainWindow,
-    app_state: &AppState,
-    navigation: &Navigation,
-    query: &str,
-    songs_paths: &Rc<RefCell<Vec<PathBuf>>>,
-    recent_paths: &Rc<RefCell<Vec<PathBuf>>>,
-    album_paths: &Rc<RefCell<Vec<PathBuf>>>,
-) {
+/// The path lists behind every library-driven table's currently rendered rows, in the same order
+/// as those rows, so `on_track_activated` can map a clicked row back to `library.prepared(path)`
+/// (`§3.4`/`§3.7`). Bundled into one struct, not four separate parameters, so
+/// `project_and_set_library` stays under clippy's `too_many_arguments` threshold now that the
+/// dedicated Search view added a fourth list alongside `songs`/`recent`/`album`.
+struct LibraryViewPaths<'a> {
+    songs: &'a Rc<RefCell<Vec<TrackKey>>>,
+    recent: &'a Rc<RefCell<Vec<TrackKey>>>,
+    album: &'a Rc<RefCell<Vec<TrackKey>>>,
+    search: &'a Rc<RefCell<Vec<TrackKey>>>,
+}
+
+/// Re-projects every library-driven view (Home, Albums, Artists, Songs, Recently Added, album
+/// detail and the dedicated Search view) from `app_state`, `navigation`'s current artist
+/// filter/album key/search query, and `query` (`§6` Stage 6, `view_model::project_library`), and
+/// records each table's visible-path list so `on_track_activated` can map a clicked row back to a
+/// path. Called once at startup, immediately after every navigation mutation that can change
+/// `artist_filter`/`album_key`/the search query, and once per 40 ms tick while `library_dirty` is
+/// set (search edits and scanner events, `§3.4`).
+fn project_and_set_library(window: &MainWindow, app_state: &AppState, navigation: &Navigation, query: &str, paths: LibraryViewPaths) {
     let projection = project_library(app_state, query, navigation.artist_filter(), navigation.album_key());
     window.set_library_empty(projection.library_empty);
     window.set_jump_back_albums(ModelRc::new(VecModel::from_iter(projection.jump_back_albums)));
@@ -1117,16 +1726,23 @@ fn project_and_set_library(
     window.set_recent_summary(projection.recent_summary.into());
     window.set_album_header(projection.album_header);
     window.set_album_tracks(ModelRc::new(VecModel::from_iter(projection.album_tracks)));
-    *songs_paths.borrow_mut() = projection.songs_paths;
-    *recent_paths.borrow_mut() = projection.recent_paths;
-    *album_paths.borrow_mut() = projection.album_paths;
+    window.set_search_songs(ModelRc::new(VecModel::from_iter(projection.search.songs)));
+    window.set_search_songs_header(projection.search.songs_header.into());
+    window.set_search_albums(ModelRc::new(VecModel::from_iter(projection.search.albums)));
+    window.set_search_albums_header(projection.search.albums_header.into());
+    window.set_search_artists_header(projection.search.artists_header.into());
+    window.set_search_has_results(projection.search.has_results);
+    *paths.songs.borrow_mut() = projection.songs_paths;
+    *paths.recent.borrow_mut() = projection.recent_paths;
+    *paths.album.borrow_mut() = projection.album_paths;
+    *paths.search.borrow_mut() = projection.search.songs_paths;
 }
 
 /// `TrackRecord` -> `PreparedTrack`, for the album/library-wide actions (`§3.7` Album Play/Shuffle/
 /// Add to Queue/Play Next, Home "Shuffle all") that already hold `&TrackRecord`s from
 /// `Library::album_tracks`/`songs` instead of paths to look up through `Library::prepared`.
 fn prepared_track(record: &TrackRecord) -> PreparedTrack {
-    PreparedTrack { path: record.path.clone(), info: record.info.clone() }
+    PreparedTrack { key: record.key.clone(), info: record.info.clone() }
 }
 
 /// A fresh shuffle seed from the wall clock (`§3.7` "seed from SystemTime nanos"), so Shuffle/
@@ -1135,14 +1751,38 @@ fn shuffle_seed() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_nanos() as u64).unwrap_or(0)
 }
 
-/// Applies the `§3.6` navigation state to the handful of Slint properties it drives. Called after
-/// every `Navigation` mutation.
+/// A `search-edited` from the top bar: stores the query, pushes `search-active` to the window at once
+/// (the Search view swaps in and out on every keystroke) and forgets the row selection when the edit
+/// changes the list on screen — a new query is a new list. An edit that leaves the effective query as
+/// it was (`Navigation::effective_search_query`: Esc in an already-empty field, a lone Space typed
+/// into it, a trailing space, another letter case) shows the same table, so the row the user clicked
+/// keeps its highlight and Space keeps its target; Return, which never edits, already behaved that way.
+fn apply_search_edit(window: &MainWindow, navigation: &mut Navigation, query: String) {
+    let before = navigation.effective_search_query();
+    navigation.set_search_query(query);
+    window.set_search_active(navigation.search_active());
+    if navigation.effective_search_query() != before {
+        clear_track_selection(window);
+    }
+}
+
+/// Applies the `§3.6` navigation state to the handful of Slint properties it drives, and forgets the
+/// row selection (`clear_track_selection`). Called after every `Navigation` mutation, including the
+/// ones that clear the search query (`nav_selected`, `album_opened`, `artist_opened`, `§3.4`
+/// "Search") — pushing `search-query`/`search-active` here too keeps the search box and the dedicated
+/// Search view in lockstep with `Navigation` itself, instead of `main.rs` having to remember to clear
+/// them separately at each call site.
 fn sync_navigation(window: &MainWindow, navigation: &Navigation) {
+    // A navigation leaves the page a row was clicked on: its selection goes with it. (A re-projection
+    // of the same page does not come through here, and keeps it.)
+    clear_track_selection(window);
     window.set_view(navigation.view());
     window.set_nav_view(navigation.nav_view());
     window.set_can_go_back(navigation.can_go_back());
     window.set_artist_filter(navigation.artist_filter().unwrap_or_default().into());
     window.set_unavailable_title(unavailable_label(navigation.view()).into());
+    window.set_search_query(navigation.search_query().into());
+    window.set_search_active(navigation.search_active());
 }
 
 fn set_playback_status(
@@ -1179,9 +1819,14 @@ fn set_device_model(window: &MainWindow, devices: &[OutputDevice]) {
 }
 
 async fn pick_audio_files(parent_window: slint::WindowHandle) -> Option<Vec<PathBuf>> {
+    // `.cue` is not itself a playable audio format (`walker::AUDIO_EXTENSIONS`), but a directly
+    // opened cue sheet must trigger the same expansion its folder gets from a folder scan
+    // (`library::scanner`'s cue detection), so the picker must allow selecting one.
+    let mut extensions: Vec<&str> = AUDIO_EXTENSIONS.to_vec();
+    extensions.push(library::walker::CUE_EXTENSION);
     rfd::AsyncFileDialog::new()
         .set_parent(&parent_window)
-        .add_filter("Audio files", &AUDIO_EXTENSIONS)
+        .add_filter("Audio files", &extensions)
         .pick_files()
         .await
         .map(|files| {
@@ -1223,7 +1868,7 @@ mod timeline_tests {
     #[test]
     fn accept_timeline_during_pending_seek() {
         let pending = PendingSeek {
-            path: PathBuf::from("/nas/album/track.flac"),
+            key: TrackKey::whole_file(PathBuf::from("/nas/album/track.flac")),
             target_ms: 30_000,
             requested_at: Instant::now(),
         };
@@ -1256,9 +1901,20 @@ mod timeline_tests {
     }
 
     #[test]
+    fn seek_ui_target_clamps_to_the_duration_and_reports_the_matching_progress() {
+        assert_eq!(seek_ui_target(30_000, 120_000), (30_000, 0.25));
+        assert_eq!(seek_ui_target(0, 120_000), (0, 0.0));
+        assert_eq!(
+            seek_ui_target(u64::MAX, 120_000),
+            (120_000, 1.0),
+            "a Control Center scrub past the end must not leave the bar or the pending target beyond the track"
+        );
+    }
+
+    #[test]
     fn seek_rejected_clears_pending_seek() {
         let mut pending = Some(PendingSeek {
-            path: PathBuf::from("/nas/album/track.flac"),
+            key: TrackKey::whole_file(PathBuf::from("/nas/album/track.flac")),
             target_ms: 5_000,
             requested_at: Instant::now(),
         });
@@ -1266,6 +1922,99 @@ mod timeline_tests {
         clear_pending_seek(&mut pending);
 
         assert!(pending.is_none());
+    }
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+
+    fn model_of(keys: &[&str]) -> slint::VecModel<TrackRowData> {
+        slint::VecModel::from(keys.iter().map(|key| TrackRowData { key: (*key).into(), ..Default::default() }).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn the_selection_is_looked_up_by_track_key_in_whatever_rows_are_shown_now() {
+        let before = model_of(&["a", "b", "c"]);
+        assert_eq!(row_of_key(&before, "a"), Some(0));
+        // The library was re-projected with two tracks ahead of it: same key, another position.
+        let after = model_of(&["x", "y", "a", "b"]);
+        assert_eq!(row_of_key(&after, "a"), Some(2), "the key follows its track to its new row");
+        // And the track is gone: nothing takes over the old position.
+        let without = model_of(&["x", "y", "b"]);
+        assert_eq!(row_of_key(&without, "a"), None, "a key that left the list resolves to nothing, not to row 0");
+    }
+
+    #[test]
+    fn no_selection_and_unknown_keys_resolve_to_no_row() {
+        let rows = model_of(&["a", "", "b"]);
+        assert_eq!(row_of_key(&rows, ""), None, "an empty selected key means nothing is selected, even next to a row with an empty key");
+        assert_eq!(row_of_key(&rows, "zzz"), None);
+        assert_eq!(row_of_key(&model_of(&[]), "a"), None);
+    }
+
+    #[test]
+    fn the_visible_track_table_follows_the_view_and_the_search() {
+        assert_eq!(visible_track_list(View::Songs, false), Some(TrackListKind::Songs));
+        assert_eq!(visible_track_list(View::RecentlyAdded, false), Some(TrackListKind::RecentlyAdded));
+        assert_eq!(visible_track_list(View::AlbumDetail, false), Some(TrackListKind::Album));
+        assert_eq!(visible_track_list(View::Queue, false), Some(TrackListKind::Queue));
+        for view in [View::Home, View::Albums, View::Artists, View::Browser, View::Liked] {
+            assert_eq!(visible_track_list(view, false), None, "{view:?} has no track table");
+        }
+        // The Search view covers whichever view is underneath, tables included.
+        for view in [View::Songs, View::Home, View::Queue, View::AlbumDetail] {
+            assert_eq!(visible_track_list(view, true), Some(TrackListKind::Search));
+        }
+    }
+
+    #[test]
+    fn space_is_the_play_button_while_a_track_is_loaded_or_queued() {
+        let selection = Some((TrackListKind::Songs, 2));
+        assert_eq!(plan_space_action(true, selection), SpaceAction::TogglePlayback, "a loaded track wins over a highlighted row");
+        assert_eq!(plan_space_action(true, None), SpaceAction::TogglePlayback);
+    }
+
+    #[test]
+    fn space_plays_the_selected_row_only_when_nothing_is_loaded() {
+        assert_eq!(
+            plan_space_action(false, Some((TrackListKind::Album, 4))),
+            SpaceAction::ActivateSelection { kind: TrackListKind::Album, index: 4 }
+        );
+        assert_eq!(
+            plan_space_action(false, Some((TrackListKind::Search, 0))),
+            SpaceAction::ActivateSelection { kind: TrackListKind::Search, index: 0 },
+            "row 0 is a real row"
+        );
+    }
+
+    #[test]
+    fn space_with_nothing_loaded_and_nothing_selected_falls_back_to_the_play_button() {
+        // The controller answers with "Open an audio file to start playback."
+        assert_eq!(plan_space_action(false, None), SpaceAction::TogglePlayback);
+    }
+}
+
+#[cfg(test)]
+mod media_publish_tests {
+    /// The OS Now Playing widget must show what the panel shows. The panel deliberately keeps the tags
+    /// and cover of a playing track that left the library (and after `Stopped`), where a fresh
+    /// projection would be the file-name fallback with no cover, so a publish that projects again
+    /// makes the widget disagree with the app. `sync_media_session` only ever reads the panel's own
+    /// snapshot (`PanelNowPlaying`, returned by `apply_now_playing_projection`).
+    #[test]
+    fn the_media_session_publishes_the_panels_snapshot_and_never_projects_again() {
+        let source = include_str!("main.rs");
+        let start = source.find("fn sync_media_session(").expect("main.rs defines sync_media_session");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("sync_media_session ends at a closing brace in column 0")];
+        assert!(
+            !body.contains("project_now_playing") && !body.contains("artwork_revision_of") && !body.contains("AppState"),
+            "sync_media_session must publish the panel's snapshot, not derive metadata from the library again:\n{body}"
+        );
+        for field in ["panel.title.clone()", "panel.artist.clone()", "panel.album.clone()", "panel.artwork.clone()"] {
+            assert!(body.contains(field), "the widget's `{field}` must come from the panel's snapshot");
+        }
     }
 }
 
@@ -1317,5 +2066,48 @@ mod batch_kind_tests {
         assert!(batch_reports_failures_inline(BatchKind::OpenFiles));
         assert!(batch_reports_failures_inline(BatchKind::OpenFolder));
         assert!(!batch_reports_failures_inline(BatchKind::StartupRestore));
+    }
+
+    fn prepared(path: &str) -> PreparedTrack {
+        PreparedTrack {
+            key: TrackKey::whole_file(PathBuf::from(path)),
+            info: AudioInfo {
+                sample_rate: 44_100,
+                duration_ms: Some(60_000),
+                source_channels: 2,
+                bits_per_sample: 16,
+                is_float: false,
+                integer_pcm: true,
+                format: "FLAC".into(),
+            },
+        }
+    }
+
+    /// "Remove from Library" (`CLAUDE.md` "Library exclusions"): a rescan (chiefly the startup
+    /// restore) must never bring an excluded track back — `exclude_removed_tracks` is exactly the
+    /// filter `LibraryEvent::Probed` runs through before a batch can be enqueued or added to the
+    /// library, so this doubles as the "rescanning a folder respects exclusions" contract.
+    #[test]
+    fn exclude_removed_tracks_drops_only_excluded_keys_and_keeps_order() {
+        let mut sources = LibrarySources::default();
+        sources.exclude_tracks([TrackKey::whole_file(PathBuf::from("/music/removed.flac"))]);
+        let tracks = vec![prepared("/music/kept-a.flac"), prepared("/music/removed.flac"), prepared("/music/kept-b.flac")];
+
+        let filtered = exclude_removed_tracks(tracks, &sources);
+
+        assert_eq!(
+            filtered.into_iter().map(|track| track.key.path).collect::<Vec<_>>(),
+            vec![PathBuf::from("/music/kept-a.flac"), PathBuf::from("/music/kept-b.flac")]
+        );
+    }
+
+    #[test]
+    fn exclude_removed_tracks_is_a_no_op_with_no_exclusions() {
+        let sources = LibrarySources::default();
+        let tracks = vec![prepared("/music/a.flac"), prepared("/music/b.flac")];
+
+        let filtered = exclude_removed_tracks(tracks.clone(), &sources);
+
+        assert_eq!(filtered.len(), tracks.len());
     }
 }

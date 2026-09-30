@@ -14,7 +14,7 @@ export enum View {
     home, artists, albums, songs, browser, folders, recently-added, liked, statistics,
     recently-opened, scripts, favorites, new-playlist, queue, album-detail,
 }
-export enum TrackListKind { songs, recently-added, album, queue }
+export enum TrackListKind { songs, recently-added, album, queue, search }
 export enum AlbumAction { play, shuffle, add-to-queue, play-next }
 export enum ButtonKind { normal, large, chip }
 
@@ -24,11 +24,12 @@ export struct TrackRowData {
     title: string, artist: string, album: string, year: string,
     duration: string,
     badge: string,
-    hi-res: bool,
+    format-label: string,
+    format-variant: string,
 }
-export struct AlbumCardData { key: string, title: string, artist: string, subtitle: string, art: image, has-art: bool }
+export struct AlbumCardData { key: string, title: string, artist: string, subtitle: string, art: image, has-art: bool, format-label: string, format-variant: string }
 export struct ArtistRowData { name: string, subtitle: string }
-export struct AlbumHeaderData { key: string, title: string, artist: string, meta: string, art: image, has-art: bool }
+export struct AlbumHeaderData { key: string, title: string, artist: string, meta: string, art: image, has-art: bool, format-label: string, format-variant: string }
 
 // `Icon`. Renders `source` through `colorize`, sized to a square of `size` (`§5.5`).
 export component Icon inherits Image {
@@ -143,13 +144,13 @@ export component ActionButton inherits Rectangle {
         if root.icon.width > 0: Icon {
             source: root.icon;
             size: root.kind == ButtonKind.large ? 18px : Theme.icon-action;
-            tint: root.primary ? white : Theme.text-primary;
+            tint: root.primary ? Theme.on-accent : Theme.text-primary;
         }
         Text {
             text: root.text;
             font-size: root.kind == ButtonKind.large ? Theme.fs-title : Theme.fs-body;
             font-weight: 600;
-            color: root.primary ? white : Theme.text-primary;
+            color: root.primary ? Theme.on-accent : Theme.text-primary;
             vertical-alignment: center;
         }
     }
@@ -225,6 +226,42 @@ export component Badge inherits Rectangle {
     }
 }
 
+// The format pill shown on `AlbumTile`/`AlbumDetailView`'s header (one per album, `§5.5`/`§5.7`)
+// and on each `TrackRow` (one per track, `§5.5`): same shape/padding/font as `Badge` above, but its
+// background/text color is picked from `variant` instead of always the accent pair, so the format
+// families can be told apart at a glance. `variant` is one of `"mp3"`, `"flac"`, `"wavpack"`,
+// `"mix"`, `"wav"` — the exact strings `AlbumFormat::variant` in `src/library/format.rs` produces
+// (a per-track pill only ever uses `"mp3"`/`"flac"`/`"wavpack"`/`"wav"`, never `"mix"`, since a
+// single track always has exactly one format); an unrecognized variant (there should never be one)
+// falls back to the neutral WAV colors rather than an undefined brush. `"mp3"` reuses
+// `Theme.accent-soft`/`Theme.accent-strong` (the app's lime accent) so no separate MP3 token exists
+// in `theme.slint`.
+export component FormatPill inherits Rectangle {
+    in property <string> text;
+    in property <string> variant;
+    property <color> pill-bg: root.variant == "flac" ? Theme.flac-soft
+        : root.variant == "wavpack" ? Theme.wavpack-soft
+        : root.variant == "mix" ? Theme.mix-soft
+        : root.variant == "mp3" ? Theme.accent-soft
+        : Theme.wav-soft;
+    property <color> pill-text: root.variant == "flac" ? Theme.flac-strong
+        : root.variant == "wavpack" ? Theme.wavpack-strong
+        : root.variant == "mix" ? Theme.mix-strong
+        : root.variant == "mp3" ? Theme.accent-strong
+        : Theme.wav-strong;
+    background: root.pill-bg;
+    border-radius: 4px;
+    width: label.preferred-width + 12px;
+    height: label.preferred-height + 2px;
+    HorizontalLayout {
+        padding-top: 1px;
+        padding-bottom: 1px;
+        padding-left: 6px;
+        padding-right: 6px;
+        label := Text { text: root.text; font-size: Theme.fs-caption; font-weight: 700; color: root.pill-text; }
+    }
+}
+
 // Either the artwork or the neutral placeholder disc, clipped to `radius` (`§5.5`).
 export component ArtworkView inherits Rectangle {
     in property <image> art;
@@ -271,10 +308,18 @@ export component EmptyState inherits Rectangle {
     }
 }
 
-// Album tile: art, title, artist, subtitle, and a click that opens the album (`§5.5`).
+// Album tile: art, title, artist, subtitle, and a click that opens the album (`§5.5`). Also carries
+// the "more" menu (three-dot button + popup, `§5.5` "Remove from Library"): right-aligned under the
+// format pill, level with the artist line (wireframe).
 export component AlbumTile inherits Rectangle {
     in property <AlbumCardData> data;
     callback opened(string);
+    callback remove-requested(string);
+    // Forces `menu-popup` open on init — used only by the offscreen snapshot harness
+    // (`src/ui_snapshot.rs`, via `AlbumGrid.force-menu-open-index`) to capture the popup's anchored
+    // position for review; production code (`main.rs`) never sets this, so it always stays `false`
+    // there and the popup only ever opens from `menu-touch`'s own click below.
+    in property <bool> force-menu-open: false;
     width: Theme.tile-art;
     height: Theme.tile-h;
     background: transparent;
@@ -286,11 +331,106 @@ export component AlbumTile inherits Rectangle {
             ArtworkView { art: root.data.art; has-art: root.data.has-art; size: Theme.tile-art; radius: 6px; }
             if touch.has-hover: Rectangle { width: 100%; height: 100%; background: #ffffff0f; border-radius: 6px; }
         }
-        Text { text: root.data.title; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
-        Text { text: root.data.artist; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; }
+        // Title row: the title elides to make room for the format pill, which sits at the right
+        // end of the same line (user wireframe). The pill is omitted until a format is known.
+        HorizontalLayout {
+            spacing: 6px;
+            cross-axis-alignment: center;
+            Text { horizontal-stretch: 1; text: root.data.title; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
+            if root.data.format-label != "": FormatPill { text: root.data.format-label; variant: root.data.format-variant; }
+        }
+        // Artist row: `width` leaves room on the right for `menu-button` below (an absolutely
+        // positioned overlay, not part of this layout) so a long artist name elides instead of
+        // running under the button.
+        artist-row := Text { text: root.data.artist; width: parent.width - 24px; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; }
         Text { text: root.data.subtitle; font-size: Theme.fs-meta; color: Theme.text-tertiary; overflow: elide; }
     }
+    // Whole-card click opens the album. Declared before `menu-button` below, so `menu-button`'s own
+    // smaller `menu-touch` — on top in z-order — intercepts clicks on the button itself first; this
+    // TouchArea only ever sees clicks outside that small region.
     touch := TouchArea { clicked => { root.opened(root.data.key); } }
+
+    // Reacts to `force-menu-open` turning on, rather than an `init => { ... }` on-create hook:
+    // `init` fires while this `AlbumTile` is first being instantiated, before the surrounding
+    // layout pass has ever run, so `menu-popup`'s position (anchored off `menu-button`, which is
+    // itself anchored off `artist-row.y`) would still be resolving from its pre-layout default and
+    // the popup would show up in the wrong place. `force-menu-open` — set only by the offscreen
+    // snapshot harness, after its first real render (`ui_snapshot.rs`'s `warmup_layout`) — only
+    // flips true once that layout has already settled, so `menu-popup` opens at its correct
+    // anchored position.
+    changed force-menu-open => { if root.force-menu-open { menu-popup.show(); } }
+
+    // The three-dot "more" button (wireframe: right end of the artist-name row, directly under the
+    // format pill). Positioned by absolute `x`/`y` against `artist-row`'s own geometry rather than
+    // living inside the `VerticalLayout` above, specifically so it can be declared after `touch` —
+    // and therefore draw, and hit-test, on top of the whole-card TouchArea instead of being covered
+    // by it.
+    menu-button := Rectangle {
+        x: root.width - self.width;
+        // Coupling note: `artist-row.y` is measured inside the `VerticalLayout` above, but
+        // `menu-button` itself is positioned relative to `root`, one level up — those two
+        // coordinate spaces only coincide today because that layout sits at (0, 0) with no padding.
+        // If the layout ever gains top padding/spacing before `artist-row`, this `y` will silently
+        // stop lining up with it. A real fix would anchor `menu-button` inside the same layout
+        // instead; left as absolute positioning here since it must draw/hit-test above `touch`
+        // below (see the comment on `touch`), which the current structure already relies on.
+        y: artist-row.y - 1px;
+        width: 20px;
+        height: 20px;
+        border-radius: 4px;
+        background: menu-touch.has-hover ? Theme.bg-hover : transparent;
+        Icon {
+            source: Icons.more-vertical;
+            size: Theme.icon-action;
+            tint: Theme.text-secondary;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+        // Scoped to just this button (`§...` Task 2 "Remove from Library"): a separate, smaller
+        // TouchArea than the card's own `touch` above, so opening the menu never also fires
+        // `root.opened(...)` — no click-propagation to stop, since the two TouchAreas cover
+        // disjoint regions to begin with.
+        menu-touch := TouchArea {
+            clicked => { menu-popup.show(); }
+        }
+        menu-popup := PopupWindow {
+            // Same reasoning as `PlayerBar`'s `output-popup` (`ui/app.slint`): the default
+            // `close-on-click` policy would close this popup on the very click that opens it or on
+            // `remove-touch`'s own click below; `close-on-click-outside` still dismisses it on an
+            // outside click but leaves its own contents alone.
+            close-policy: close-on-click-outside;
+            x: -Theme.tile-art + parent.width;
+            y: parent.height + 4px;
+            Rectangle {
+                // Card-wide, right-aligned to the button: its left edge lines up with the card's,
+                // so the menu never spills over the sidebar for first-column cards.
+                width: Theme.tile-art;
+                background: Theme.bg-panel;
+                border-radius: 8px;
+                drop-shadow-blur: 12px;
+                drop-shadow-color: #000000.with-alpha(0.35);
+                VerticalLayout {
+                    padding: 6px;
+                    Rectangle {
+                        height: 34px;
+                        border-radius: 6px;
+                        background: remove-touch.has-hover ? Theme.danger.with-alpha(0.14) : transparent;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 8px;
+                            cross-axis-alignment: center;
+                            Icon { source: Icons.trash; size: Theme.icon-action; tint: Theme.danger; }
+                            Text { text: "Remove from Library"; font-size: Theme.fs-body; color: Theme.danger; vertical-alignment: center; }
+                        }
+                        remove-touch := TouchArea {
+                            clicked => { root.remove-requested(root.data.key); }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // A responsive grid of `AlbumTile`s, optionally capped to `max-rows` (`§5.5`).
@@ -298,6 +438,11 @@ export component AlbumGrid inherits Rectangle {
     in property <[AlbumCardData]> albums;
     in property <int> max-rows: 0;
     callback opened(string);
+    callback remove-requested(string);
+    // Snapshot-harness-only knob (see `AlbumTile.force-menu-open`): the index (within `albums`,
+    // pre-`max-rows` cap) whose card should render with its "more" popup forced open; `-1` (the
+    // default every real page uses) forces none.
+    in property <int> force-menu-open-index: -1;
     property <int> cols: max(1, floor((self.width + 22px) / (Theme.tile-art + 22px)));
     property <int> shown: root.max-rows > 0 ? min(root.albums.length, root.cols * root.max-rows) : root.albums.length;
     height: ceil(root.shown / root.cols) * (Theme.tile-h + 24px);
@@ -307,7 +452,141 @@ export component AlbumGrid inherits Rectangle {
         y: floor(i / root.cols) * (Theme.tile-h + 24px);
         visible: i < root.shown;
         data: album;
+        force-menu-open: i == root.force-menu-open-index;
         opened(key) => { root.opened(key); }
+        remove-requested(key) => { root.remove-requested(key); }
+    }
+}
+
+// An artist row: an icon, name and subtitle, and a click that opens the artist (`§5.7`). Shared by
+// `ArtistsView` and the dedicated Search view's own Artists section so the row markup exists once.
+export component ArtistListRow inherits Rectangle {
+    in property <ArtistRowData> data;
+    callback opened(string);
+    height: 52px;
+    border-radius: 6px;
+    background: row-touch.has-hover ? Theme.bg-hover : transparent;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 12px;
+        cross-axis-alignment: center;
+        Rectangle {
+            width: 36px;
+            height: 36px;
+            border-radius: 18px;
+            background: Theme.bg-field;
+            Icon { source: Icons.artists; size: 18px; tint: Theme.text-secondary; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text { text: root.data.name; font-size: Theme.fs-body; font-weight: 600; color: Theme.text-primary; overflow: elide; }
+            Text { text: root.data.subtitle; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; }
+        }
+    }
+    row-touch := TouchArea { clicked => { root.opened(root.data.name); } }
+}
+
+// One bar of `PlayingBars` below. Geometry is passed in as already-scaled lengths (`x`/`bar-width`/
+// `rest-height`, derived from `assets/icon.svg`'s bar group); this component only owns the
+// oscillation math and the resulting `Rectangle`. While `animating` is true, `height` is a sum of
+// two sines at incommensurate frequencies (`freq-a`/`freq-b`, in Hz) and distinct phases
+// (`phase-a`/`phase-b`) driven by `animation-tick()`, growing/shrinking symmetrically around the
+// bar's fixed vertical center (`center-y`) between 25% and 100% of `rest-height` — five bars, each
+// with different constants, never fall into a visibly repeating pattern together. While `animating`
+// is false, `height` binds straight to `rest-height` and never evaluates `animation-tick()` at all:
+// the ternary's untaken branch is never read, so this bar drops the animation-tick dependency (and
+// with it, Slint's per-frame redraw request) the moment `animating` turns false — the same lazy
+// pattern Slint's own animated-indicator examples use.
+component PlayingBar inherits Rectangle {
+    in property <length> x-pos;
+    in property <length> bar-width;
+    in property <length> rest-height;
+    in property <length> center-y;
+    in property <brush> bar-fill;
+    in property <bool> animating;
+    in property <float> freq-a;
+    in property <float> freq-b;
+    in property <angle> phase-a;
+    in property <angle> phase-b;
+    property <float> osc: root.animating
+        ? 0.5 * sin((animation-tick() / 1s) * root.freq-a * 360deg + root.phase-a)
+            + 0.5 * sin((animation-tick() / 1s) * root.freq-b * 360deg + root.phase-b)
+        : 0.0;
+    property <length> bar-height: root.animating ? root.rest-height * (0.625 + 0.375 * root.osc) : root.rest-height;
+    x: root.x-pos;
+    y: root.center-y - self.bar-height / 2;
+    width: root.bar-width;
+    height: root.bar-height;
+    border-radius: self.width / 2;
+    background: root.bar-fill;
+}
+
+// The animated "now playing" indicator shown in the "#" column of `TrackRow` (`§5.5`), an animated
+// version of the app icon's five bars (`assets/icon.svg`, no tile). Geometry is the SVG's own bar
+// group in its 1024x1024 canvas — x in [225, 799] (width 574), rest heights 172/348/538/348/172 —
+// scaled uniformly so the group's width matches `Theme.icon-playing-bars`; every bar in the source
+// icon shares the same vertical center (y=512, exactly half of the group's own 538px height), so
+// this component's own vertical center is that shared center too, and no separate offset is needed.
+// `animating` drives each bar's oscillation (see `PlayingBar` above); while false, the bars sit
+// static at their resting heights.
+export component PlayingBars inherits Rectangle {
+    in property <bool> animating: false;
+    width: Theme.icon-playing-bars;
+    height: root.width * 538 / 574;
+    background: transparent;
+    property <length> unit: root.width / 574;
+
+    PlayingBar {
+        x-pos: 0 * root.unit;
+        bar-width: 78 * root.unit;
+        rest-height: 172 * root.unit;
+        center-y: root.height / 2;
+        bar-fill: @linear-gradient(180deg, Theme.playing-bars-outer-top 0%, Theme.playing-bars-outer-bottom 100%);
+        animating: root.animating;
+        freq-a: 0.9; freq-b: 1.457; phase-a: 0deg; phase-b: 137deg;
+    }
+    // `Theme.icon-playing-bars` (24px, not a smaller ~16px glyph size) is load-bearing for these
+    // three inner bars specifically: below ~22px, this tallest/middle bar's own gradient-filled
+    // rounded rect (the most extreme aspect ratio of the five — under 3px wide at 16px) is
+    // mis-rasterized by Slint 1.18.1's software renderer, rendering with a collapsed height. See
+    // `Theme.icon-playing-bars`'s own comment.
+    PlayingBar {
+        x-pos: 122 * root.unit;
+        bar-width: 82 * root.unit;
+        rest-height: 348 * root.unit;
+        center-y: root.height / 2;
+        bar-fill: @linear-gradient(180deg, Theme.playing-bars-inner-top 0%, Theme.playing-bars-inner-mid 55%, Theme.playing-bars-inner-bottom 100%);
+        animating: root.animating;
+        freq-a: 1.3; freq-b: 2.104; phase-a: 63deg; phase-b: 288deg;
+    }
+    PlayingBar {
+        x-pos: 246 * root.unit;
+        bar-width: 82 * root.unit;
+        rest-height: 538 * root.unit;
+        center-y: root.height / 2;
+        bar-fill: @linear-gradient(180deg, Theme.playing-bars-inner-top 0%, Theme.playing-bars-inner-mid 55%, Theme.playing-bars-inner-bottom 100%);
+        animating: root.animating;
+        freq-a: 1.1; freq-b: 1.782; phase-a: 205deg; phase-b: 12deg;
+    }
+    PlayingBar {
+        x-pos: 370 * root.unit;
+        bar-width: 82 * root.unit;
+        rest-height: 348 * root.unit;
+        center-y: root.height / 2;
+        bar-fill: @linear-gradient(180deg, Theme.playing-bars-inner-top 0%, Theme.playing-bars-inner-mid 55%, Theme.playing-bars-inner-bottom 100%);
+        animating: root.animating;
+        freq-a: 1.7; freq-b: 2.751; phase-a: 314deg; phase-b: 96deg;
+    }
+    PlayingBar {
+        x-pos: 496 * root.unit;
+        bar-width: 78 * root.unit;
+        rest-height: 172 * root.unit;
+        center-y: root.height / 2;
+        bar-fill: @linear-gradient(180deg, Theme.playing-bars-outer-top 0%, Theme.playing-bars-outer-bottom 100%);
+        animating: root.animating;
+        freq-a: 1.5; freq-b: 0.983; phase-a: 171deg; phase-b: 249deg;
     }
 }
 
@@ -316,6 +595,12 @@ export component TrackRow inherits Rectangle {
     in property <int> index;
     in property <bool> selected: false;
     in property <bool> is-playing: false;
+    // Real transport state (`MainWindow.is-playing`, set from `PlaybackEvent::Playing`), not
+    // whether this row *is* the current track (that's `is-playing` above, despite the name overlap
+    // — kept as-is to match the existing `now-playing-key` match it's derived from). Drives whether
+    // `PlayingBars` animates or sits static at its resting heights: a track can be current and
+    // paused at the same time.
+    in property <bool> playing: false;
     in property <bool> show-album: true;
     in property <bool> show-format: false;
     callback clicked(int);
@@ -331,10 +616,8 @@ export component TrackRow inherits Rectangle {
         Rectangle {
             width: 44px;
             height: 100%;
-            if root.is-playing: Icon {
-                source: Icons.now-playing;
-                size: Theme.icon-inline;
-                tint: Theme.accent;
+            if root.is-playing: PlayingBars {
+                animating: root.playing;
                 x: parent.width - self.width;
                 y: (parent.height - self.height) / 2;
             }
@@ -362,7 +645,7 @@ export component TrackRow inherits Rectangle {
             spacing: 6px;
             cross-axis-alignment: center;
             // `alignment: start` (`§6` Stage 6 fix): with no title `horizontal-stretch`, the title
-            // and badge pack at their preferred size from the left, so the Hi-Res badge follows the
+            // and pill pack at their preferred size from the left, so the format pill follows the
             // title (`§5.5`) instead of the old `horizontal-stretch: 1` on the title pushing it to
             // the far right of the whole Title column. When the column is too narrow, the shrink
             // solver still elides the title first (`i-slint-compiler` `layout.rs` `solve_box_layout`).
@@ -373,7 +656,7 @@ export component TrackRow inherits Rectangle {
                 color: root.is-playing ? Theme.accent : Theme.text-primary;
                 overflow: elide;
             }
-            if root.data.hi-res: Badge { text: "Hi-Res"; }
+            if root.data.format-label != "": FormatPill { text: root.data.format-label; variant: root.data.format-variant; }
         }
         Text {
             text: root.data.artist;
@@ -398,9 +681,11 @@ export component TrackRow inherits Rectangle {
             width: 110px;
             height: 100%;
             // `x: 0` matches the left-aligned "Format" header (`§6` Stage 5 fix): with no `x`
-            // binding, Slint's `maybe_center_in_parent` centered the badge in the 110 px column
-            // instead.
-            Badge { x: 0; y: (parent.height - self.height) / 2; text: root.data.badge; }
+            // binding, Slint's `maybe_center_in_parent` centered the pill in the 110 px column
+            // instead. `FormatPill` here keeps the badge's full "FLAC 24/96"-style text but colors
+            // it by `format-variant`, same as the compact per-track pill next to the title, instead
+            // of the neutral grey `Badge` this column used before (`§5.5` per-track format pills).
+            FormatPill { x: 0; y: (parent.height - self.height) / 2; text: root.data.badge; variant: root.data.format-variant; }
         }
         Text { text: root.data.duration; width: 64px; font-size: Theme.fs-body; color: Theme.text-primary; horizontal-alignment: right; }
     }
@@ -487,10 +772,26 @@ component TrackTableHeader inherits Rectangle {
 export component TrackTable inherits VerticalLayout {
     in property <[TrackRowData]> rows;
     in property <string> now-playing-key: "";
+    // Real transport state, forwarded to each `TrackRow`'s own `playing` (see `TrackRow`'s comment):
+    // `MainWindow.is-playing` reaches every row through here.
+    in property <bool> playing: false;
     in property <bool> show-album: true;
     in property <bool> show-format: false;
     callback activated(int);
-    property <int> selected-index: -1;
+    // The selected row is identified by its `TrackRowData.key`, never by its position (`CLAUDE.md`
+    // "Media controls" -> "Spacebar"): a table that stays on screen has its rows replaced all the time
+    // (a scan batch or a `Started` re-projects the library), and an index would then name whatever
+    // sits at that position now. `MainWindow` owns the key and hands it down as `selected-key`; a
+    // click or double click reports the clicked row's key through `selected`, and `main.rs` resolves
+    // the key to a row only when Space is pressed. A navigation or a search edit that changes the
+    // list clears the key instead (`main.rs` `sync_navigation`, `apply_search_edit`).
+    // Known limit: a key that appears in several rows on screen highlights every one of them. Only
+    // the Queue view can show that (its "Now Playing" row plus the same track later in "Up Next", or an
+    // album queued twice); the selection is inert there (Space is the play button whenever the queue
+    // is not empty), so the copies are left highlighted together rather than giving queue rows an
+    // identity other than the track key that `row_of_key` and `now-playing-key` match on.
+    in property <string> selected-key: "";
+    callback selected(string);
     // A `for` loop's row count is a runtime value, so the compiler cannot bound this layout's own
     // height from its children alone; it defaults `max-height` to unbounded. Left unbounded, this
     // table (not the fixed-size labels around it) is the one element in Queue's outer layout that
@@ -510,12 +811,13 @@ export component TrackTable inherits VerticalLayout {
     for row[i] in root.rows: TrackRow {
         data: row;
         index: i;
-        selected: root.selected-index == i;
+        selected: root.selected-key != "" && row.key == root.selected-key;
         is-playing: root.now-playing-key != "" && row.key == root.now-playing-key;
+        playing: root.playing;
         show-album: root.show-album;
         show-format: root.show-format;
-        clicked(index) => { root.selected-index = index; }
-        activated(index) => { root.selected-index = index; root.activated(index); }
+        clicked => { root.selected(row.key); }
+        activated(index) => { root.selected(row.key); root.activated(index); }
     }
 }
 
@@ -531,10 +833,14 @@ export component TrackTable inherits VerticalLayout {
 export component VirtualizedTrackTable inherits VerticalLayout {
     in property <[TrackRowData]> rows;
     in property <string> now-playing-key: "";
+    // See `TrackTable.playing`.
+    in property <bool> playing: false;
     in property <bool> show-album: true;
     in property <bool> show-format: false;
     callback activated(int);
-    property <int> selected-index: -1;
+    // See `TrackTable.selected-key`: the selection is a track key, so it survives replaced rows.
+    in property <string> selected-key: "";
+    callback selected(string);
     spacing: 0px;
 
     TrackTableHeader { show-album: root.show-album; show-format: root.show-format; }
@@ -544,12 +850,13 @@ export component VirtualizedTrackTable inherits VerticalLayout {
         for row[i] in root.rows: TrackRow {
             data: row;
             index: i;
-            selected: root.selected-index == i;
+            selected: root.selected-key != "" && row.key == root.selected-key;
             is-playing: root.now-playing-key != "" && row.key == root.now-playing-key;
+            playing: root.playing;
             show-album: root.show-album;
             show-format: root.show-format;
-            clicked(index) => { root.selected-index = index; }
-            activated(index) => { root.selected-index = index; root.activated(index); }
+            clicked => { root.selected(row.key); }
+            activated(index) => { root.selected(row.key); root.activated(index); }
         }
     }
 }
