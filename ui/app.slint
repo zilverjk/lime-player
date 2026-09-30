@@ -86,6 +86,10 @@ component TopBar inherits Rectangle {
     callback open-files();
     callback open-folder();
     callback search-edited(string);
+    // The user is done typing (Esc or Return in the search field): whoever owns the keyboard focus
+    // takes it back, so Space toggles playback again instead of typing into the field
+    // (`CLAUDE.md` "Media controls" -> "Spacebar").
+    callback search-dismissed();
     callback window-drag-requested();
     callback window-zoom-requested();
     // Same background as the content area below it (`§6` layout pass): the top bar is no longer
@@ -181,6 +185,7 @@ component TopBar inherits Rectangle {
                     height: 100%;
                     vertical-alignment: center;
                     edited => { root.search-edited(self.text); }
+                    accepted => { root.search-dismissed(); }
                     // Esc clears the query (`§3.4` "Search"), same as the pill's own "x" button
                     // below: `self.text` and `root.search-edited` both need to be told directly —
                     // assigning `self.text` alone updates the two-way-bound `root.search-query` but
@@ -190,6 +195,7 @@ component TopBar inherits Rectangle {
                         if (event.text == Key.Escape) {
                             self.text = "";
                             root.search-edited("");
+                            root.search-dismissed();
                             return accept;
                         }
                         return reject;
@@ -508,6 +514,9 @@ component NowPlayingPanel inherits Rectangle {
     // routing (`Stopped`/`Inactive`/a failed start or seek) — unlike `output-name`, which also
     // updates from the ComboBox selection alone, before anything necessarily plays there (`§6`).
     in property <string> active-output-name: "";
+    // Whether the Output `ComboBox` holds the keyboard, so `MainWindow` can take it back before this
+    // panel is hidden (`MainWindow.panel-shown`).
+    out property <bool> output-focused: output-combo.has-focus;
     callback output-chosen(int);
     callback hog-mode-changed(bool);
     background: Theme.bg-panel;
@@ -599,7 +608,7 @@ component NowPlayingPanel inherits Rectangle {
 
             Rectangle { height: 1px; width: 100%; background: Theme.divider; }
             SectionLabel { text: "Output"; }
-            ComboBox {
+            output-combo := ComboBox {
                 height: 30px;
                 width: 100%;
                 model: root.output-device-options;
@@ -688,7 +697,12 @@ component QueueView inherits Rectangle {
     // both the section header count and the "...and N more" row below.
     in property <int> queue-count: 0;
     in property <string> now-playing-key: "";
+    in property <bool> playing: false;
+    in property <string> selected-key: "";
     callback track-activated(int);
+    // A click on a row of either table: the single "Now Playing" row (its own table) or an "Up Next"
+    // row. Reports the row's `TrackRowData.key`.
+    callback selected(string);
     background: Theme.bg-content;
 
     ScrollView {
@@ -710,7 +724,14 @@ component QueueView inherits Rectangle {
             Text { text: "Queue"; font-size: Theme.fs-hero; font-weight: 700; color: Theme.text-primary; }
 
             if root.has-queue-current: Text { text: "Now Playing"; font-size: Theme.fs-label; font-weight: 600; color: Theme.text-tertiary; }
-            if root.has-queue-current: TrackTable { rows: [root.queue-current]; now-playing-key: root.now-playing-key; show-format: true; }
+            if root.has-queue-current: TrackTable {
+                rows: [root.queue-current];
+                now-playing-key: root.now-playing-key;
+                playing: root.playing;
+                show-format: true;
+                selected-key: root.selected-key;
+                selected(k) => { root.selected(k); }
+            }
 
             Text {
                 text: root.queue-count > 0 ? "Up Next · " + root.queue-count : "Up Next";
@@ -726,8 +747,11 @@ component QueueView inherits Rectangle {
             if root.queue-rows.length > 0: TrackTable {
                 rows: root.queue-rows;
                 now-playing-key: root.now-playing-key;
+                playing: root.playing;
                 show-format: true;
+                selected-key: root.selected-key;
                 activated(i) => { root.track-activated(i); }
+                selected(k) => { root.selected(k); }
             }
             // `queue-rows` is capped (`QUEUE_UP_NEXT_LIMIT`) so a huge queue never instantiates one
             // `TrackRow` per track; `queue-count` is the worker's true, uncapped total.
@@ -779,6 +803,7 @@ component HomeView inherits Rectangle {
     in property <[AlbumCardData]> recent-albums;
     in property <string> search-query: "";
     callback album-opened(string);
+    callback remove-requested(string);
     callback shuffle-all();
     callback show-all-albums();
     background: Theme.bg-content;
@@ -805,7 +830,7 @@ component HomeView inherits Rectangle {
             if root.jump-back-albums.length > 0: VerticalLayout {
                 spacing: 12px;
                 Text { text: "Jump back in"; font-size: Theme.fs-section; font-weight: 700; color: Theme.text-primary; }
-                AlbumGrid { albums: root.jump-back-albums; max-rows: 1; opened(key) => { root.album-opened(key); } }
+                AlbumGrid { albums: root.jump-back-albums; max-rows: 1; opened(key) => { root.album-opened(key); } remove-requested(key) => { root.remove-requested(key); } }
             }
 
             // Guarded the same way as "Jump back in" above (`§6` Stage 6 fix): both shelves are
@@ -824,7 +849,7 @@ component HomeView inherits Rectangle {
                         TouchArea { clicked => { root.show-all-albums(); } }
                     }
                 }
-                AlbumGrid { albums: root.recent-albums; max-rows: 2; opened(key) => { root.album-opened(key); } }
+                AlbumGrid { albums: root.recent-albums; max-rows: 2; opened(key) => { root.album-opened(key); } remove-requested(key) => { root.remove-requested(key); } }
             }
 
             if root.jump-back-albums.length == 0 && root.recent-albums.length == 0 && root.search-query != "": EmptyState {
@@ -842,6 +867,10 @@ component AlbumsView inherits Rectangle {
     in property <string> artist-filter: "";
     in property <string> search-query: "";
     callback opened(string);
+    callback remove-requested(string);
+    // Snapshot-harness-only knob, forwarded straight to `AlbumGrid` below (see
+    // `AlbumGrid.force-menu-open-index`).
+    in property <int> force-menu-open-index: -1;
     background: Theme.bg-content;
     ScrollView {
         vertical-scrollbar-policy: as-needed;
@@ -869,7 +898,12 @@ component AlbumsView inherits Rectangle {
                         ? "No albums by " + root.artist-filter + "."
                         : "Nothing matches \u{201c}" + root.search-query + "\u{201d}.";
             }
-            if root.albums.length > 0: AlbumGrid { albums: root.albums; opened(key) => { root.opened(key); } }
+            if root.albums.length > 0: AlbumGrid {
+                albums: root.albums;
+                force-menu-open-index: root.force-menu-open-index;
+                opened(key) => { root.opened(key); }
+                remove-requested(key) => { root.remove-requested(key); }
+            }
         }
     }
 }
@@ -917,13 +951,17 @@ component SearchResultsView inherits Rectangle {
     in property <[TrackRowData]> songs: [];
     in property <string> songs-header: "";
     in property <string> now-playing-key: "";
+    in property <bool> playing: false;
     in property <[AlbumCardData]> albums: [];
     in property <string> albums-header: "";
     in property <[ArtistRowData]> artists: [];
     in property <string> artists-header: "";
     in property <bool> has-results: false;
+    in property <string> selected-key: "";
     callback activated(int);
+    callback selected(string);
     callback album-opened(string);
+    callback remove-requested(string);
     callback artist-opened(string);
     background: Theme.bg-content;
     ScrollView {
@@ -941,12 +979,12 @@ component SearchResultsView inherits Rectangle {
             if root.songs.length > 0: VerticalLayout {
                 spacing: 12px;
                 Text { text: root.songs-header; font-size: Theme.fs-section; font-weight: 700; color: Theme.text-primary; }
-                TrackTable { rows: root.songs; now-playing-key: root.now-playing-key; show-format: true; activated(i) => { root.activated(i); } }
+                TrackTable { rows: root.songs; now-playing-key: root.now-playing-key; playing: root.playing; show-format: true; selected-key: root.selected-key; activated(i) => { root.activated(i); } selected(k) => { root.selected(k); } }
             }
             if root.albums.length > 0: VerticalLayout {
                 spacing: 12px;
                 Text { text: root.albums-header; font-size: Theme.fs-section; font-weight: 700; color: Theme.text-primary; }
-                AlbumGrid { albums: root.albums; opened(key) => { root.album-opened(key); } }
+                AlbumGrid { albums: root.albums; opened(key) => { root.album-opened(key); } remove-requested(key) => { root.remove-requested(key); } }
             }
             if root.artists.length > 0: VerticalLayout {
                 spacing: 12px;
@@ -968,8 +1006,11 @@ component TrackListPage inherits Rectangle {
     in property <string> summary;
     in property <[TrackRowData]> rows;
     in property <string> now-playing-key: "";
+    in property <bool> playing: false;
     in property <string> search-query: "";
+    in property <string> selected-key: "";
     callback activated(int);
+    callback selected(string);
     background: Theme.bg-content;
     VerticalLayout {
         // Explicit, not inherited from a single-layout-child default: `VirtualizedTrackTable`'s own
@@ -994,8 +1035,11 @@ component TrackListPage inherits Rectangle {
             min-height: 0px;
             rows: root.rows;
             now-playing-key: root.now-playing-key;
+            playing: root.playing;
             show-format: true;
+            selected-key: root.selected-key;
             activated(i) => { root.activated(i); }
+            selected(k) => { root.selected(k); }
         }
     }
 }
@@ -1007,9 +1051,12 @@ component AlbumDetailView inherits Rectangle {
     in property <AlbumHeaderData> header;
     in property <[TrackRowData]> tracks;
     in property <string> now-playing-key: "";
+    in property <bool> playing: false;
+    in property <string> selected-key: "";
     callback artist-opened(string);
     callback action(AlbumAction);
     callback activated(int);
+    callback selected(string);
     background: Theme.bg-content;
     ScrollView {
         vertical-scrollbar-policy: as-needed;
@@ -1081,9 +1128,12 @@ component AlbumDetailView inherits Rectangle {
                 TrackTable {
                     rows: root.tracks;
                     now-playing-key: root.now-playing-key;
+                    playing: root.playing;
                     show-album: true;
                     show-format: false;
+                    selected-key: root.selected-key;
                     activated(i) => { root.activated(i); }
+                    selected(k) => { root.selected(k); }
                 }
             }
         }
@@ -1099,6 +1149,9 @@ export component MainWindow inherits Window {
     min-height: 700px;
     background: Theme.bg-content;
     default-font-size: Theme.fs-body;
+    // Nothing has keyboard focus when the window opens, and a key event only ever reaches the focus
+    // item's ancestors, so without this Space would go nowhere until the search field was clicked.
+    forward-focus: key-root;
 
     // This UI is dark-only; the one `std-widgets` control it uses (`ComboBox`) otherwise follows
     // `prefers-color-scheme` and renders in the light Fluent palette on a Light-appearance system,
@@ -1139,6 +1192,10 @@ export component MainWindow inherits Window {
     in property <string> recent-summary: "";
     in property <AlbumHeaderData> album-header;
     in property <string> artist-filter: "";
+    // Offscreen-snapshot-harness-only (`src/ui_snapshot.rs`): forces the Albums grid's card at this
+    // index to render with its "more" popup open, so a reviewer can see the popup's anchored
+    // position. `-1` (the default `main.rs` always leaves it at) forces none.
+    in property <int> debug-force-album-menu-open-index: -1;
 
     // The dedicated Search view's own data (`§3.4` "Search"): Songs/Albums are already capped, and
     // each section's header string already carries its count (or a "Showing first N of M" note
@@ -1197,6 +1254,14 @@ export component MainWindow inherits Window {
     in property <bool> volume-available: false;
     in-out property <string> volume-detail: "";
 
+    // The row the user last clicked in any track table, as its `TrackRowData.key` ("" = none), so
+    // Space can play it when nothing is loaded. A key, not a position: the tables' rows are replaced
+    // by every library re-projection, and the key still names the same track wherever it sits now
+    // (or none at all once it left the list). Every table highlights `row.key == selected-track-key`;
+    // `main.rs` resolves it to a row only when Space is pressed, and clears it on navigation and
+    // search-query changes.
+    in-out property <string> selected-track-key: "";
+
     // Layout.
     in-out property <bool> right-panel-visible: true;
     private property <bool> panel-shown: root.right-panel-visible && root.width >= Theme.panel-threshold;
@@ -1219,9 +1284,12 @@ export component MainWindow inherits Window {
     callback search-edited(string);
     callback album-opened(string);
     callback artist-opened(string);
+    callback remove-album-requested(string);
     callback album-action(string, AlbumAction);
     callback shuffle-all();
     callback track-activated(TrackListKind, int);
+    // Space, from the window-wide `key-root` scope (plain, not a key repeat, no Control/Meta/Alt).
+    callback space-pressed();
     callback play-pause-requested();
     callback next-track-requested();
     callback previous-track-requested();
@@ -1233,211 +1301,297 @@ export component MainWindow inherits Window {
     callback window-drag-requested();
     callback window-zoom-requested();
 
-    VerticalLayout {
-        spacing: 0px;
+    // Hands the keyboard back to `key-root`. The search field keeps focus after a click anywhere
+    // else (Slint never clears focus on an outside click, and the app's own buttons and rows are
+    // `TouchArea`s that never take it), so every handler below that the user reaches by clicking
+    // something other than the search field calls this; otherwise Space would keep typing into the
+    // search box. The field itself is never cleared with `clear-focus()`: that would leave no focus
+    // item at all, and Space would then reach nobody.
+    function release-search-focus() {
+        key-root.focus();
+    }
 
-        HorizontalLayout {
-            vertical-stretch: 1;
-            min-height: 0px;
+    // Clicking an Output `ComboBox` gives it the keyboard, and closing its dropdown hands the focus back
+    // to it AFTER `selected` has fired, so `output-chosen` cannot release it inline: this waits a
+    // moment for the dropdown to finish closing, then gives the keyboard to `key-root`. A `ComboBox`
+    // that keeps it is a trap: Slint drops the focus item of a key press when that item is no longer
+    // visible (the details panel hidden or scrolled away, the output popup closed), and the Space
+    // then reaches nobody, not even `key-root`, until something else takes the focus.
+    focus-handback := Timer {
+        interval: 50ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            root.release-search-focus();
+        }
+    }
+    function hand-focus-back-soon() {
+        focus-handback.running = true;
+    }
 
-            Sidebar {
-                width: Theme.sidebar-w;
-                nav-view: root.nav-view;
-                unified-title-bar: root.unified-title-bar;
-                selected(v) => { root.nav-selected(v); }
-                window-drag-requested => { root.window-drag-requested(); }
+    // Hiding the details panel (its toggle, or a window narrower than `Theme.panel-threshold`) makes
+    // the panel's Output `ComboBox` invisible, and an invisible focus item loses the Space the same
+    // way. Only when that `ComboBox` is the one holding the keyboard: releasing unconditionally would
+    // also pull it out of the search field the user is typing in.
+    changed panel-shown => {
+        if (!root.panel-shown && now-playing-panel.output-focused) {
+            root.release-search-focus();
+        }
+    }
+
+    // A click on a track row (any table): the row is the selection, and the keyboard goes back from
+    // the search field. Tables report only real clicks (there is no "created with nothing selected"
+    // report any more: the key lives here, not in the table), so a table appearing while the user types
+    // a query cannot take the focus.
+    function row-selected(key: string) {
+        root.release-search-focus();
+        root.selected-track-key = key;
+    }
+
+    // The window-wide keyboard scope (`CLAUDE.md` "Media controls" -> "Spacebar"). It wraps the whole
+    // layout, as an ancestor of everything focusable, so a Space that a visible focused control does
+    // not consume (a `ComboBox`, a `FocusScope` of its own) still bubbles up to it. That holds only
+    // while the focus item is visible and not inside a popup: Slint drops an invisible focus item at
+    // the key press, and key bubbling stops at a popup's edge, which is why the Output `ComboBox`es
+    // never keep the keyboard (`hand-focus-back-soon`, `changed panel-shown`). Space is handled in
+    // the bubbling `key-pressed`, never `capture-key-pressed`: a capture handler runs before the
+    // focused search field and would steal the spaces typed into it.
+    key-root := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == Key.Space && !event.repeat && !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt) {
+                root.space-pressed();
+                return accept;
             }
+            return reject;
+        }
+        VerticalLayout {
+            spacing: 0px;
 
-            // Plain geometry (`x`/`width`), not a `HorizontalLayout`, for the same reason as
-            // before (`§6` Stage 5 fix, carried into the layout pass below): `panel-shown` reads
-            // `root.width`, so a *layout* child whose width depends on `panel-shown` would feed
-            // this row's own preferred width back into `root`'s, and from there into
-            // `root.width` itself — a binding loop Slint 1.18 flags (and may panic on). Manual
-            // geometry never asks for a preferred size from its children, so it can't join that
-            // cycle. This row now holds the middle column (top bar + content, stacked) and the
-            // right panel side by side, both spanning its full height: the panel used to sit only
-            // below the top bar, but it must now run the whole height of the window down to the
-            // player bar, level with the top bar rather than starting under it (`§6` layout
-            // pass).
-            Rectangle {
-                horizontal-stretch: 1;
+            HorizontalLayout {
                 vertical-stretch: 1;
                 min-height: 0px;
 
-                middle-column := VerticalLayout {
-                    x: 0;
-                    y: 0;
-                    width: parent.width - (root.panel-shown ? Theme.panel-w : 0px);
-                    height: 100%;
-
-                    TopBar {
-                        height: Theme.topbar-h;
-                        can-go-back: root.can-go-back;
-                        unified-title-bar: root.unified-title-bar;
-                        search-query <=> root.search-query;
-                        back-requested => { root.back-requested(); }
-                        open-files => { root.open-files(); }
-                        open-folder => { root.open-folder(); }
-                        search-edited(q) => { root.search-edited(q); }
-                        window-drag-requested => { root.window-drag-requested(); }
-                        window-zoom-requested => { root.window-zoom-requested(); }
-                    }
-
-                    content-area := Rectangle {
-                        vertical-stretch: 1;
-                        min-height: 0px;
-                        background: Theme.bg-content;
-
-                        // `search-active` takes priority over every other branch below, including
-                        // the empty-library one: typing a query is what the user asked for right
-                        // now, so it always wins the middle content regardless of which `view` or
-                        // library state is underneath it (`§3.4` "Search"). Every other branch is
-                        // guarded with `!root.search-active` in turn, so exactly one ever renders —
-                        // and since none of them ever changes `view`/`nav-view` themselves, clearing
-                        // the search (Esc, the pill's "x", or editing back to empty) lands back on
-                        // whichever one was already current with no separate "previous view" state
-                        // to restore.
-                        if root.is-library-view && root.library-empty && !root.search-active: LibraryEmptyState {
-                            open-files => { root.open-files(); }
-                        }
-                        if root.search-active: SearchResultsView {
-                            search-query: root.search-query;
-                            songs: root.search-songs;
-                            songs-header: root.search-songs-header;
-                            now-playing-key: root.now-playing-key;
-                            albums: root.search-albums;
-                            albums-header: root.search-albums-header;
-                            artists: root.artists;
-                            artists-header: root.search-artists-header;
-                            has-results: root.search-has-results;
-                            activated(i) => { root.track-activated(TrackListKind.search, i); }
-                            album-opened(key) => { root.album-opened(key); }
-                            artist-opened(name) => { root.artist-opened(name); }
-                        }
-                        if !root.search-active && root.view == View.home && !root.library-empty: HomeView {
-                            jump-back-albums: root.jump-back-albums;
-                            recent-albums: root.recent-albums;
-                            search-query: root.search-query;
-                            album-opened(key) => { root.album-opened(key); }
-                            shuffle-all => { root.shuffle-all(); }
-                            show-all-albums => { root.nav-selected(View.albums); }
-                        }
-                        if !root.search-active && root.view == View.albums && !root.library-empty: AlbumsView {
-                            albums: root.albums;
-                            artist-filter: root.artist-filter;
-                            search-query: root.search-query;
-                            opened(key) => { root.album-opened(key); }
-                        }
-                        if !root.search-active && root.view == View.artists && !root.library-empty: ArtistsView {
-                            artists: root.artists;
-                            search-query: root.search-query;
-                            opened(name) => { root.artist-opened(name); }
-                        }
-                        if !root.search-active && root.view == View.songs && !root.library-empty: TrackListPage {
-                            hero: "Songs";
-                            summary: root.songs-summary;
-                            rows: root.songs;
-                            now-playing-key: root.now-playing-key;
-                            search-query: root.search-query;
-                            activated(i) => { root.track-activated(TrackListKind.songs, i); }
-                        }
-                        if !root.search-active && root.view == View.recently-added && !root.library-empty: TrackListPage {
-                            hero: "Recently Added";
-                            summary: root.recent-summary;
-                            rows: root.recent-songs;
-                            now-playing-key: root.now-playing-key;
-                            search-query: root.search-query;
-                            activated(i) => { root.track-activated(TrackListKind.recently-added, i); }
-                        }
-                        if !root.search-active && root.view == View.album-detail: AlbumDetailView {
-                            header: root.album-header;
-                            tracks: root.album-tracks;
-                            now-playing-key: root.now-playing-key;
-                            artist-opened(name) => { root.artist-opened(name); }
-                            action(action) => { root.album-action(root.album-header.key, action); }
-                            activated(i) => { root.track-activated(TrackListKind.album, i); }
-                        }
-                        if !root.search-active && root.view == View.queue: QueueView {
-                            queue-current: root.queue-current;
-                            has-queue-current: root.has-queue-current;
-                            queue-rows: root.queue-rows;
-                            queue-count: root.queue-count;
-                            now-playing-key: root.now-playing-key;
-                            track-activated(i) => { root.track-activated(TrackListKind.queue, i); }
-                        }
-                        if !root.search-active && !root.is-library-view && root.view != View.queue && root.view != View.album-detail: UnavailableView {
-                            icon: root.unavailable-icon;
-                            title: root.unavailable-title;
-                        }
-                    }
+                Sidebar {
+                    width: Theme.sidebar-w;
+                    nav-view: root.nav-view;
+                    unified-title-bar: root.unified-title-bar;
+                    selected(v) => { root.release-search-focus(); root.nav-selected(v); }
+                    window-drag-requested => { root.window-drag-requested(); }
                 }
 
-                NowPlayingPanel {
-                    x: middle-column.width;
-                    y: 0;
-                    width: root.panel-shown ? Theme.panel-w : 0px;
-                    height: 100%;
-                    visible: root.panel-shown;
-                    unified-title-bar: root.unified-title-bar;
-                    now-playing-key: root.now-playing-key;
-                    now-playing-title: root.now-playing-title;
-                    now-playing-artist: root.now-playing-artist;
-                    now-playing-album: root.now-playing-album;
-                    now-playing-year: root.now-playing-year;
-                    now-playing-genre: root.now-playing-genre;
-                    now-playing-badge: root.now-playing-badge;
-                    now-playing-art: root.now-playing-art;
-                    now-playing-has-art: root.now-playing-has-art;
-                    format-line: root.format-line;
-                    file-size-line: root.file-size-line;
-                    lyrics: root.lyrics;
-                    has-lyrics: root.has-lyrics;
-                    output-device-options <=> root.output-device-options;
-                    selected-output-index <=> root.selected-output-index;
-                    hog-mode-enabled <=> root.hog-mode-enabled;
-                    volume-detail: root.volume-detail;
-                    volume-available: root.volume-available;
-                    playback-status: root.playback-status;
-                    output-name: root.output-name;
-                    active-output-name: root.active-output-name;
-                    output-chosen(index) => { root.output-chosen(index); }
-                    hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
+                // Plain geometry (`x`/`width`), not a `HorizontalLayout`, for the same reason as
+                // before (`§6` Stage 5 fix, carried into the layout pass below): `panel-shown` reads
+                // `root.width`, so a *layout* child whose width depends on `panel-shown` would feed
+                // this row's own preferred width back into `root`'s, and from there into
+                // `root.width` itself — a binding loop Slint 1.18 flags (and may panic on). Manual
+                // geometry never asks for a preferred size from its children, so it can't join that
+                // cycle. This row now holds the middle column (top bar + content, stacked) and the
+                // right panel side by side, both spanning its full height: the panel used to sit only
+                // below the top bar, but it must now run the whole height of the window down to the
+                // player bar, level with the top bar rather than starting under it (`§6` layout
+                // pass).
+                Rectangle {
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    min-height: 0px;
+
+                    middle-column := VerticalLayout {
+                        x: 0;
+                        y: 0;
+                        width: parent.width - (root.panel-shown ? Theme.panel-w : 0px);
+                        height: 100%;
+
+                        TopBar {
+                            height: Theme.topbar-h;
+                            can-go-back: root.can-go-back;
+                            unified-title-bar: root.unified-title-bar;
+                            search-query <=> root.search-query;
+                            back-requested => { root.release-search-focus(); root.back-requested(); }
+                            open-files => { root.release-search-focus(); root.open-files(); }
+                            open-folder => { root.release-search-focus(); root.open-folder(); }
+                            search-edited(q) => { root.search-edited(q); }
+                            search-dismissed => { root.release-search-focus(); }
+                            window-drag-requested => { root.window-drag-requested(); }
+                            window-zoom-requested => { root.window-zoom-requested(); }
+                        }
+
+                        content-area := Rectangle {
+                            vertical-stretch: 1;
+                            min-height: 0px;
+                            background: Theme.bg-content;
+
+                            // `search-active` takes priority over every other branch below, including
+                            // the empty-library one: typing a query is what the user asked for right
+                            // now, so it always wins the middle content regardless of which `view` or
+                            // library state is underneath it (`§3.4` "Search"). Every other branch is
+                            // guarded with `!root.search-active` in turn, so exactly one ever renders —
+                            // and since none of them ever changes `view`/`nav-view` themselves, clearing
+                            // the search (Esc, the pill's "x", or editing back to empty) lands back on
+                            // whichever one was already current with no separate "previous view" state
+                            // to restore.
+                            if root.is-library-view && root.library-empty && !root.search-active: LibraryEmptyState {
+                                open-files => { root.release-search-focus(); root.open-files(); }
+                            }
+                            if root.search-active: SearchResultsView {
+                                search-query: root.search-query;
+                                songs: root.search-songs;
+                                songs-header: root.search-songs-header;
+                                now-playing-key: root.now-playing-key;
+                                playing: root.is-playing;
+                                albums: root.search-albums;
+                                albums-header: root.search-albums-header;
+                                artists: root.artists;
+                                artists-header: root.search-artists-header;
+                                has-results: root.search-has-results;
+                                selected-key: root.selected-track-key;
+                                activated(i) => { root.track-activated(TrackListKind.search, i); }
+                                selected(k) => { root.row-selected(k); }
+                                album-opened(key) => { root.release-search-focus(); root.album-opened(key); }
+                                remove-requested(key) => { root.release-search-focus(); root.remove-album-requested(key); }
+                                artist-opened(name) => { root.release-search-focus(); root.artist-opened(name); }
+                            }
+                            if !root.search-active && root.view == View.home && !root.library-empty: HomeView {
+                                jump-back-albums: root.jump-back-albums;
+                                recent-albums: root.recent-albums;
+                                search-query: root.search-query;
+                                album-opened(key) => { root.release-search-focus(); root.album-opened(key); }
+                                remove-requested(key) => { root.release-search-focus(); root.remove-album-requested(key); }
+                                shuffle-all => { root.release-search-focus(); root.shuffle-all(); }
+                                show-all-albums => { root.release-search-focus(); root.nav-selected(View.albums); }
+                            }
+                            if !root.search-active && root.view == View.albums && !root.library-empty: AlbumsView {
+                                albums: root.albums;
+                                artist-filter: root.artist-filter;
+                                search-query: root.search-query;
+                                force-menu-open-index: root.debug-force-album-menu-open-index;
+                                opened(key) => { root.release-search-focus(); root.album-opened(key); }
+                                remove-requested(key) => { root.release-search-focus(); root.remove-album-requested(key); }
+                            }
+                            if !root.search-active && root.view == View.artists && !root.library-empty: ArtistsView {
+                                artists: root.artists;
+                                search-query: root.search-query;
+                                opened(name) => { root.release-search-focus(); root.artist-opened(name); }
+                            }
+                            if !root.search-active && root.view == View.songs && !root.library-empty: TrackListPage {
+                                hero: "Songs";
+                                summary: root.songs-summary;
+                                rows: root.songs;
+                                now-playing-key: root.now-playing-key;
+                                playing: root.is-playing;
+                                search-query: root.search-query;
+                                selected-key: root.selected-track-key;
+                                activated(i) => { root.track-activated(TrackListKind.songs, i); }
+                                selected(k) => { root.row-selected(k); }
+                            }
+                            if !root.search-active && root.view == View.recently-added && !root.library-empty: TrackListPage {
+                                hero: "Recently Added";
+                                summary: root.recent-summary;
+                                rows: root.recent-songs;
+                                now-playing-key: root.now-playing-key;
+                                playing: root.is-playing;
+                                search-query: root.search-query;
+                                selected-key: root.selected-track-key;
+                                activated(i) => { root.track-activated(TrackListKind.recently-added, i); }
+                                selected(k) => { root.row-selected(k); }
+                            }
+                            if !root.search-active && root.view == View.album-detail: AlbumDetailView {
+                                header: root.album-header;
+                                tracks: root.album-tracks;
+                                now-playing-key: root.now-playing-key;
+                                playing: root.is-playing;
+                                selected-key: root.selected-track-key;
+                                artist-opened(name) => { root.release-search-focus(); root.artist-opened(name); }
+                                action(action) => { root.release-search-focus(); root.album-action(root.album-header.key, action); }
+                                activated(i) => { root.track-activated(TrackListKind.album, i); }
+                                selected(k) => { root.row-selected(k); }
+                            }
+                            if !root.search-active && root.view == View.queue: QueueView {
+                                queue-current: root.queue-current;
+                                has-queue-current: root.has-queue-current;
+                                queue-rows: root.queue-rows;
+                                queue-count: root.queue-count;
+                                now-playing-key: root.now-playing-key;
+                                playing: root.is-playing;
+                                selected-key: root.selected-track-key;
+                                track-activated(i) => { root.track-activated(TrackListKind.queue, i); }
+                                selected(k) => { root.row-selected(k); }
+                            }
+                            if !root.search-active && !root.is-library-view && root.view != View.queue && root.view != View.album-detail: UnavailableView {
+                                icon: root.unavailable-icon;
+                                title: root.unavailable-title;
+                            }
+                        }
+                    }
+
+                    now-playing-panel := NowPlayingPanel {
+                        x: middle-column.width;
+                        y: 0;
+                        width: root.panel-shown ? Theme.panel-w : 0px;
+                        height: 100%;
+                        visible: root.panel-shown;
+                        unified-title-bar: root.unified-title-bar;
+                        now-playing-key: root.now-playing-key;
+                        now-playing-title: root.now-playing-title;
+                        now-playing-artist: root.now-playing-artist;
+                        now-playing-album: root.now-playing-album;
+                        now-playing-year: root.now-playing-year;
+                        now-playing-genre: root.now-playing-genre;
+                        now-playing-badge: root.now-playing-badge;
+                        now-playing-art: root.now-playing-art;
+                        now-playing-has-art: root.now-playing-has-art;
+                        format-line: root.format-line;
+                        file-size-line: root.file-size-line;
+                        lyrics: root.lyrics;
+                        has-lyrics: root.has-lyrics;
+                        output-device-options <=> root.output-device-options;
+                        selected-output-index <=> root.selected-output-index;
+                        hog-mode-enabled <=> root.hog-mode-enabled;
+                        volume-detail: root.volume-detail;
+                        volume-available: root.volume-available;
+                        playback-status: root.playback-status;
+                        output-name: root.output-name;
+                        active-output-name: root.active-output-name;
+                        output-chosen(index) => { root.output-chosen(index); root.hand-focus-back-soon(); }
+                        hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
+                    }
                 }
             }
-        }
 
-        PlayerBar {
-            is-playing: root.is-playing;
-            now-playing-title: root.now-playing-title;
-            now-playing-artist: root.now-playing-artist;
-            now-playing-badge: root.now-playing-badge;
-            now-playing-art: root.now-playing-art;
-            now-playing-has-art: root.now-playing-has-art;
-            queue-count: root.queue-count;
-            playback-elapsed: root.playback-elapsed;
-            playback-duration: root.playback-duration;
-            playback-progress: root.playback-progress;
-            can-seek: root.can-seek;
-            duration-ms: root.duration-ms;
-            volume-level <=> root.volume-level;
-            volume-available: root.volume-available;
-            volume-detail: root.volume-detail;
-            right-panel-visible <=> root.right-panel-visible;
-            panel-shown: root.panel-shown;
-            panel-toggle-enabled: root.width >= Theme.panel-threshold;
-            playback-status: root.playback-status;
-            output-device-options <=> root.output-device-options;
-            selected-output-index <=> root.selected-output-index;
-            hog-mode-enabled <=> root.hog-mode-enabled;
-            play-pause-requested => { root.play-pause-requested(); }
-            previous-track-requested => { root.previous-track-requested(); }
-            next-track-requested => { root.next-track-requested(); }
-            seek-requested(f) => { root.seek-requested(f); }
-            volume-requested(v, is-final) => { root.volume-requested(v, is-final); }
-            now-playing-album-requested => { root.now-playing-album-requested(); }
-            queue-opened => { root.nav-selected(View.queue); }
-            output-chosen(index) => { root.output-chosen(index); }
-            hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
+            PlayerBar {
+                is-playing: root.is-playing;
+                now-playing-title: root.now-playing-title;
+                now-playing-artist: root.now-playing-artist;
+                now-playing-badge: root.now-playing-badge;
+                now-playing-art: root.now-playing-art;
+                now-playing-has-art: root.now-playing-has-art;
+                queue-count: root.queue-count;
+                playback-elapsed: root.playback-elapsed;
+                playback-duration: root.playback-duration;
+                playback-progress: root.playback-progress;
+                can-seek: root.can-seek;
+                duration-ms: root.duration-ms;
+                volume-level <=> root.volume-level;
+                volume-available: root.volume-available;
+                volume-detail: root.volume-detail;
+                right-panel-visible <=> root.right-panel-visible;
+                panel-shown: root.panel-shown;
+                panel-toggle-enabled: root.width >= Theme.panel-threshold;
+                playback-status: root.playback-status;
+                output-device-options <=> root.output-device-options;
+                selected-output-index <=> root.selected-output-index;
+                hog-mode-enabled <=> root.hog-mode-enabled;
+                play-pause-requested => { root.release-search-focus(); root.play-pause-requested(); }
+                previous-track-requested => { root.release-search-focus(); root.previous-track-requested(); }
+                next-track-requested => { root.release-search-focus(); root.next-track-requested(); }
+                seek-requested(f) => { root.release-search-focus(); root.seek-requested(f); }
+                volume-requested(v, is-final) => { root.release-search-focus(); root.volume-requested(v, is-final); }
+                now-playing-album-requested => { root.release-search-focus(); root.now-playing-album-requested(); }
+                queue-opened => { root.release-search-focus(); root.nav-selected(View.queue); }
+                output-chosen(index) => { root.output-chosen(index); root.hand-focus-back-soon(); }
+                hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
+            }
         }
     }
 }

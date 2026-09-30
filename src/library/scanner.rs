@@ -3,7 +3,7 @@
 //! for that (`§3.3`, `§6` Stage 3 "worker stops probing").
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,11 +12,13 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
+use crate::audio::rate_repair::needs_rate_repair;
 use crate::audio::{self, AudioInfo, EmbeddedPicture, PreparedTrack, TrackTags};
 
 use super::cue::{CueSheet, CueTrack, ResolvedCueFile, cue_time_to_sample_frame, dedupe_cue_sheets, parse_cue, resolve_cue_files};
+use super::repair::{RateRepairConfig, RepairDone, RepairOutcome, RepairWorker};
 use super::walker::has_cue_extension;
-use super::{ArtworkPixels, ArtworkSource, TrackKey, TrackRecord, album_key, walker};
+use super::{ArtworkPixels, ArtworkSource, EffectiveAlbumArtist, TrackKey, TrackRecord, album_key, walker};
 
 /// Embedded artwork above this size was already dropped by `audio::metadata::read_metadata`
 /// (`§4.4`); folder art is capped again independently below.
@@ -74,6 +76,13 @@ pub enum LibraryEvent {
     /// files, before any of them enter the ordinary probe/tag pipeline above. `main.rs` uses
     /// `root` to build a "Scanning {root}: {found} tracks found" status line.
     FolderScanProgress { root: PathBuf, found: usize },
+    /// A FLAC at a non-standard sample rate was converted in place (`audio::rate_repair`). Its
+    /// original is kept at `backup`. The track's own `Probed` follows and carries the new rate.
+    RateRepaired { batch: u64, path: PathBuf, from_rate: u32, to_rate: u32, backup: PathBuf },
+    /// The repair was attempted but changed nothing (read-only volume, unsupported layout, failed
+    /// verification, ...). The track continues through the scan as it is on disk; `main.rs` prints
+    /// this as a developer diagnostic and, outside the quiet startup restore, a status line.
+    RateRepairFailed { batch: u64, path: PathBuf, error: String },
 }
 
 /// One `scan()`/`scan_folder()` request, tagged with a batch id assigned by the *caller*
@@ -95,6 +104,12 @@ struct ScanRequest {
     /// Every other batch kind keeps expanding every cue sheet found in a touched directory in
     /// full, since every file in that directory was already implicitly requested.
     explicit_selection: bool,
+    /// The tracks `main.rs` drops from this request's `Probed`/`Scanned` events because "Remove from
+    /// Library" excluded them (`LibrarySources::excluded_tracks`), as they were when the request was
+    /// dispatched. Phase 2 still reads their tags, but they never take part in artwork resolution
+    /// (`BatchArtwork`): a record that is thrown away must not suppress the picture of an included
+    /// sibling of the same album.
+    excluded: HashSet<TrackKey>,
 }
 
 pub struct LibraryScanner {
@@ -112,13 +127,26 @@ pub struct LibraryScanner {
 }
 
 impl LibraryScanner {
+    /// A scanner that never modifies a file.
     pub fn new() -> Self {
+        Self::spawn(None)
+    }
+
+    /// A scanner that also converts FLAC files at a non-standard sample rate to one output devices
+    /// accept, on its own `lime-rate-repair` thread (`audio::rate_repair`, `CLAUDE.md` "Sample-rate
+    /// repair"). Only what `Preferences::repair_nonstandard_sample_rates` allows should reach here.
+    pub fn with_rate_repair(config: RateRepairConfig) -> Self {
+        Self::spawn(Some(config))
+    }
+
+    fn spawn(rate_repair: Option<RateRepairConfig>) -> Self {
         let (request_tx, request_rx) = unbounded::<ScanRequest>();
         let (event_tx, event_rx) = unbounded::<LibraryEvent>();
         let scanner_event_tx = event_tx.clone();
+        let repair_worker = rate_repair.map(RepairWorker::spawn);
         thread::Builder::new()
             .name("lime-library-scanner".into())
-            .spawn(move || run(request_rx, scanner_event_tx))
+            .spawn(move || run_with_repair(request_rx, scanner_event_tx, repair_worker))
             .expect("could not start Lime Player library scanner");
         Self {
             requests: request_tx,
@@ -136,9 +164,12 @@ impl LibraryScanner {
     /// explicit pick (an "Open Files…" dialog selection) — never for the startup restore of
     /// previously-opened individual files/cue sheets, which behaves like every file in the
     /// relevant directory was already implicitly requested (`ScanRequest::explicit_selection`).
-    pub fn scan(&self, paths: Vec<PathBuf>, explicit_selection: bool) -> u64 {
+    ///
+    /// `excluded` is a snapshot of the tracks the caller will drop from this request's events
+    /// (`ScanRequest::excluded`); take it after lifting the exclusions an explicit re-open overrides.
+    pub fn scan(&self, paths: Vec<PathBuf>, explicit_selection: bool, excluded: HashSet<TrackKey>) -> u64 {
         let batch = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
-        let _ = self.requests.send(ScanRequest { batch, paths, explicit_selection });
+        let _ = self.requests.send(ScanRequest { batch, paths, explicit_selection, excluded });
         batch
     }
 
@@ -148,8 +179,9 @@ impl LibraryScanner {
     /// the same pipeline as `scan`. Returns the batch id immediately, before the walk has even
     /// started, for the same reason `scan` does. A `root` that cannot be read at all (e.g. an
     /// unmounted NAS share) still produces a `Failed`/`BatchDone { requested: 0 }` pair instead of
-    /// silently doing nothing.
-    pub fn scan_folder(&self, root: PathBuf) -> u64 {
+    /// silently doing nothing. `excluded` is the same snapshot `scan` takes, captured now rather than
+    /// when the walk finishes.
+    pub fn scan_folder(&self, root: PathBuf, excluded: HashSet<TrackKey>) -> u64 {
         let batch = self.next_batch_id.fetch_add(1, Ordering::Relaxed);
         let events = self.event_tx.clone();
         let requests = self.requests.clone();
@@ -181,7 +213,7 @@ impl LibraryScanner {
                 // A folder walk's own files are never an "explicit selection" (`CLAUDE.md` "Over-
                 // broad CUE claim on Open Files"): every file the walk found was already implicitly
                 // requested by opening the folder, so cue expansion stays full-directory.
-                let _ = requests.send(ScanRequest { batch, paths: files, explicit_selection: false });
+                let _ = requests.send(ScanRequest { batch, paths: files, explicit_selection: false, excluded });
             })
             .expect("could not start Lime Player folder walk thread");
         batch
@@ -208,8 +240,13 @@ impl Drop for LibraryScanner {
 struct BatchState {
     id: u64,
     requested: usize,
+    /// Items not finished yet: queued phase-2 work, plus (`RepairWorker`) tracks still waiting on
+    /// a sample-rate repair, which enter `phase2_queue` only once it reports.
     remaining: usize,
     scanned: usize,
+    /// Kept here so it lives exactly as long as the batch: it is dropped with the state when the
+    /// batch finishes, however that happens (`finish_item`).
+    artwork: BatchArtwork,
 }
 
 /// One item of phase-2 work: either an ordinary whole-file track (one `TrackRecord` from one
@@ -227,42 +264,108 @@ enum Phase2Item {
 /// artwork) work of an earlier one still in flight, so `Probed` and the queue enqueue for a later
 /// "Open Files…" happen promptly instead of waiting for a large first batch's whole phase 2 to
 /// finish over a slow NAS share (`§6`). Phase-2 items stay in a single FIFO queue tagged by which
-/// batch they belong to, so batches still complete — and `BatchDone` still fires — in arrival order.
+/// batch they belong to, so batches still complete — and `BatchDone` still fires — in arrival
+/// order, except that a batch waiting on a sample-rate repair finishes when that repair does.
+///
+/// This is the loop without the repair worker, which the tests drive directly; the app always
+/// starts `run_with_repair`.
+#[cfg(test)]
 fn run(requests: Receiver<ScanRequest>, events: Sender<LibraryEvent>) {
-    let mut folder_art_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
-    let mut albums_with_art: HashSet<String> = HashSet::new();
+    run_with_repair(requests, events, None);
+}
+
+/// `run`, optionally with the sample-rate repair worker (`LibraryScanner::with_rate_repair`).
+fn run_with_repair(requests: Receiver<ScanRequest>, events: Sender<LibraryEvent>, repair: Option<RepairWorker>) {
     // Phase-2 work not yet processed, across every request that has run phase 1 so far.
-    let mut phase2_queue: VecDeque<Phase2Item> = VecDeque::new();
-    // Batches still in flight, oldest first, matching the prefix grouping of `phase2_queue`.
+    let mut phase2_queue: VecDeque<(u64, Phase2Item)> = VecDeque::new();
+    // Batches still in flight, oldest first.
     let mut batches: VecDeque<BatchState> = VecDeque::new();
+    // Never fires when there is no repair worker (or once it is gone).
+    let mut repair_results = repair.as_ref().map_or_else(crossbeam_channel::never, RepairWorker::results);
 
     loop {
         if phase2_queue.is_empty() {
-            match requests.recv() {
-                Ok(request) => enqueue_batch(request, &events, &mut phase2_queue, &mut batches),
-                Err(_) => return,
+            crossbeam_channel::select! {
+                recv(requests) -> request => match request {
+                    Ok(request) => enqueue_batch(request, &events, repair.as_ref(), &mut phase2_queue, &mut batches),
+                    Err(_) => return,
+                },
+                recv(repair_results) -> done => match done {
+                    Ok(done) => resume_after_repair(done, &events, &mut phase2_queue, &mut batches),
+                    Err(_) => repair_results = crossbeam_channel::never(),
+                },
             }
             continue;
         }
         // Never blocks: picks up every request that arrived while phase 2 above was running, so
         // its `Probed` goes out immediately instead of after the older batch's whole phase 2.
         while let Ok(request) = requests.try_recv() {
-            enqueue_batch(request, &events, &mut phase2_queue, &mut batches);
+            enqueue_batch(request, &events, repair.as_ref(), &mut phase2_queue, &mut batches);
         }
-        let Some(item) = phase2_queue.pop_front() else { continue };
-        let Some(state) = batches.front_mut() else { continue };
-        let batch = state.id;
+        while let Ok(done) = repair_results.try_recv() {
+            resume_after_repair(done, &events, &mut phase2_queue, &mut batches);
+        }
+        let Some((batch, item)) = phase2_queue.pop_front() else { continue };
+        // A queued item keeps its own batch open, so the state is always found; the throwaway one
+        // only keeps this from having to assume that.
+        let mut unattached = BatchArtwork::default();
+        let artwork = batches.iter_mut().find(|state| state.id == batch).map_or(&mut unattached, |state| &mut state.artwork);
         let scanned = match item {
-            Phase2Item::WholeFile(track) => {
-                usize::from(scan_phase2_one(batch, track, &events, &mut folder_art_cache, &mut albums_with_art))
-            }
-            Phase2Item::CueFile(file) => scan_cue_phase2_one(batch, file, &events, &mut folder_art_cache),
+            Phase2Item::WholeFile(track) => usize::from(scan_phase2_one(batch, track, &events, artwork)),
+            Phase2Item::CueFile(file) => scan_cue_phase2_one(batch, file, &events, artwork),
         };
-        state.scanned += scanned;
-        state.remaining -= 1;
-        if state.remaining == 0 {
-            let state = batches.pop_front().expect("front just matched above");
-            let _ = events.send(LibraryEvent::BatchDone { batch: state.id, requested: state.requested, count: state.scanned });
+        finish_item(batch, scanned, &events, &mut batches);
+    }
+}
+
+/// Marks one item of `batch` finished (`scanned` tracks scanned successfully) and sends
+/// `BatchDone` once it has none left.
+fn finish_item(batch: u64, scanned: usize, events: &Sender<LibraryEvent>, batches: &mut VecDeque<BatchState>) {
+    let Some(index) = batches.iter().position(|state| state.id == batch) else { return };
+    let state = &mut batches[index];
+    state.scanned += scanned;
+    state.remaining -= 1;
+    if state.remaining == 0 {
+        let state = batches.remove(index).expect("index just found above");
+        let _ = events.send(LibraryEvent::BatchDone { batch: state.id, requested: state.requested, count: state.scanned });
+    }
+}
+
+/// Continues a track that was held back for a sample-rate repair: reports how the repair went, then
+/// probes the file again (its rate may have changed) and sends it down the ordinary path — its
+/// `Probed`, then phase 2 — exactly like a track that never needed repair. A track whose repair
+/// failed or was skipped continues as it is on disk.
+fn resume_after_repair(
+    done: RepairDone,
+    events: &Sender<LibraryEvent>,
+    phase2_queue: &mut VecDeque<(u64, Phase2Item)>,
+    batches: &mut VecDeque<BatchState>,
+) {
+    let RepairDone { batch, path, outcome } = done;
+    match outcome {
+        RepairOutcome::Repaired(report) => {
+            let _ = events.send(LibraryEvent::RateRepaired {
+                batch,
+                path: path.clone(),
+                from_rate: report.from_rate,
+                to_rate: report.to_rate,
+                backup: report.backup,
+            });
+        }
+        RepairOutcome::Failed(error) => {
+            let _ = events.send(LibraryEvent::RateRepairFailed { batch, path: path.clone(), error });
+        }
+        RepairOutcome::Skipped => {}
+    }
+    match guarded(AssertUnwindSafe(|| audio::probe_file(&path).map_err(|error| error.to_string()))) {
+        Ok(info) => {
+            let track = PreparedTrack { key: TrackKey::whole_file(path), info };
+            let _ = events.send(LibraryEvent::Probed { batch, tracks: vec![track.clone()] });
+            phase2_queue.push_back((batch, Phase2Item::WholeFile(track)));
+        }
+        Err(error) => {
+            let _ = events.send(LibraryEvent::Failed { batch, path, error, phase: ScanFailurePhase::Probe });
+            finish_item(batch, 0, events, batches);
         }
     }
 }
@@ -279,10 +382,11 @@ fn run(requests: Receiver<ScanRequest>, events: Sender<LibraryEvent>) {
 fn enqueue_batch(
     request: ScanRequest,
     events: &Sender<LibraryEvent>,
-    phase2_queue: &mut VecDeque<Phase2Item>,
+    repair: Option<&RepairWorker>,
+    phase2_queue: &mut VecDeque<(u64, Phase2Item)>,
     batches: &mut VecDeque<BatchState>,
 ) {
-    let ScanRequest { batch, paths, explicit_selection } = request;
+    let ScanRequest { batch, paths, explicit_selection, excluded } = request;
     let requested = paths.len();
 
     let (cue_prepared, cue_phase2_files, claimed_paths) = expand_cue_sheets_for_paths(batch, &paths, explicit_selection, events);
@@ -293,29 +397,50 @@ fn enqueue_batch(
         let _ = events.send(LibraryEvent::Probed { batch, tracks: cue_prepared });
     }
 
-    let ordinary_prepared = probe_phase(batch, &remaining_paths, events);
+    let (ordinary_prepared, awaiting_repair) = probe_phase(batch, &remaining_paths, events, repair);
 
-    let remaining_items = cue_phase2_files.len() + ordinary_prepared.len();
+    let remaining_items = cue_phase2_files.len() + ordinary_prepared.len() + awaiting_repair;
     if remaining_items == 0 {
         let _ = events.send(LibraryEvent::BatchDone { batch, requested, count: 0 });
         return;
     }
-    batches.push_back(BatchState { id: batch, requested, remaining: remaining_items, scanned: 0 });
-    phase2_queue.extend(cue_phase2_files.into_iter().map(Phase2Item::CueFile));
-    phase2_queue.extend(ordinary_prepared.into_iter().map(Phase2Item::WholeFile));
+    batches.push_back(BatchState { id: batch, requested, remaining: remaining_items, scanned: 0, artwork: BatchArtwork::new(excluded) });
+    phase2_queue.extend(cue_phase2_files.into_iter().map(|file| (batch, Phase2Item::CueFile(file))));
+    phase2_queue.extend(ordinary_prepared.into_iter().map(|track| (batch, Phase2Item::WholeFile(track))));
 }
 
 /// Phase 1: probes every requested path and emits one `Probed` event for the whole batch, so the
 /// existing "append the whole selection at once" queue semantics are preserved. Unsupported or
 /// unreadable files are skipped (`Failed`) and never reach the queue or the library.
-fn probe_phase(batch: u64, paths: &[PathBuf], events: &Sender<LibraryEvent>) -> Vec<PreparedTrack> {
-    let prepared = for_each_guarded(batch, paths.to_vec(), events, PathBuf::clone, |path| {
+///
+/// With a repair worker, a FLAC at a non-standard sample rate (`needs_rate_repair`) is handed to it
+/// instead and left out of both the `Probed` event and the returned tracks: it is counted in the
+/// second return value, and `resume_after_repair` sends it on later, once the file on disk is final.
+fn probe_phase(
+    batch: u64,
+    paths: &[PathBuf],
+    events: &Sender<LibraryEvent>,
+    repair: Option<&RepairWorker>,
+) -> (Vec<PreparedTrack>, usize) {
+    let probed = for_each_guarded(batch, paths.to_vec(), events, PathBuf::clone, |path| {
         audio::probe_file(&path).map(|info| PreparedTrack { key: TrackKey::whole_file(path), info }).map_err(|error| error.to_string())
     });
+    let mut prepared = Vec::with_capacity(probed.len());
+    let mut awaiting_repair = 0;
+    for track in probed {
+        if let Some(worker) = repair
+            && needs_rate_repair(&track.info)
+            && worker.submit(batch, track.key.path.clone())
+        {
+            awaiting_repair += 1;
+        } else {
+            prepared.push(track);
+        }
+    }
     if !prepared.is_empty() {
         let _ = events.send(LibraryEvent::Probed { batch, tracks: prepared.clone() });
     }
-    prepared
+    (prepared, awaiting_repair)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -583,10 +708,10 @@ fn scan_cue_phase2_one(
     batch: u64,
     file: CuePhase2File,
     events: &Sender<LibraryEvent>,
-    folder_art_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+    artwork: &mut BatchArtwork,
 ) -> usize {
     let path = file.resolved_path.clone();
-    match guarded(AssertUnwindSafe(|| Ok::<_, String>(build_cue_track_records(file, folder_art_cache)))) {
+    match guarded(AssertUnwindSafe(|| Ok::<_, String>(build_cue_track_records(file, artwork)))) {
         Ok(records) => {
             let count = records.len();
             for record in records {
@@ -605,14 +730,20 @@ fn scan_cue_phase2_one(
 /// via `merge_cue_tags`.
 ///
 /// Artwork (`CLAUDE.md` "Artwork duplication per cue track", fix H): `AppState::apply_scanned` only
-/// ever consults the album-level artwork cache (keyed by `album_key`, first arrival wins) once a
-/// `Scanned` record reaches the UI thread — `TrackRecord.artwork` itself is never read again after
-/// that (it is `.take()`n on arrival). Every track derived from one cue sheet shares the same album
-/// key regardless of which physical `FILE` it came from (`merge_cue_tags`'s album fields are always
-/// sheet-level), so attaching the decoded pixels to only the FIRST track built from this physical
-/// file — instead of a deep copy per track — is enough for the whole album's art to resolve, without
-/// redundantly cloning a potentially large embedded picture once per track.
-fn build_cue_track_records(file: CuePhase2File, folder_art_cache: &mut HashMap<PathBuf, Option<PathBuf>>) -> Vec<TrackRecord> {
+/// ever consults the album-level artwork cache (keyed by `album_key`, tier-aware — the highest
+/// `ArtworkSource` wins) once a `Scanned` record reaches the UI thread — `TrackRecord.artwork` itself
+/// is never read again after that (it is `.take()`n on arrival). Every track derived from one cue
+/// sheet shares the same album key regardless of which physical `FILE` it came from
+/// (`merge_cue_tags`'s album fields are always sheet-level), so attaching the decoded pixels, and
+/// their `ArtworkSource`, to only the FIRST track built from this physical file — instead of a deep
+/// copy per track — is enough for the whole album's art to resolve, without redundantly cloning a
+/// potentially large embedded picture once per track. Resolution follows the same tiers and the
+/// same per-album dedup as any other track (`attach_artwork`), keyed by that shared album key, so a
+/// multi-`FILE` sheet (one `.flac` per track, one `.wv` per LP side) reads and decodes its folder
+/// cover once, not once per physical file. The picture rides on the first track that is not
+/// excluded (`BatchArtwork::is_excluded`), since `main.rs` drops an excluded track's record with
+/// whatever it carries.
+fn build_cue_track_records(file: CuePhase2File, artwork: &mut BatchArtwork) -> Vec<TrackRecord> {
     let CuePhase2File { resolved_path, tracks, sheet } = file;
     let file_size = std::fs::metadata(&resolved_path).ok().map(|meta| meta.len());
     let metadata = audio::read_metadata(&resolved_path).unwrap_or_else(|error| {
@@ -622,27 +753,25 @@ fn build_cue_track_records(file: CuePhase2File, folder_art_cache: &mut HashMap<P
         let _ = writeln!(std::io::stderr().lock(), "DIAG could not read tags for {}: {error}", resolved_path.display());
         Default::default()
     });
-    let artwork = resolve_artwork(&resolved_path, metadata.picture.as_ref(), folder_art_cache);
 
     let mut records = Vec::with_capacity(tracks.len());
-    for (index, (key, track, track_info)) in tracks.into_iter().enumerate() {
-        let (record_artwork, artwork_source) = if index == 0 {
-            match &artwork {
-                Some((pixels, source)) => (Some(pixels.clone()), *source),
-                None => (None, ArtworkSource::None),
-            }
-        } else {
-            (None, ArtworkSource::None)
-        };
+    for (key, track, track_info) in tracks {
         records.push(TrackRecord {
             key,
             info: track_info,
             file_size,
             tags: merge_cue_tags(&sheet, &track, &metadata.tags),
-            artwork: record_artwork,
-            artwork_source,
+            artwork: None,
+            artwork_source: ArtworkSource::None,
             added_seq: 0,
+            // Also transient/pre-`Library` here — see `scan_details`'s identical comment. Every
+            // track of one CUE sheet shares the sheet-level album/album-artist tags anyway, so once
+            // these reach `Library::upsert`, they resolve to the same group regardless.
+            effective_album_artist: EffectiveAlbumArtist::Unresolved,
         });
+    }
+    if let Some(first) = records.iter_mut().find(|record| !artwork.is_excluded(&record.key)) {
+        attach_artwork(first, metadata.picture.as_ref(), artwork);
     }
     records
 }
@@ -706,12 +835,11 @@ fn scan_phase2_one(
     batch: u64,
     track: PreparedTrack,
     events: &Sender<LibraryEvent>,
-    folder_art_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
-    albums_with_art: &mut HashSet<String>,
+    artwork: &mut BatchArtwork,
 ) -> bool {
     let path = track.key.path.clone();
     match guarded(AssertUnwindSafe(|| {
-        let record = scan_details(track, folder_art_cache, albums_with_art);
+        let record = scan_details(track, artwork);
         let _ = events.send(LibraryEvent::Scanned(Box::new(record)));
         Ok(())
     })) {
@@ -756,11 +884,7 @@ fn guarded<T>(f: impl FnOnce() -> Result<T, String> + panic::UnwindSafe) -> Resu
     }
 }
 
-fn scan_details(
-    track: PreparedTrack,
-    folder_art_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
-    albums_with_art: &mut HashSet<String>,
-) -> TrackRecord {
+fn scan_details(track: PreparedTrack, artwork: &mut BatchArtwork) -> TrackRecord {
     let file_size = std::fs::metadata(&track.key.path).ok().map(|meta| meta.len());
     let metadata = audio::read_metadata(&track.key.path).unwrap_or_else(|error| {
         // A write that cannot panic: `eprintln!` unwinds this very `guarded` wrapper (turning an
@@ -779,77 +903,311 @@ fn scan_details(
         artwork: None,
         artwork_source: ArtworkSource::None,
         added_seq: 0,
+        // This record is never upserted into a `Library` — it is transient, scanner-thread-only
+        // state built purely to decide artwork resolution below — so `effective_album_artist` stays
+        // `Unresolved`. `album_key` then falls back to this one record's own tags for the
+        // `BatchArtwork::tiers` dedup key (see `attach_artwork` for what a wrong guess costs).
+        effective_album_artist: EffectiveAlbumArtist::Unresolved,
     };
 
-    let key = album_key(&record);
-    if !albums_with_art.contains(&key)
-        && let Some((pixels, source)) = resolve_artwork(&record.key.path, metadata.picture.as_ref(), folder_art_cache)
-    {
-        record.artwork = Some(pixels);
-        record.artwork_source = source;
-        albums_with_art.insert(key);
-    }
-
+    attach_artwork(&mut record, metadata.picture.as_ref(), artwork);
     record
 }
 
-/// Embedded front cover (or the first embedded picture) first, then folder art
-/// (`cover|folder|front|album` + `.jpg/.jpeg/.png`, case-insensitive) — `§1.2` "Artwork".
+/// One scan batch's artwork bookkeeping (`BatchState::artwork`); a request never inherits another's.
+///
+/// `tiers` is the best artwork tier already sent for each (approximate, see `attach_artwork`) album
+/// key of the batch. It is per batch, not scanner-lifetime, because a later request can land tracks
+/// on an album key that has no cached picture yet, even though the approximate key looks the same:
+/// after "Remove from Library" only part of an album may be re-opened, and its group can then resolve
+/// to a different effective artist, i.e. a different final key. A scanner-lifetime map would keep
+/// suppressing the picture such a key needs. `AppState` keeps the best tier per album across
+/// batches, so resolving once per batch is enough.
+///
+/// `excluded` is the request's exclusion snapshot (`ScanRequest::excluded`). `main.rs` drops an
+/// excluded track's `Scanned` record, so that track must neither record a tier in `tiers` (it would
+/// suppress an included sibling of the same album) nor carry a picture. The snapshot is taken when
+/// the request is dispatched: a track excluded while its batch already runs still counts as included
+/// here, and its dropped record can suppress a sibling's picture for the rest of that batch.
+///
+/// `folder_reads` is what the batch remembers about folder images (`FolderPictureReads`): which files
+/// each folder holds, which of them failed, and the last picture it decoded. It is per batch for the
+/// same reason `tiers` is: a later request or an explicit re-open must see the folder as it is by then.
+#[derive(Default)]
+struct BatchArtwork {
+    tiers: HashMap<String, ArtworkSource>,
+    excluded: HashSet<TrackKey>,
+    folder_reads: FolderPictureReads,
+}
+
+impl BatchArtwork {
+    fn new(excluded: HashSet<TrackKey>) -> Self {
+        Self { excluded, ..Self::default() }
+    }
+
+    fn is_excluded(&self, key: &TrackKey) -> bool {
+        self.excluded.contains(key)
+    }
+}
+
+/// Resolves `record`'s artwork and attaches it, but only when it would beat what an earlier track of
+/// the same album already produced in this batch (`resolve_artwork`'s `best_so_far`): a picture is
+/// sent at most once per tier per album, and a later folder's named cover still overrides an earlier
+/// track's embedded picture. `artwork.tiers` is updated with the tier sent. An excluded track is
+/// left alone entirely (`BatchArtwork`).
+///
+/// The album key is only an approximation: `record` is transient (never upserted into a `Library`),
+/// so `album_key` falls back to this one record's own tags, exactly as before group-level resolution
+/// existed. A wrong guess is usually harmless — the same album resolves one extra time — but two
+/// different albums can collide on the unscoped `aa:` key (same album title and `ALBUMARTIST`, e.g.
+/// one folder with a mistagged stray track): the first one's picture then suppresses the second's
+/// within the batch. `AppState`'s final-key cache never shows a wrong picture for that, but the
+/// suppressed album can be left with the placeholder.
+fn attach_artwork(record: &mut TrackRecord, picture: Option<&EmbeddedPicture>, artwork: &mut BatchArtwork) {
+    if artwork.is_excluded(&record.key) {
+        return;
+    }
+    let key = album_key(record);
+    let best_so_far = artwork.tiers.get(&key).copied().unwrap_or(ArtworkSource::None);
+    if let Some((pixels, source)) = resolve_artwork(&record.key.path, picture, &mut artwork.folder_reads, best_so_far) {
+        record.artwork = Some(pixels);
+        record.artwork_source = source;
+        artwork.tiers.insert(key, source);
+    }
+}
+
+/// The stems of a named folder cover (`ArtworkSource::Folder`), in priority order: `cover`, `art`,
+/// `album art`, `album`, `front`. Each entry lists the spellings of one stem, matched
+/// case-insensitively, so "album art" also accepts `album_art`, `album-art` and `albumart` at the
+/// same priority. Only whole stems match: `AlbumArtSmall`, `artwork` or `back` never do.
+const NAMED_FOLDER_ART_STEMS: [&[&str]; 5] = [&["cover"], &["art"], &["album art", "album_art", "album-art", "albumart"], &["album"], &["front"]];
+/// The legacy folder-art stem (`ArtworkSource::FolderFallback`): accepted before the named list
+/// above existed, so it stays a last resort instead of being dropped.
+const FALLBACK_FOLDER_ART_STEM: &str = "folder";
+/// Image extensions a folder-art file may have, matched case-insensitively (the `image` crate is
+/// built with its PNG and JPEG decoders only).
+const FOLDER_ART_EXTENSIONS: [&str; 3] = ["jpg", "jpeg", "png"];
+
+/// One folder image that could serve as album art.
+struct FolderArtCandidate {
+    path: PathBuf,
+    /// Set once reading this file produced no picture in this batch (`first_readable_candidate`: not
+    /// a regular file, over `MAX_ART_BYTES`, corrupt, a decoder panic, an I/O error), so a bad cover
+    /// on a NAS share is not fetched and re-decoded for every following track of the album. It lives
+    /// in the batch's listing (`FolderPictureReads::listings`), so the next scan tries the file again.
+    unusable: bool,
+}
+
+/// What one scan batch remembers about folder images (`BatchArtwork::folder_reads`). All of it is
+/// dropped with the batch, so nothing stale survives an explicit re-open or the next scan: a
+/// `cover.jpg` added, renamed or repaired since is found, and a failure (a `read_dir` that hit an
+/// SMB timeout while a share reconnected, a candidate that could not be read) is never remembered
+/// beyond the batch it happened in.
+#[derive(Default)]
+struct FolderPictureReads {
+    /// `find_folder_art` per folder: one `read_dir` per folder however many tracks the batch holds
+    /// there. A `read_dir` that failed is kept as an empty listing, so the batch does not hammer an
+    /// unresponsive share once per track. Paths and flags only — decoded pixels are never kept here.
+    listings: HashMap<PathBuf, FolderArt>,
+    /// The last folder picture this batch decoded, and the file it came from. A folder's tracks arrive
+    /// one after another, yet each can resolve from scratch under its own approximate album key (say a
+    /// different `ALBUMARTIST` per track, or many single-track albums sharing one `cover.jpg`): without
+    /// this every such key would read and decode the same cover from the share again. One entry
+    /// bounds it to a single thumbnail.
+    last_picture: Option<(PathBuf, ArtworkPixels)>,
+}
+
+/// What the single `read_dir` of one folder found, best-ranked candidate first. Paths and flags
+/// only — decoded pixels are never cached here.
+#[derive(Default)]
+struct FolderArt {
+    /// Named covers (`ArtworkSource::Folder`), in `NAMED_FOLDER_ART_STEMS` order.
+    named: Vec<FolderArtCandidate>,
+    /// Legacy `folder.*` images (`ArtworkSource::FolderFallback`).
+    fallback: Vec<FolderArtCandidate>,
+}
+
+/// Resolves the album picture a track can contribute, in precedence order (`ArtworkSource`):
+///
+/// 1. A named folder cover (`cover`, `art`, `album art`, `album`, `front` + `.jpg/.jpeg/.png`,
+///    case-insensitive) in the track's own folder, then — for a track inside a disc subfolder
+///    (`CD1`, `Disc 2`, ...) — in the RELEASE folder above it, since a multi-disc rip's cover often
+///    sits there once rather than being duplicated into every disc subfolder (`CLAUDE.md` "Album
+///    grouping"). A candidate that cannot be read or decoded is skipped for the next one.
+/// 2. The embedded front cover (or the first embedded picture).
+/// 3. The legacy `folder.jpg/.jpeg/.png`, own folder then release folder — only when the album has
+///    no picture at all yet, so an album with neither a named cover nor embedded art still gets one.
+///
+/// `best_so_far` is the best tier already found for this track's album; only a strictly better
+/// picture is looked for and returned (`None` otherwise), so an album whose folder cover was already
+/// found never touches the disk again, and one with embedded art never re-decodes it for each track.
+/// Pass `ArtworkSource::None` to resolve from scratch. The returned source always ranks above
+/// `best_so_far`. `reads` is the batch's folder-image state: each folder is listed once per batch, and
+/// a cover already decoded for an earlier track of the folder is reused instead of read again, so an
+/// album key the batch has not seen yet still costs no second read of the same `cover.jpg`. Pass a
+/// fresh `FolderPictureReads` to resolve as a new batch would.
 fn resolve_artwork(
     path: &Path,
     embedded: Option<&EmbeddedPicture>,
-    folder_art_cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+    reads: &mut FolderPictureReads,
+    best_so_far: ArtworkSource,
 ) -> Option<(ArtworkPixels, ArtworkSource)> {
-    if let Some(picture) = embedded
+    if best_so_far >= ArtworkSource::Folder {
+        return None;
+    }
+    let folders = art_folders(path);
+    if let Some(pixels) = folder_art_of_tier(&folders, ArtworkSource::Folder, reads) {
+        return Some((pixels, ArtworkSource::Folder));
+    }
+    if best_so_far < ArtworkSource::Embedded
+        && let Some(picture) = embedded
         && let Some(pixels) = decode_artwork(&picture.data)
     {
         return Some((pixels, ArtworkSource::Embedded));
     }
-    let folder = path.parent()?.to_path_buf();
-    let cover_path = folder_art_cache.entry(folder.clone()).or_insert_with(|| find_folder_art(&folder)).clone()?;
+    if best_so_far == ArtworkSource::None
+        && let Some(pixels) = folder_art_of_tier(&folders, ArtworkSource::FolderFallback, reads)
+    {
+        return Some((pixels, ArtworkSource::FolderFallback));
+    }
+    None
+}
+
+/// The folders `resolve_artwork` looks in for a track, most specific first: its own folder, plus the
+/// release folder above it when its own name looks like a disc subfolder (`is_disc_subfolder_name`).
+fn art_folders(path: &Path) -> Vec<PathBuf> {
+    let Some(folder) = path.parent() else { return Vec::new() };
+    let mut folders = vec![folder.to_path_buf()];
+    let is_disc_subfolder = folder.file_name().and_then(|name| name.to_str()).is_some_and(super::is_disc_subfolder_name);
+    if is_disc_subfolder && let Some(release_folder) = folder.parent() {
+        folders.push(release_folder.to_path_buf());
+    }
+    folders
+}
+
+/// The first decodable picture of `tier` (`Folder` or `FolderFallback`) across `folders`, in order.
+fn folder_art_of_tier(folders: &[PathBuf], tier: ArtworkSource, reads: &mut FolderPictureReads) -> Option<ArtworkPixels> {
+    folders.iter().find_map(|folder| folder_art_in(folder, tier, reads))
+}
+
+/// One folder's worth of the folder-art lookup: finds (listed once per batch) the folder's candidates
+/// of `tier` and decodes the first usable one, enforcing the same size cap either folder level uses.
+/// A candidate that fails is flagged, so the next track of the batch skips it instead of reading it
+/// again.
+fn folder_art_in(folder: &Path, tier: ArtworkSource, reads: &mut FolderPictureReads) -> Option<ArtworkPixels> {
+    let FolderPictureReads { listings, last_picture } = reads;
+    let art = listings.entry(folder.to_path_buf()).or_insert_with(|| find_folder_art(folder));
+    let candidates = match tier {
+        ArtworkSource::Folder => &mut art.named,
+        ArtworkSource::FolderFallback => &mut art.fallback,
+        ArtworkSource::Embedded | ArtworkSource::None => return None,
+    };
+    first_readable_candidate(candidates, |path| read_folder_art_reusing(path, last_picture))
+}
+
+/// The first not-yet-failed candidate `read` turns into a picture. A candidate is flagged unusable
+/// BEFORE it is read and cleared only on success, so even a `read` that unwinds leaves the verdict
+/// recorded: one bad cover is never re-read by every following track of the album.
+fn first_readable_candidate(
+    candidates: &mut [FolderArtCandidate],
+    mut read: impl FnMut(&Path) -> Option<ArtworkPixels>,
+) -> Option<ArtworkPixels> {
+    for candidate in candidates {
+        if candidate.unusable {
+            continue;
+        }
+        candidate.unusable = true;
+        if let Some(pixels) = read(&candidate.path) {
+            candidate.unusable = false;
+            return Some(pixels);
+        }
+    }
+    None
+}
+
+/// `read_folder_art`, answered from `last_picture` when it holds this very file (a picture this
+/// batch already decoded for an earlier track of the folder), and otherwise remembered there.
+fn read_folder_art_reusing(path: &Path, last_picture: &mut Option<(PathBuf, ArtworkPixels)>) -> Option<ArtworkPixels> {
+    if let Some((cached_path, pixels)) = last_picture.as_ref()
+        && cached_path == path
+    {
+        return Some(pixels.clone());
+    }
+    let pixels = read_folder_art(path)?;
+    *last_picture = Some((path.to_path_buf(), pixels.clone()));
+    Some(pixels)
+}
+
+/// Reads and decodes one folder image. Only a regular file (after following a symlink) within
+/// `MAX_ART_BYTES` is read, and the read itself is capped too, so a `cover.jpg` symlinked to a FIFO
+/// or a device, or one that grows while it is read, can neither block the scanner thread nor exhaust
+/// memory. A decode that panics counts as this candidate failing: it costs the folder picture, not
+/// the track's tags (`guarded` would otherwise turn the whole track into a `Failed`).
+fn read_folder_art(path: &Path) -> Option<ArtworkPixels> {
     // Checked before reading: an oversized cover on a NAS share must never be pulled across the
     // network in full just to be thrown away by a length check (`§3.3`, same cap as embedded art).
-    if std::fs::metadata(&cover_path).ok()?.len() > MAX_ART_BYTES as u64 {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_ART_BYTES as u64 {
         return None;
     }
-    let bytes = std::fs::read(&cover_path).ok()?;
-    let pixels = decode_artwork(&bytes)?;
-    Some((pixels, ArtworkSource::Folder))
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|file| file.take(MAX_ART_BYTES as u64 + 1).read_to_end(&mut bytes)).ok()?;
+    if bytes.len() > MAX_ART_BYTES {
+        return None;
+    }
+    contain_panic(|| decode_artwork(&bytes))
 }
 
-/// The `cover|folder|front|album` stems, in the priority order `§1.2` "Artwork" lists them.
-const FOLDER_ART_STEM_PRIORITY: [&str; 4] = ["cover", "folder", "front", "album"];
-
-/// One `read_dir` per folder. Candidates are found by name first, using the cheap file-type bit
-/// `read_dir` already returns instead of a separate `stat` per entry; when a folder holds more
-/// than one candidate, the `§1.2` stem order wins, then a case-insensitive file name as a
-/// deterministic final tie-break.
-fn find_folder_art(folder: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(folder).ok()?;
-    let mut candidates: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|entry| {
-            is_folder_art_name(&entry.path()) && entry.file_type().is_ok_and(|kind| kind.is_file() || kind.is_symlink())
-        })
-        .map(|entry| entry.path())
-        .collect();
-    candidates.sort_by_key(|path| folder_art_rank(path));
-    candidates.into_iter().next()
+/// `f`'s result, or `None` when it panics.
+fn contain_panic<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    panic::catch_unwind(AssertUnwindSafe(f)).ok().flatten()
 }
 
-fn folder_art_rank(path: &Path) -> (usize, String) {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
-    let priority = FOLDER_ART_STEM_PRIORITY.iter().position(|candidate| *candidate == stem).unwrap_or(FOLDER_ART_STEM_PRIORITY.len());
-    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
-    (priority, name)
+/// One `read_dir` per folder (per batch: `FolderPictureReads::listings`). Candidates are found by name first, using the cheap file-type bit
+/// `read_dir` already returns instead of a separate `stat` per entry, and ranked within their tier:
+/// the `NAMED_FOLDER_ART_STEMS` order first, then a case-insensitive file name (and finally the exact
+/// one) as a deterministic tie-break, so the same folder always ranks the same on any file system.
+fn find_folder_art(folder: &Path) -> FolderArt {
+    let Ok(entries) = std::fs::read_dir(folder) else { return FolderArt::default() };
+    let mut named: Vec<(usize, PathBuf)> = Vec::new();
+    let mut fallback: Vec<(usize, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let Some((tier, stem_rank)) = classify_folder_art(Path::new(&entry.file_name())) else { continue };
+        if !entry.file_type().is_ok_and(|kind| kind.is_file() || kind.is_symlink()) {
+            continue;
+        }
+        match tier {
+            ArtworkSource::Folder => named.push((stem_rank, entry.path())),
+            _ => fallback.push((stem_rank, entry.path())),
+        }
+    }
+    let ranked = |mut found: Vec<(usize, PathBuf)>| -> Vec<FolderArtCandidate> {
+        found.sort_by_cached_key(|(stem_rank, path)| folder_art_rank(*stem_rank, path));
+        found.into_iter().map(|(_, path)| FolderArtCandidate { path, unusable: false }).collect()
+    };
+    FolderArt { named: ranked(named), fallback: ranked(fallback) }
 }
 
-fn is_folder_art_name(path: &Path) -> bool {
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { return false };
-    let Some(ext) = path.extension().and_then(|s| s.to_str()) else { return false };
-    let stem_matches = matches!(stem.to_ascii_lowercase().as_str(), "cover" | "folder" | "front" | "album");
-    let ext_matches = matches!(ext.to_ascii_lowercase().as_str(), "jpg" | "jpeg" | "png");
-    stem_matches && ext_matches
+fn folder_art_rank(stem_rank: usize, path: &Path) -> (usize, String, String) {
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    (stem_rank, name.to_ascii_lowercase(), name.to_owned())
+}
+
+/// Whether the file name `path` is folder art, and which tier it would serve with its stem's rank
+/// within that tier (`NAMED_FOLDER_ART_STEMS` position; always 0 for the single legacy stem), or
+/// `None` when it is not folder art at all. Matches the whole stem and the extension
+/// case-insensitively.
+fn classify_folder_art(path: &Path) -> Option<(ArtworkSource, usize)> {
+    let stem = path.file_stem()?.to_str()?.to_ascii_lowercase();
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !FOLDER_ART_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    if stem == FALLBACK_FOLDER_ART_STEM {
+        return Some((ArtworkSource::FolderFallback, 0));
+    }
+    let stem_rank = NAMED_FOLDER_ART_STEMS.iter().position(|spellings| spellings.contains(&stem.as_str()))?;
+    Some((ArtworkSource::Folder, stem_rank))
 }
 
 /// Decodes and downscales `bytes` to at most `ARTWORK_MAX_SIDE` px on the longest side, under
@@ -871,6 +1229,7 @@ fn decode_artwork(bytes: &[u8]) -> Option<ArtworkPixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::rate_repair::test_support::write_tagged_test_flac;
     use std::time::Duration;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -920,52 +1279,814 @@ mod tests {
         assert!(decode_artwork(&bytes).is_none());
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Artwork precedence: named folder cover > embedded picture > legacy folder.jpg
+    // -----------------------------------------------------------------------------------------
+
+    // The shapes the test pictures resolve to. `image::DynamicImage::thumbnail` fits an image into
+    // the `ARTWORK_MAX_SIDE` box preserving its aspect ratio in both directions, so a small picture
+    // is scaled up too — and a different aspect ratio per source tells which file was actually read.
+    const SQUARE: (u32, u32) = (ARTWORK_MAX_SIDE, ARTWORK_MAX_SIDE);
+    const WIDE: (u32, u32) = (ARTWORK_MAX_SIDE, ARTWORK_MAX_SIDE / 2);
+    const TALL: (u32, u32) = (ARTWORK_MAX_SIDE / 2, ARTWORK_MAX_SIDE);
+    const PANORAMA: (u32, u32) = (ARTWORK_MAX_SIDE, ARTWORK_MAX_SIDE / 4);
+
+    fn shape(pixels: &ArtworkPixels) -> (u32, u32) {
+        (pixels.width, pixels.height)
+    }
+
+    fn wide_jpeg() -> Vec<u8> {
+        tiny_jpeg_bytes(40, 20)
+    }
+
+    fn tall_png() -> Vec<u8> {
+        tiny_png_bytes(20, 40)
+    }
+
+    fn panorama_jpeg() -> Vec<u8> {
+        tiny_jpeg_bytes(80, 20)
+    }
+
+    fn embedded_square() -> EmbeddedPicture {
+        EmbeddedPicture { media_type: None, front_cover: true, data: tiny_png_bytes(20, 20) }
+    }
+
+    /// Resolves from scratch (no earlier track of the album has produced anything yet), in a batch of
+    /// its own: nothing is reused from an earlier call, the folder is listed again every time.
+    fn resolve_new(path: &Path, embedded: Option<&EmbeddedPicture>) -> Option<(ArtworkPixels, ArtworkSource)> {
+        resolve_artwork(path, embedded, &mut FolderPictureReads::default(), ArtworkSource::None)
+    }
+
+    fn candidate_names(candidates: &[FolderArtCandidate]) -> Vec<String> {
+        candidates.iter().map(|candidate| candidate.path.file_name().unwrap().to_str().unwrap().to_owned()).collect()
+    }
+
     #[test]
-    fn scanner_prefers_embedded_art_then_folder_art() {
-        let dir = temp_dir("folder-art");
-        let cover_bytes = tiny_jpeg_bytes(10, 10);
-        std::fs::write(dir.join("Cover.JPG"), &cover_bytes).unwrap();
+    fn a_named_folder_cover_beats_the_embedded_picture() {
+        let dir = temp_dir("named-beats-embedded");
+        std::fs::write(dir.join("Cover.JPG"), wide_jpeg()).unwrap();
 
-        let found = find_folder_art(&dir).expect("a case-insensitively named cover file should be found");
-        assert_eq!(found.file_name().unwrap().to_str().unwrap(), "Cover.JPG");
+        let (pixels, source) = resolve_new(&dir.join("track.flac"), Some(&embedded_square())).unwrap();
 
-        // An embedded picture, when present, is preferred over folder art.
-        let embedded = tiny_png_bytes(20, 20);
-        let mut folder_art_cache = HashMap::new();
-        let (pixels, source) = resolve_artwork(
-            &dir.join("track.flac"),
-            Some(&EmbeddedPicture { media_type: None, front_cover: true, data: embedded }),
-            &mut folder_art_cache,
-        )
-        .unwrap();
-        assert_eq!(source, ArtworkSource::Embedded);
-        // `image::DynamicImage::thumbnail` fits the image to the target box preserving aspect
-        // ratio in both directions, so a smaller-than-target square is scaled up to it too.
-        assert_eq!(pixels.width, ARTWORK_MAX_SIDE);
-        assert_eq!(pixels.height, ARTWORK_MAX_SIDE);
-
-        // With no embedded picture, folder art is used instead — a real JPEG decode, not a PNG
-        // wearing a `.jpg` extension.
-        let (pixels, source) = resolve_artwork(&dir.join("track.flac"), None, &mut folder_art_cache).unwrap();
         assert_eq!(source, ArtworkSource::Folder);
-        assert_eq!(pixels.width, ARTWORK_MAX_SIDE);
-        assert_eq!(pixels.height, ARTWORK_MAX_SIDE);
+        assert_eq!(shape(&pixels), WIDE, "the folder cover's pixels, not the embedded picture's");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn folder_art_prefers_the_1_2_stem_order_over_byte_sort() {
-        let dir = temp_dir("folder-art-priority");
-        // Byte/case order would put these first ("F" < "c", and "album" < "cover"); the `§1.2`
-        // priority order (cover, folder, front, album) must win instead.
-        std::fs::write(dir.join("Folder.jpg"), tiny_jpeg_bytes(4, 4)).unwrap();
-        std::fs::write(dir.join("album.jpg"), tiny_jpeg_bytes(4, 4)).unwrap();
-        std::fs::write(dir.join("cover.png"), tiny_png_bytes(4, 4)).unwrap();
+    fn the_embedded_picture_is_the_fallback_when_the_folder_has_no_named_cover() {
+        let dir = temp_dir("embedded-fallback");
 
-        let found = find_folder_art(&dir).expect("a cover file should be found");
+        let (pixels, source) = resolve_new(&dir.join("track.flac"), Some(&embedded_square())).unwrap();
 
-        assert_eq!(found.file_name().unwrap().to_str().unwrap(), "cover.png");
+        assert_eq!(source, ArtworkSource::Embedded);
+        assert_eq!(shape(&pixels), SQUARE);
+        assert!(resolve_new(&dir.join("track.flac"), None).is_none(), "nothing at all yields no art");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `folder.jpg` was accepted before the named list existed; it stays as the very last resort so
+    /// an album with neither a named cover nor embedded art keeps its thumbnail.
+    #[test]
+    fn embedded_art_beats_a_legacy_folder_jpg_which_only_serves_when_nothing_else_does() {
+        let dir = temp_dir("legacy-folder-jpg");
+        std::fs::write(dir.join("Folder.JPG"), panorama_jpeg()).unwrap();
+
+        let (pixels, source) = resolve_new(&dir.join("track.flac"), Some(&embedded_square())).unwrap();
+        assert_eq!(source, ArtworkSource::Embedded);
+        assert_eq!(shape(&pixels), SQUARE);
+
+        let (pixels, source) = resolve_new(&dir.join("track.flac"), None).unwrap();
+        assert_eq!(source, ArtworkSource::FolderFallback);
+        assert_eq!(shape(&pixels), PANORAMA);
+
+        // A named cover beats folder.jpg even with no embedded picture around.
+        std::fs::write(dir.join("front.png"), tall_png()).unwrap();
+        let (pixels, source) = resolve_new(&dir.join("track.flac"), None).unwrap();
+        assert_eq!(source, ArtworkSource::Folder);
+        assert_eq!(shape(&pixels), TALL);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_accepted_cover_name_is_recognized_case_insensitively() {
+        // (name, priority of its stem: cover, art, album art and its spellings, album, front)
+        let names = [
+            ("cover.jpg", 0), ("COVER.JPG", 0), ("Cover.Jpeg", 0), ("art.png", 1), ("ART.PNG", 1), ("album art.jpg", 2), ("Album Art.JPG", 2),
+            ("album_art.jpg", 2), ("album-art.jpeg", 2), ("albumart.png", 2), ("ALBUMART.PNG", 2), ("album.jpg", 3), ("Album.PNG", 3),
+            ("front.jpg", 4), ("FRONT.JPEG", 4),
+        ];
+        for (name, stem_rank) in names {
+            assert_eq!(classify_folder_art(Path::new(name)), Some((ArtworkSource::Folder, stem_rank)), "{name} is a named cover of that priority");
+
+            // The content is what gets decoded, not the extension: a JPEG under a `.png` name works.
+            let dir = temp_dir("accepted-name");
+            std::fs::write(dir.join(name), wide_jpeg()).unwrap();
+            let (pixels, source) =
+                resolve_new(&dir.join("track.flac"), Some(&embedded_square())).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert_eq!(source, ArtworkSource::Folder, "{name} must beat the embedded picture");
+            assert_eq!(shape(&pixels), WIDE, "{name}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn names_that_are_not_an_accepted_cover_are_ignored() {
+        let names = [
+            "AlbumArtSmall.jpg", "artwork.jpg", "back.jpg", "cover.gif", "cover.jpg.bak", "cover", "covers.jpg", "cover1.jpg", "my cover.jpg",
+            "album art small.jpg", "cover.webp", "folder.gif", "Thumbs.db",
+        ];
+        let dir = temp_dir("ignored-names");
+        for name in names {
+            assert_eq!(classify_folder_art(Path::new(name)), None, "{name} must not match");
+            std::fs::write(dir.join(name), wide_jpeg()).unwrap();
+        }
+
+        let (_pixels, source) = resolve_new(&dir.join("track.flac"), Some(&embedded_square())).unwrap();
+        assert_eq!(source, ArtworkSource::Embedded, "none of them may stand in for a cover");
+        assert!(resolve_new(&dir.join("track.flac"), None).is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn named_covers_rank_cover_art_album_art_album_front_and_folder_stays_a_fallback() {
+        let dir = temp_dir("named-priority");
+        // Byte/case order would put these differently ("A" < "c" < "f"): the priority list must win.
+        for name in ["front.jpg", "album.png", "Album Art.jpg", "art.jpg", "cover.jpeg", "folder.jpg", "Folder.png"] {
+            std::fs::write(dir.join(name), tiny_jpeg_bytes(4, 4)).unwrap();
+        }
+
+        let art = find_folder_art(&dir);
+
+        assert_eq!(candidate_names(&art.named), ["cover.jpeg", "art.jpg", "Album Art.jpg", "album.png", "front.jpg"]);
+        assert_eq!(candidate_names(&art.fallback), ["folder.jpg", "Folder.png"], "legacy folder.* images, by case-insensitive name");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn spellings_of_one_stem_tie_break_by_case_insensitive_file_name() {
+        let dir = temp_dir("named-tie-break");
+        for name in ["front.png", "album.jpg", "album_art.png", "AlbumArt.jpg", "album-art.jpg", "album art.jpg", "cover.PNG", "Cover.jpg"] {
+            std::fs::write(dir.join(name), tiny_jpeg_bytes(4, 4)).unwrap();
+        }
+
+        let art = find_folder_art(&dir);
+
+        assert_eq!(
+            candidate_names(&art.named),
+            ["Cover.jpg", "cover.PNG", "album art.jpg", "album-art.jpg", "album_art.png", "AlbumArt.jpg", "album.jpg", "front.png"],
+            "cover before album art, every album art spelling before album and front; within each stem, by lowercased file name"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A multi-disc release's cover sitting only in the RELEASE folder — not duplicated into every
+    /// `CD1`/`CD2` subfolder — must still resolve for a track inside a disc subfolder, once its own
+    /// folder comes up empty (`CLAUDE.md` "Album grouping", artwork fallback order).
+    #[test]
+    fn scanner_falls_back_to_release_folder_art_for_a_disc_subfolder_track() {
+        let release_dir = temp_dir("release-art");
+        let disc_dir = release_dir.join("CD1");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(release_dir.join("cover.jpg"), tiny_jpeg_bytes(10, 10)).unwrap();
+
+        let (pixels, source) = resolve_new(&disc_dir.join("01 - Track.flac"), None)
+            .expect("the release folder's cover must be found for a track with none in its own disc folder");
+        assert_eq!(source, ArtworkSource::Folder);
+        assert_eq!(pixels.width, ARTWORK_MAX_SIDE);
+
+        std::fs::remove_dir_all(&release_dir).unwrap();
+    }
+
+    /// Own disc folder's named cover > release folder's named cover > embedded picture > legacy
+    /// folder.jpg (of either folder): the release folder is only ever a fallback, never preferred.
+    #[test]
+    fn disc_subfolder_art_precedence_is_own_named_then_release_named_then_embedded() {
+        let release_dir = temp_dir("release-art-priority");
+        let disc_dir = release_dir.join("CD2");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        let track = disc_dir.join("01 - Track.flac");
+        std::fs::write(release_dir.join("cover.jpg"), tall_png()).unwrap();
+        std::fs::write(disc_dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        std::fs::write(release_dir.join("folder.jpg"), panorama_jpeg()).unwrap();
+
+        let mut reads = FolderPictureReads::default();
+        let (pixels, source) = resolve_artwork(&track, Some(&embedded_square()), &mut reads, ArtworkSource::None).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, WIDE), "the disc folder's own cover wins");
+        assert!(!reads.listings.contains_key(&release_dir), "the release folder is not even listed when the disc folder has a cover");
+
+        std::fs::remove_file(disc_dir.join("cover.jpg")).unwrap();
+        let (pixels, source) = resolve_new(&track, Some(&embedded_square())).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, TALL), "then the release folder's named cover, over the embedded picture");
+
+        std::fs::remove_file(release_dir.join("cover.jpg")).unwrap();
+        let (pixels, source) = resolve_new(&track, Some(&embedded_square())).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Embedded, SQUARE), "then the embedded picture, over a legacy folder.jpg");
+
+        let (pixels, source) = resolve_new(&track, None).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::FolderFallback, PANORAMA), "the release folder's folder.jpg is the last resort");
+
+        std::fs::remove_dir_all(&release_dir).unwrap();
+    }
+
+    /// The own folder is searched before the release folder as a whole: a lower-ranked stem beside
+    /// the track still beats a higher-ranked one in the release folder.
+    #[test]
+    fn a_disc_folders_own_lower_ranked_cover_beats_the_release_folders_higher_ranked_one() {
+        let release_dir = temp_dir("own-folder-first");
+        let disc_dir = release_dir.join("CD1");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(release_dir.join("cover.jpg"), tall_png()).unwrap();
+        std::fs::write(disc_dir.join("front.jpg"), wide_jpeg()).unwrap();
+
+        let (pixels, source) = resolve_new(&disc_dir.join("01.flac"), None).unwrap();
+
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, WIDE));
+
+        std::fs::remove_dir_all(&release_dir).unwrap();
+    }
+
+    /// A release-folder named cover also beats the disc folder's OWN legacy folder.jpg: tiers are
+    /// compared before folders.
+    #[test]
+    fn a_release_folder_named_cover_beats_the_disc_folders_legacy_folder_jpg() {
+        let release_dir = temp_dir("release-named-vs-disc-legacy");
+        let disc_dir = release_dir.join("Disc 1");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(release_dir.join("front.png"), tall_png()).unwrap();
+        std::fs::write(disc_dir.join("folder.jpg"), panorama_jpeg()).unwrap();
+
+        let (pixels, source) = resolve_new(&disc_dir.join("01.flac"), None).unwrap();
+
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, TALL));
+
+        std::fs::remove_dir_all(&release_dir).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_named_cover_falls_back_to_the_next_candidate_then_to_embedded() {
+        let dir = temp_dir("corrupt-cover");
+        let track = dir.join("track.flac");
+        std::fs::write(dir.join("cover.jpg"), b"definitely not an image").unwrap();
+        std::fs::write(dir.join("art.png"), tall_png()).unwrap();
+
+        // Next ranked file in the same folder.
+        let mut reads = FolderPictureReads::default();
+        let (pixels, source) = resolve_artwork(&track, Some(&embedded_square()), &mut reads, ArtworkSource::None).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, TALL), "art.png stands in for the corrupt cover.jpg");
+        let named = &reads.listings[&dir].named;
+        assert_eq!(candidate_names(named), ["cover.jpg", "art.png"]);
+        assert!(named[0].unusable && !named[1].unusable, "only the corrupt candidate is flagged");
+
+        // No other named file: the embedded picture.
+        std::fs::remove_file(dir.join("art.png")).unwrap();
+        let (pixels, source) = resolve_new(&track, Some(&embedded_square())).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Embedded, SQUARE));
+
+        // ... and with no embedded picture either, the legacy folder.jpg.
+        std::fs::write(dir.join("folder.jpg"), panorama_jpeg()).unwrap();
+        let (pixels, source) = resolve_new(&track, None).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::FolderFallback, PANORAMA));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A corrupt cover in the disc folder falls through to the release folder's named cover before
+    /// any embedded picture is considered.
+    #[test]
+    fn a_corrupt_disc_folder_cover_falls_back_to_the_release_folder_cover() {
+        let release_dir = temp_dir("corrupt-disc-cover");
+        let disc_dir = release_dir.join("CD1");
+        std::fs::create_dir_all(&disc_dir).unwrap();
+        std::fs::write(disc_dir.join("cover.jpg"), b"not an image").unwrap();
+        std::fs::write(release_dir.join("cover.jpg"), tall_png()).unwrap();
+
+        let (pixels, source) = resolve_new(&disc_dir.join("01.flac"), Some(&embedded_square())).unwrap();
+
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, TALL));
+
+        std::fs::remove_dir_all(&release_dir).unwrap();
+    }
+
+    /// Within one batch a folder is listed once and a candidate that failed is remembered: neither is
+    /// looked at again for the following tracks, so one bad cover on a slow share is not re-read per
+    /// track. The next batch starts over (`a_cover_added_or_repaired_after_a_batch_is_found_by_the_next_one`).
+    #[test]
+    fn a_folder_is_listed_once_and_a_failed_candidate_is_not_read_again_within_a_batch() {
+        let dir = temp_dir("listed-once");
+        let track = dir.join("track.flac");
+        let mut reads = FolderPictureReads::default();
+
+        assert!(resolve_artwork(&track, None, &mut reads, ArtworkSource::None).is_none());
+        // A valid cover appears after the listing: only a cached listing can still find nothing.
+        std::fs::write(dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        assert!(resolve_artwork(&track, None, &mut reads, ArtworkSource::None).is_none(), "the folder is not listed a second time");
+        assert_eq!(reads.listings.len(), 1);
+
+        // A cover that is corrupt from the start: read once, flagged, and never read again.
+        std::fs::write(dir.join("cover.jpg"), b"corrupt").unwrap();
+        let mut reads = FolderPictureReads::default();
+        assert!(resolve_artwork(&track, Some(&embedded_square()), &mut reads, ArtworkSource::None).is_some_and(|(_, source)| source == ArtworkSource::Embedded));
+        // The cover is repaired on disk, but the batch's verdict stands.
+        std::fs::write(dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        let (_pixels, source) = resolve_artwork(&track, Some(&embedded_square()), &mut reads, ArtworkSource::None).unwrap();
+        assert_eq!(source, ArtworkSource::Embedded, "a candidate that failed is not read again");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Nothing about a folder outlives its batch (`FolderPictureReads`): a cover added after the folder
+    /// was first listed, one that was corrupt and has been repaired, and a folder whose `read_dir`
+    /// failed (an unmounted or reconnecting share) are all picked up by the next batch, which is what
+    /// an explicit re-open or a later scan is.
+    #[test]
+    fn a_cover_added_or_repaired_after_a_batch_is_found_by_the_next_one() {
+        let base = temp_dir("next-batch");
+        let dir = base.join("album");
+        let track = dir.join("track.flac");
+        let embedded = embedded_square();
+
+        // `read_dir` fails: the batch lists the folder as empty and keeps that answer, but only for itself.
+        let mut reads = FolderPictureReads::default();
+        assert!(resolve_artwork(&track, None, &mut reads, ArtworkSource::None).is_none());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cover.jpg"), b"corrupt").unwrap();
+        assert!(resolve_artwork(&track, None, &mut reads, ArtworkSource::None).is_none(), "the failed listing is kept for the rest of the batch");
+        assert!(resolve_new(&track, None).is_none(), "the next batch lists the folder again and finds only a corrupt cover");
+
+        // The corrupt cover is replaced: a batch that already gave up on it keeps its verdict, the next one reads it.
+        let mut reads = FolderPictureReads::default();
+        assert!(resolve_artwork(&track, Some(&embedded), &mut reads, ArtworkSource::None).is_some_and(|(_, source)| source == ArtworkSource::Embedded));
+        std::fs::write(dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        assert!(resolve_artwork(&track, Some(&embedded), &mut reads, ArtworkSource::None).is_some_and(|(_, source)| source == ArtworkSource::Embedded));
+        let (pixels, source) = resolve_new(&track, Some(&embedded)).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, WIDE));
+
+        // A cover that is added after the folder was listed without one wins over the embedded picture, too.
+        std::fs::remove_file(dir.join("cover.jpg")).unwrap();
+        let mut reads = FolderPictureReads::default();
+        assert!(resolve_artwork(&track, Some(&embedded), &mut reads, ArtworkSource::None).is_some_and(|(_, source)| source == ArtworkSource::Embedded));
+        std::fs::write(dir.join("Front.png"), tall_png()).unwrap();
+        assert!(resolve_artwork(&track, Some(&embedded), &mut reads, ArtworkSource::None).is_some_and(|(_, source)| source == ArtworkSource::Embedded));
+        let (pixels, source) = resolve_new(&track, Some(&embedded)).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, TALL));
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A candidate is flagged unusable BEFORE it is read, so even a read that unwinds leaves the
+    /// verdict recorded: the next track skips it instead of reading (and unwinding on) it again.
+    #[test]
+    fn a_candidate_is_flagged_unusable_before_it_is_read() {
+        let mut candidates = vec![
+            FolderArtCandidate { path: PathBuf::from("cover.jpg"), unusable: false },
+            FolderArtCandidate { path: PathBuf::from("art.png"), unusable: false },
+        ];
+
+        let unwound = panic::catch_unwind(AssertUnwindSafe(|| first_readable_candidate(&mut candidates, |_| panic!("decoder blew up"))));
+
+        assert!(unwound.is_err());
+        assert!(candidates[0].unusable, "the candidate that unwound stays flagged");
+        assert!(!candidates[1].unusable);
+
+        let mut reads = Vec::new();
+        let pixels = ArtworkPixels { width: 1, height: 1, rgb: vec![1, 2, 3] };
+        let found = first_readable_candidate(&mut candidates, |path| {
+            reads.push(path.to_path_buf());
+            Some(pixels.clone())
+        });
+        assert_eq!(found, Some(pixels));
+        assert_eq!(reads, [PathBuf::from("art.png")], "the next track goes straight to the next candidate");
+        assert!(!candidates[1].unusable, "a successful read leaves the candidate usable");
+    }
+
+    /// A candidate that fails for any reason (corrupt, unreadable, gone since the listing) is skipped by
+    /// the rest of the batch, and the lookup falls through to the next ranked one.
+    #[test]
+    fn a_failed_candidate_is_skipped_for_the_rest_of_the_batch_and_the_next_one_is_tried() {
+        let candidate = |name: &str| FolderArtCandidate { path: PathBuf::from(name), unusable: false };
+        let mut candidates = vec![candidate("cover.jpg"), candidate("art.png"), candidate("front.png")];
+        let pixels = ArtworkPixels { width: 1, height: 1, rgb: vec![1, 2, 3] };
+
+        let mut attempts = Vec::new();
+        let found = first_readable_candidate(&mut candidates, |path| {
+            attempts.push(path.to_path_buf());
+            (path == Path::new("front.png")).then(|| pixels.clone())
+        });
+
+        assert_eq!(found, Some(pixels.clone()));
+        assert_eq!(attempts, [PathBuf::from("cover.jpg"), PathBuf::from("art.png"), PathBuf::from("front.png")]);
+
+        attempts.clear();
+        let found = first_readable_candidate(&mut candidates, |path| {
+            attempts.push(path.to_path_buf());
+            Some(pixels.clone())
+        });
+        assert_eq!(found, Some(pixels));
+        assert_eq!(attempts, [PathBuf::from("front.png")], "the two that failed are not tried again");
+    }
+
+    /// A cover that could not be read (here: gone since the folder was listed) costs its batch the
+    /// picture, and the next batch gets it once the file is readable again.
+    #[test]
+    fn a_cover_that_cannot_be_read_costs_its_batch_the_picture_and_the_next_batch_retries() {
+        let dir = temp_dir("cover-io-error");
+        let track = dir.join("track.flac");
+        let cover = dir.join("cover.jpg");
+        std::fs::write(&cover, wide_jpeg()).unwrap();
+        let mut batch = FolderPictureReads::default();
+        batch.listings.insert(dir.clone(), find_folder_art(&dir));
+        let embedded = embedded_square();
+        std::fs::rename(&cover, dir.join("moved-away")).unwrap();
+
+        let (pixels, source) = resolve_artwork(&track, Some(&embedded), &mut batch, ArtworkSource::None).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Embedded, SQUARE), "the batch falls back to the embedded picture");
+
+        // Same batch: the file is back, but the candidate is not hammered again.
+        std::fs::rename(dir.join("moved-away"), &cover).unwrap();
+        let (_pixels, source) = resolve_artwork(&track, Some(&embedded), &mut batch, ArtworkSource::None).unwrap();
+        assert_eq!(source, ArtworkSource::Embedded);
+
+        // The next batch lists the folder again and reads it.
+        let (pixels, source) = resolve_new(&track, Some(&embedded)).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, WIDE));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every new approximate album key of a batch resolves from scratch (`BatchArtwork::tiers`), but
+    /// the folder cover is read and decoded once: the second key is served from the batch's last
+    /// decoded picture, so it still works after the file is gone, while a batch of its own reads again.
+    #[test]
+    fn a_folder_cover_is_decoded_once_per_batch_however_many_album_keys_resolve_it() {
+        let dir = temp_dir("cover-reused-per-batch");
+        let track = dir.join("track.flac");
+        let cover = dir.join("cover.jpg");
+        std::fs::write(&cover, wide_jpeg()).unwrap();
+        let embedded = embedded_square();
+        let mut batch = FolderPictureReads::default();
+
+        let (first, source) = resolve_artwork(&track, Some(&embedded), &mut batch, ArtworkSource::None).unwrap();
+        assert_eq!((source, shape(&first)), (ArtworkSource::Folder, WIDE));
+
+        // A file that cannot be read any more proves the next resolve did not touch the disk.
+        std::fs::remove_file(&cover).unwrap();
+        let (second, source) = resolve_artwork(&track, Some(&embedded), &mut batch, ArtworkSource::None).unwrap();
+        assert_eq!((source, second), (ArtworkSource::Folder, first));
+
+        let (_pixels, source) =
+            resolve_artwork(&track, Some(&embedded), &mut FolderPictureReads::default(), ArtworkSource::None).unwrap();
+        assert_eq!(source, ArtworkSource::Embedded, "another batch does not reuse it: it reads the folder again");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A decode that panics is contained per candidate, so it costs the folder picture and not the
+    /// track's tags (`guarded` would otherwise fail the whole track).
+    #[test]
+    fn a_panicking_decode_counts_as_no_picture() {
+        assert_eq!(contain_panic(|| -> Option<u8> { panic!("decoder blew up") }), None);
+        assert_eq!(contain_panic(|| Some(7)), Some(7));
+        assert_eq!(contain_panic(|| None::<u8>), None);
+    }
+
+    /// Only a regular file is ever read: a `cover.jpg` that is a symlink to a directory, or to a FIFO
+    /// (which reports length 0, passes the size cap and used to block the read forever), is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_cover_that_is_not_a_regular_file_is_refused_without_blocking() {
+        let dir = temp_dir("cover-not-a-file");
+        let target_dir = dir.join("a-directory");
+        std::fs::create_dir(&target_dir).unwrap();
+        std::os::unix::fs::symlink(&target_dir, dir.join("cover.jpg")).unwrap();
+        assert!(read_folder_art(&dir.join("cover.jpg")).is_none());
+
+        let fifo = dir.join("front.png");
+        if std::process::Command::new("mkfifo").arg(&fifo).status().is_ok_and(|status| status.success()) {
+            let (done, result) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let _ = done.send(read_folder_art(&fifo).is_none());
+            });
+            assert_eq!(result.recv_timeout(Duration::from_secs(5)), Ok(true), "a FIFO is refused instead of blocking the scanner thread");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `best_so_far` is the album's best tier already sent: only a strictly better picture is looked
+    /// for, so an album is not re-resolved (or its embedded picture re-decoded) for every track.
+    #[test]
+    fn resolve_artwork_only_returns_pictures_that_beat_the_best_so_far() {
+        let dir = temp_dir("best-so-far");
+        let track = dir.join("track.flac");
+        let embedded = embedded_square();
+        let mut reads = FolderPictureReads::default();
+
+        // Nothing here: an embedded-only album produces its picture once, then nothing.
+        assert!(resolve_artwork(&track, Some(&embedded), &mut reads, ArtworkSource::None).is_some_and(|(_, source)| source == ArtworkSource::Embedded));
+        assert!(resolve_artwork(&track, Some(&embedded), &mut reads, ArtworkSource::Embedded).is_none());
+        assert!(resolve_artwork(&track, Some(&embedded), &mut reads, ArtworkSource::Folder).is_none());
+
+        // A legacy folder.jpg serves only an album with nothing yet, and an embedded picture upgrades it.
+        let legacy_dir = temp_dir("best-so-far-legacy");
+        let legacy_track = legacy_dir.join("track.flac");
+        std::fs::write(legacy_dir.join("folder.jpg"), panorama_jpeg()).unwrap();
+        assert!(resolve_artwork(&legacy_track, None, &mut reads, ArtworkSource::None).is_some_and(|(_, source)| source == ArtworkSource::FolderFallback));
+        assert!(resolve_artwork(&legacy_track, None, &mut reads, ArtworkSource::FolderFallback).is_none());
+        assert!(
+            resolve_artwork(&legacy_track, Some(&embedded), &mut reads, ArtworkSource::FolderFallback)
+                .is_some_and(|(_, source)| source == ArtworkSource::Embedded)
+        );
+
+        // A named cover found in any later folder upgrades embedded, and once found nothing else runs.
+        let named_dir = temp_dir("best-so-far-named");
+        let named_track = named_dir.join("track.flac");
+        std::fs::write(named_dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        let (pixels, source) = resolve_artwork(&named_track, Some(&embedded), &mut reads, ArtworkSource::Embedded).unwrap();
+        assert_eq!((source, shape(&pixels)), (ArtworkSource::Folder, WIDE));
+        assert!(resolve_artwork(&named_track, Some(&embedded), &mut reads, ArtworkSource::Folder).is_none());
+
+        for dir in [dir, legacy_dir, named_dir] {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The `Scanned` records of one request, in arrival order.
+    fn scan_records(scanner: &LibraryScanner, events: &Receiver<LibraryEvent>, paths: Vec<PathBuf>, explicit_selection: bool) -> Vec<TrackRecord> {
+        scan_records_excluding(scanner, events, paths, explicit_selection, HashSet::new())
+    }
+
+    /// `scan_records` for a request dispatched with an exclusion snapshot: phase 2 still reports every
+    /// track (`main.rs` is what drops the excluded ones).
+    fn scan_records_excluding(
+        scanner: &LibraryScanner,
+        events: &Receiver<LibraryEvent>,
+        paths: Vec<PathBuf>,
+        explicit_selection: bool,
+        excluded: HashSet<TrackKey>,
+    ) -> Vec<TrackRecord> {
+        let batch = scanner.scan(paths, explicit_selection, excluded);
+        collect_until_batch_done(events, batch)
+            .into_iter()
+            .filter_map(|event| match event {
+                LibraryEvent::Scanned(record) => Some(*record),
+                LibraryEvent::Failed { path, error, .. } => panic!("scanning {} failed: {error}", path.display()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A two-disc release whose tracks share one album key (no ALBUM tag, so `dir:<release folder>`
+    /// for both): `CD1/01.flac` carries an embedded picture and has no folder art, `CD2/01.flac` has
+    /// no embedded picture but a named `cover.jpg` beside it.
+    fn two_disc_release(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let release_dir = temp_dir(name);
+        let (cd1, cd2) = (release_dir.join("CD1"), release_dir.join("CD2"));
+        std::fs::create_dir_all(&cd1).unwrap();
+        std::fs::create_dir_all(&cd2).unwrap();
+        write_tagged_test_flac(&cd1.join("01.flac"), 44_100, 4_410);
+        std::fs::copy(fixture_path("decoder-tone.flac"), cd2.join("01.flac")).unwrap();
+        std::fs::write(cd2.join("cover.jpg"), wide_jpeg()).unwrap();
+        (release_dir.clone(), cd1.join("01.flac"), cd2.join("01.flac"))
+    }
+
+    /// An album merged from two folders where only the later-scanned one has a named cover: the
+    /// scanner must not treat the first track's embedded picture as "album already has art" — the
+    /// later track sends its named cover, which then wins in `AppState`.
+    #[test]
+    fn a_later_track_with_a_named_cover_still_sends_it_after_an_earlier_embedded_only_track() {
+        let (release_dir, cd1_track, cd2_track) = two_disc_release("art-embedded-then-named");
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+
+        // One request, so the dedup between the two tracks is what is under test.
+        let records = scan_records(&scanner, &events, vec![cd1_track.clone(), cd2_track.clone()], false);
+
+        let (first, second) = (&records[0], &records[1]);
+        assert_eq!((&first.key.path, &second.key.path), (&cd1_track, &cd2_track));
+        assert_eq!(album_key(first), album_key(second), "the two tracks must land in one album for this test to mean anything");
+        assert_eq!(first.artwork_source, ArtworkSource::Embedded);
+        assert_eq!(first.artwork.as_ref().map(shape), Some(SQUARE));
+        assert_eq!(second.artwork_source, ArtworkSource::Folder, "the later folder's named cover is still emitted");
+        assert_eq!(second.artwork.as_ref().map(shape), Some(WIDE));
+
+        std::fs::remove_dir_all(&release_dir).unwrap();
+    }
+
+    /// The other scan order: once the album's named cover was sent, a later track (whose own folder
+    /// only has an embedded picture) resolves nothing more.
+    #[test]
+    fn a_later_embedded_only_track_sends_nothing_once_the_albums_named_cover_was_sent() {
+        let (release_dir, cd1_track, cd2_track) = two_disc_release("art-named-then-embedded");
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+
+        let records = scan_records(&scanner, &events, vec![cd2_track.clone(), cd1_track.clone()], false);
+
+        let (first, second) = (&records[0], &records[1]);
+        assert_eq!((&first.key.path, &second.key.path), (&cd2_track, &cd1_track));
+        assert_eq!(album_key(first), album_key(second));
+        assert_eq!(first.artwork_source, ArtworkSource::Folder);
+        assert!(second.artwork.is_none(), "an embedded picture can never improve on a named cover");
+        assert_eq!(second.artwork_source, ArtworkSource::None);
+
+        std::fs::remove_dir_all(&release_dir).unwrap();
+    }
+
+    /// An embedded-only album sends its picture once, not once per track.
+    #[test]
+    fn an_embedded_only_album_sends_its_picture_once() {
+        let dir = temp_dir("art-embedded-once");
+        write_tagged_test_flac(&dir.join("01.flac"), 44_100, 4_410);
+        write_tagged_test_flac(&dir.join("02.flac"), 44_100, 4_410);
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+
+        let records = scan_records(&scanner, &events, vec![dir.join("01.flac"), dir.join("02.flac")], false);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.iter().filter(|record| record.artwork.is_some()).count(), 1);
+        assert_eq!(records.iter().filter(|record| record.artwork_source == ArtworkSource::Embedded).count(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The dedup lives for one request only. A later request can land tracks on an album key that has
+    /// no cached picture yet (after "Remove from Library" only part of an album is re-opened and its
+    /// group resolves to a different effective artist), so re-opening an album must resolve its
+    /// picture again instead of trusting that an earlier request already sent one; `AppState` keeps
+    /// the best tier per album across requests anyway.
+    #[test]
+    fn a_later_request_resolves_an_albums_artwork_again() {
+        let dir = temp_dir("art-per-request");
+        write_tagged_test_flac(&dir.join("01.flac"), 44_100, 4_410);
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+
+        let first = scan_records(&scanner, &events, vec![dir.join("01.flac")], false);
+        let second = scan_records(&scanner, &events, vec![dir.join("01.flac")], false);
+
+        for records in [&first, &second] {
+            assert_eq!(records[0].artwork_source, ArtworkSource::Embedded);
+            assert_eq!(records[0].artwork.as_ref().map(shape), Some(SQUARE));
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The user's own scenario, end to end: a folder is opened while it has no named cover (its tracks
+    /// carry embedded pictures), a `cover.jpg` is dropped into it, and the folder is opened again. The
+    /// second request lists the folder afresh (nothing about a folder outlives its batch), so its record
+    /// carries the cover at the `Folder` tier, which `AppState::cache_artwork` lets replace the embedded
+    /// picture the first request produced.
+    #[test]
+    fn a_cover_added_between_two_requests_is_found_by_the_second_and_outranks_the_embedded_picture() {
+        let dir = temp_dir("art-cover-added-later");
+        write_tagged_test_flac(&dir.join("01.flac"), 44_100, 4_410);
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+
+        let first = scan_records(&scanner, &events, vec![dir.join("01.flac")], false);
+        assert_eq!(first[0].artwork_source, ArtworkSource::Embedded);
+        assert_eq!(first[0].artwork.as_ref().map(shape), Some(SQUARE));
+
+        std::fs::write(dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        let second = scan_records(&scanner, &events, vec![dir.join("01.flac")], false);
+
+        assert_eq!(second[0].artwork_source, ArtworkSource::Folder);
+        assert!(second[0].artwork_source > first[0].artwork_source);
+        assert_eq!(second[0].artwork.as_ref().map(shape), Some(WIDE), "the folder cover's pixels, not the tag picture's");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `main.rs` drops an excluded track's record, so it must not be the one that "already sent" the
+    /// album's picture: with the album's first track excluded, an included sibling of the same album
+    /// (same folder, no album tag, so one `dir:` key) still carries the named cover, in either order.
+    #[test]
+    fn an_excluded_track_never_suppresses_an_included_siblings_picture() {
+        let dir = temp_dir("art-excluded-sibling");
+        let (first, second) = (dir.join("01.flac"), dir.join("11.flac"));
+        write_tagged_test_flac(&first, 44_100, 4_410);
+        write_tagged_test_flac(&second, 44_100, 4_410);
+        std::fs::write(dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+
+        let records = scan_records(&scanner, &events, vec![first.clone(), second.clone()], false);
+        assert_eq!(album_key(&records[0]), album_key(&records[1]), "one album for this test to mean anything");
+        assert!(records[0].artwork.is_some() && records[1].artwork.is_none(), "without exclusions the first track carries the album's picture");
+
+        for paths in [vec![first.clone(), second.clone()], vec![second.clone(), first.clone()]] {
+            let excluded = HashSet::from([TrackKey::whole_file(first.clone())]);
+            let records = scan_records_excluding(&scanner, &events, paths, false, excluded);
+            assert_eq!(records.len(), 2, "phase 2 itself still reports every track");
+            let excluded_record = records.iter().find(|record| record.key.path == first).unwrap();
+            let included_record = records.iter().find(|record| record.key.path == second).unwrap();
+            assert!(excluded_record.artwork.is_none() && excluded_record.artwork_source == ArtworkSource::None);
+            assert_eq!(included_record.artwork_source, ArtworkSource::Folder);
+            assert_eq!(included_record.artwork.as_ref().map(shape), Some(WIDE));
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same for a cue-derived file: its one picture rides on the first track that is not excluded,
+    /// and on none when every track is.
+    #[test]
+    fn a_cue_files_picture_rides_on_its_first_non_excluded_track() {
+        let dir = temp_dir("cue-art-excluded");
+        write_tagged_test_flac(&dir.join("decoder-tone.flac"), 44_100, 88_200);
+        std::fs::write(dir.join("album.cue"), SYNTHETIC_CUE).unwrap();
+        std::fs::write(dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+        let cue = || vec![dir.join("album.cue")];
+
+        let records = scan_records(&scanner, &events, cue(), true);
+        let first_key = records.iter().find(|record| record.tags.track_number == Some(1)).unwrap().key.clone();
+        let second_key = records.iter().find(|record| record.tags.track_number == Some(2)).unwrap().key.clone();
+
+        let records = scan_records_excluding(&scanner, &events, cue(), true, HashSet::from([first_key.clone()]));
+        let first = records.iter().find(|record| record.key == first_key).unwrap();
+        let second = records.iter().find(|record| record.key == second_key).unwrap();
+        assert!(first.artwork.is_none() && first.artwork_source == ArtworkSource::None, "the excluded track carries nothing");
+        assert_eq!(second.artwork_source, ArtworkSource::Folder);
+        assert_eq!(second.artwork.as_ref().map(shape), Some(WIDE));
+
+        let records = scan_records_excluding(&scanner, &events, cue(), true, HashSet::from([first_key, second_key]));
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|record| record.artwork.is_none()), "nothing to carry it when every track is excluded");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The cue path resolves with the same tiers: a named cover beats the physical file's embedded
+    /// picture, which beats nothing, and the source travels on the record (attached to the first cue
+    /// track only) so `AppState` can compare tiers.
+    #[test]
+    fn cue_tracks_resolve_artwork_with_the_same_tiers() {
+        let with_cover = temp_dir("cue-art-named");
+        let embedded_only = temp_dir("cue-art-embedded");
+        for dir in [&with_cover, &embedded_only] {
+            // Two seconds, so the sheet's second TRACK (at 00:01:00) starts inside the file.
+            write_tagged_test_flac(&dir.join("decoder-tone.flac"), 44_100, 88_200);
+            std::fs::write(dir.join("album.cue"), SYNTHETIC_CUE).unwrap();
+        }
+        std::fs::write(with_cover.join("Front.jpg"), wide_jpeg()).unwrap();
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+
+        let records = scan_records(&scanner, &events, vec![with_cover.join("album.cue")], true);
+        assert_eq!(records.len(), 2, "the sheet's two TRACKs");
+        let first = records.iter().find(|record| record.tags.track_number == Some(1)).unwrap();
+        let second = records.iter().find(|record| record.tags.track_number == Some(2)).unwrap();
+        assert_eq!(first.artwork_source, ArtworkSource::Folder, "a named cover beats the embedded picture for cue tracks too");
+        assert_eq!(first.artwork.as_ref().map(shape), Some(WIDE));
+        assert!(second.artwork.is_none() && second.artwork_source == ArtworkSource::None, "the picture rides on one track per physical file");
+
+        let records = scan_records(&scanner, &events, vec![embedded_only.join("album.cue")], true);
+        let first = records.iter().find(|record| record.tags.track_number == Some(1)).unwrap();
+        assert_eq!(first.artwork_source, ArtworkSource::Embedded);
+        assert_eq!(first.artwork.as_ref().map(shape), Some(SQUARE));
+
+        for dir in [with_cover, embedded_only] {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Every `FILE` of one sheet shares its album key, so a multi-`FILE` sheet (one `.flac` per track)
+    /// reads and decodes the folder cover once — not once per physical file, each time over the NAS.
+    #[test]
+    fn a_multi_file_cue_sheet_resolves_its_artwork_once() {
+        let dir = temp_dir("cue-art-two-files");
+        write_tagged_test_flac(&dir.join("a.flac"), 44_100, 44_100);
+        write_tagged_test_flac(&dir.join("b.flac"), 44_100, 44_100);
+        std::fs::write(dir.join("cover.jpg"), wide_jpeg()).unwrap();
+        std::fs::write(
+            dir.join("album.cue"),
+            "TITLE \"Two Files\"\r\nPERFORMER \"Album Artist\"\r\n\
+FILE \"a.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n\
+FILE \"b.flac\" WAVE\r\n  TRACK 02 AUDIO\r\n    INDEX 01 00:00:00\r\n",
+        )
+        .unwrap();
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+
+        let records = scan_records(&scanner, &events, vec![dir.join("album.cue")], true);
+
+        assert_eq!(records.len(), 2, "one track per FILE");
+        assert_eq!(album_key(&records[0]), album_key(&records[1]), "both FILEs land in one album for this test to mean anything");
+        let with_art: Vec<&TrackRecord> = records.iter().filter(|record| record.artwork.is_some()).collect();
+        assert_eq!(with_art.len(), 1, "the album's picture is sent once");
+        assert_eq!(with_art[0].artwork_source, ArtworkSource::Folder);
+        assert_eq!(with_art[0].artwork.as_ref().map(shape), Some(WIDE));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -982,7 +2103,7 @@ mod tests {
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        scanner.scan(vec![flac_path.clone(), wav_path.clone(), bad_path.clone()], false);
+        scanner.scan(vec![flac_path.clone(), wav_path.clone(), bad_path.clone()], false, HashSet::new());
 
         // The bad file sorts last, so phase 1 emits its `Failed` inline before the batch's single
         // `Probed`, which only goes out once the whole request has been walked (`§3.3`) — collect
@@ -1006,7 +2127,7 @@ mod tests {
         // first (`§3.3` "one Probed event per scan request, in request order").
         let second_path = dir.join("second.flac");
         std::fs::copy(fixture_path("decoder-tone.flac"), &second_path).unwrap();
-        scanner.scan(vec![second_path.clone()], false);
+        scanner.scan(vec![second_path.clone()], false, HashSet::new());
         let mut second_probed: Option<Vec<PreparedTrack>> = None;
         let second_deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < second_deadline && second_probed.is_none() {
@@ -1072,8 +2193,8 @@ mod tests {
 
         let (request_tx, request_rx) = unbounded::<ScanRequest>();
         let (event_tx, event_rx) = unbounded::<LibraryEvent>();
-        request_tx.send(ScanRequest { batch: 0, paths: vec![first_a.clone(), first_b.clone()], explicit_selection: false }).unwrap();
-        request_tx.send(ScanRequest { batch: 1, paths: vec![second.clone()], explicit_selection: false }).unwrap();
+        request_tx.send(ScanRequest { batch: 0, paths: vec![first_a.clone(), first_b.clone()], explicit_selection: false, excluded: HashSet::new() }).unwrap();
+        request_tx.send(ScanRequest { batch: 1, paths: vec![second.clone()], explicit_selection: false, excluded: HashSet::new() }).unwrap();
         let worker = thread::spawn(move || run(request_rx, event_tx));
 
         let mut first_probed = false;
@@ -1136,8 +2257,8 @@ mod tests {
 
         let (request_tx, request_rx) = unbounded::<ScanRequest>();
         let (event_tx, event_rx) = unbounded::<LibraryEvent>();
-        request_tx.send(ScanRequest { batch: 0, paths: vec![cue_path.clone()], explicit_selection: true }).unwrap();
-        request_tx.send(ScanRequest { batch: 1, paths: vec![second.clone()], explicit_selection: false }).unwrap();
+        request_tx.send(ScanRequest { batch: 0, paths: vec![cue_path.clone()], explicit_selection: true, excluded: HashSet::new() }).unwrap();
+        request_tx.send(ScanRequest { batch: 1, paths: vec![second.clone()], explicit_selection: false, excluded: HashSet::new() }).unwrap();
         let worker = thread::spawn(move || run(request_rx, event_tx));
 
         let mut first_probed = false;
@@ -1188,7 +2309,7 @@ mod tests {
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        let batch = scanner.scan_folder(dir.clone());
+        let batch = scanner.scan_folder(dir.clone(), HashSet::new());
 
         let mut probed: Option<Vec<PathBuf>> = None;
         let mut batch_done = false;
@@ -1224,7 +2345,7 @@ mod tests {
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        let batch = scanner.scan_folder(dir.clone());
+        let batch = scanner.scan_folder(dir.clone(), HashSet::new());
 
         let mut failed = false;
         let mut batch_done = false;
@@ -1320,7 +2441,7 @@ FILE \"decoder-tone.flac\" WAVE\r\n\
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        scanner.scan(vec![cue_path.clone()], true);
+        scanner.scan(vec![cue_path.clone()], true, HashSet::new());
 
         let mut scanned: Vec<TrackRecord> = Vec::new();
         let mut batch_done = false;
@@ -1369,7 +2490,7 @@ FILE \"decoder-tone.flac\" WAVE\r\n\
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        let batch = scanner.scan(vec![dir.join("decoder-tone.flac"), dir.join("unclaimed.wav")], true);
+        let batch = scanner.scan(vec![dir.join("decoder-tone.flac"), dir.join("unclaimed.wav")], true, HashSet::new());
 
         let mut probed_tracks: Vec<PreparedTrack> = Vec::new();
         let mut batch_done = false;
@@ -1420,7 +2541,7 @@ FILE \"decoder-tone.flac\" WAVE\r\n\
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        let batch = scanner.scan(vec![dir.join("decoder-tone.flac")], true);
+        let batch = scanner.scan(vec![dir.join("decoder-tone.flac")], true, HashSet::new());
 
         let mut saw_cue_failure = false;
         let mut probed_tracks: Vec<PreparedTrack> = Vec::new();
@@ -1472,7 +2593,7 @@ FILE \"decoder-tone.flac\" WAVE\r\n\
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        let batch = scanner.scan(vec![dir.join("decoder-tone.flac")], true);
+        let batch = scanner.scan(vec![dir.join("decoder-tone.flac")], true, HashSet::new());
 
         let mut saw_cue_failure = false;
         let mut probed_tracks: Vec<PreparedTrack> = Vec::new();
@@ -1524,7 +2645,7 @@ FILE \"decoder-tone.flac\" WAVE\r\n\
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        let batch = scanner.scan(vec![cue_path.clone()], true);
+        let batch = scanner.scan(vec![cue_path.clone()], true, HashSet::new());
 
         let mut saw_probe_failure = false;
         let mut scanned = Vec::new();
@@ -1568,7 +2689,7 @@ FILE \"track2.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        let batch = scanner.scan(vec![dir.join("track1.flac")], true);
+        let batch = scanner.scan(vec![dir.join("track1.flac")], true, HashSet::new());
 
         let mut probed_tracks: Vec<PreparedTrack> = Vec::new();
         let mut batch_done = false;
@@ -1613,7 +2734,7 @@ FILE \"track2.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
 
         let scanner = LibraryScanner::new();
         let events = scanner.events();
-        let batch = scanner.scan(vec![dir.join("track1.flac")], false);
+        let batch = scanner.scan(vec![dir.join("track1.flac")], false, HashSet::new());
 
         let mut probed_tracks: Vec<PreparedTrack> = Vec::new();
         let mut batch_done = false;
@@ -1681,7 +2802,7 @@ FILE \"track2.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
         // (`claimed_paths.contains`) from fix B's own restriction, which would otherwise also
         // (for the wrong reason) exclude the cue track here since the resolved path's case differs
         // from the requested path's.
-        let batch = scanner.scan(vec![dir.join("Track.flac")], false);
+        let batch = scanner.scan(vec![dir.join("Track.flac")], false, HashSet::new());
 
         let mut probed_tracks: Vec<PreparedTrack> = Vec::new();
         let mut batch_done = false;
@@ -1711,4 +2832,207 @@ FILE \"track2.flac\" WAVE\r\n  TRACK 01 AUDIO\r\n    INDEX 01 00:00:00\r\n";
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Sample-rate repair (`audio::rate_repair`, `library::repair`)
+    // -----------------------------------------------------------------------------------------
+
+    /// Every event of `batch`, in arrival order, up to and including its `BatchDone`.
+    fn collect_until_batch_done(events: &Receiver<LibraryEvent>, batch: u64) -> Vec<LibraryEvent> {
+        let mut collected = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            let event = events.recv_timeout(wait).expect("the batch should finish");
+            let done = matches!(&event, LibraryEvent::BatchDone { batch: id, .. } if *id == batch);
+            collected.push(event);
+            if done {
+                return collected;
+            }
+        }
+    }
+
+    fn probed_sample_rates(events: &[LibraryEvent]) -> Vec<(PathBuf, u32)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                LibraryEvent::Probed { tracks, .. } => Some(tracks.iter().map(|track| (track.key.path.clone(), track.info.sample_rate))),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn scanner_with_rate_repair(dir: &Path) -> LibraryScanner {
+        LibraryScanner::with_rate_repair(RateRepairConfig { backup_dir: dir.join("backups") })
+    }
+
+    #[test]
+    fn a_37800_hz_flac_is_repaired_before_it_reaches_the_library() {
+        let dir = temp_dir("repair-scan");
+        let path = dir.join("heat.flac");
+        write_tagged_test_flac(&path, 37_800, 30_000);
+        let original = std::fs::read(&path).unwrap();
+
+        let scanner = scanner_with_rate_repair(&dir);
+        let events = scanner.events();
+        let batch = scanner.scan(vec![path.clone()], true, HashSet::new());
+        let collected = collect_until_batch_done(&events, batch);
+
+        let repaired = collected.iter().find_map(|event| match event {
+            LibraryEvent::RateRepaired { from_rate, to_rate, backup, .. } => Some((*from_rate, *to_rate, backup.clone())),
+            _ => None,
+        });
+        let (from_rate, to_rate, backup) = repaired.expect("a RateRepaired event");
+        assert_eq!((from_rate, to_rate), (37_800, 44_100));
+        assert_eq!(std::fs::read(backup).unwrap(), original, "the untouched original is kept");
+
+        // The track is announced once, with the rate of the file that is now on disk.
+        assert_eq!(probed_sample_rates(&collected), vec![(path.clone(), 44_100)]);
+        let scanned: Vec<_> = collected.iter().filter_map(|event| match event {
+            LibraryEvent::Scanned(record) => Some((record.key.path.clone(), record.info.sample_rate, record.tags.title.clone())),
+            _ => None,
+        }).collect();
+        assert_eq!(scanned, vec![(path.clone(), 44_100, Some("Heat - The Heat Is On".to_owned()))], "tags survive the rewrite");
+        assert!(matches!(collected.last(), Some(LibraryEvent::BatchDone { requested: 1, count: 1, .. })));
+        assert!(!collected.iter().any(|event| matches!(event, LibraryEvent::Failed { .. } | LibraryEvent::RateRepairFailed { .. })));
+
+        // Scanning the repaired file again is a plain scan: idempotent, nothing is rewritten.
+        let repaired_bytes = std::fs::read(&path).unwrap();
+        let batch = scanner.scan(vec![path.clone()], true, HashSet::new());
+        let collected = collect_until_batch_done(&events, batch);
+        assert!(!collected.iter().any(|event| matches!(event, LibraryEvent::RateRepaired { .. } | LibraryEvent::RateRepairFailed { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), repaired_bytes);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Repairing one file must not hold up the rest of its batch: the standard-rate file is announced
+    /// straight from phase 1, and the batch only finishes once the held-back file has been resumed.
+    #[test]
+    fn a_repair_does_not_delay_the_other_files_of_its_batch() {
+        let dir = temp_dir("repair-siblings");
+        let odd = dir.join("a-odd.flac");
+        let standard = dir.join("b-standard.flac");
+        write_tagged_test_flac(&odd, 37_800, 30_000);
+        std::fs::copy(fixture_path("decoder-tone.flac"), &standard).unwrap();
+
+        let scanner = scanner_with_rate_repair(&dir);
+        let events = scanner.events();
+        let batch = scanner.scan(vec![odd.clone(), standard.clone()], false, HashSet::new());
+        let collected = collect_until_batch_done(&events, batch);
+
+        match &collected[0] {
+            LibraryEvent::Probed { tracks, .. } => {
+                assert_eq!(tracks.iter().map(|track| track.key.path.clone()).collect::<Vec<_>>(), vec![standard.clone()]);
+            }
+            _ => panic!("the first event must be the standard-rate file's Probed"),
+        }
+        let mut rates = probed_sample_rates(&collected);
+        rates.sort();
+        assert_eq!(rates, vec![(odd.clone(), 44_100), (standard.clone(), 44_100)]);
+        let scanned = collected.iter().filter(|event| matches!(event, LibraryEvent::Scanned(_))).count();
+        assert_eq!(scanned, 2);
+        assert!(matches!(collected.last(), Some(LibraryEvent::BatchDone { requested: 2, count: 2, .. })));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_scanner_without_rate_repair_never_touches_the_file() {
+        let dir = temp_dir("repair-off");
+        let path = dir.join("heat.flac");
+        write_tagged_test_flac(&path, 37_800, 20_000);
+        let original = std::fs::read(&path).unwrap();
+
+        let scanner = LibraryScanner::new();
+        let events = scanner.events();
+        let batch = scanner.scan(vec![path.clone()], false, HashSet::new());
+        let collected = collect_until_batch_done(&events, batch);
+
+        assert_eq!(probed_sample_rates(&collected), vec![(path.clone(), 37_800)]);
+        assert!(!collected.iter().any(|event| matches!(event, LibraryEvent::RateRepaired { .. } | LibraryEvent::RateRepairFailed { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file that cannot be rewritten (read-only here) is still added exactly as it is on disk, the
+    /// failure is reported once, and rescanning it does not try again.
+    #[test]
+    fn a_failed_repair_reports_once_and_the_track_is_still_added_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("repair-fails");
+        let path = dir.join("locked.flac");
+        write_tagged_test_flac(&path, 37_800, 20_000);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let scanner = scanner_with_rate_repair(&dir);
+        let events = scanner.events();
+        let batch = scanner.scan(vec![path.clone()], false, HashSet::new());
+        let collected = collect_until_batch_done(&events, batch);
+
+        let failures: Vec<&String> = collected
+            .iter()
+            .filter_map(|event| match event {
+                LibraryEvent::RateRepairFailed { error, .. } => Some(error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("read-only"), "{}", failures[0]);
+        assert_eq!(probed_sample_rates(&collected), vec![(path.clone(), 37_800)]);
+        assert!(matches!(collected.last(), Some(LibraryEvent::BatchDone { requested: 1, count: 1, .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        // No retry loop: the second scan of the same path is a plain scan.
+        let batch = scanner.scan(vec![path.clone()], false, HashSet::new());
+        let collected = collect_until_batch_done(&events, batch);
+        assert!(!collected.iter().any(|event| matches!(event, LibraryEvent::RateRepairFailed { .. })));
+        assert_eq!(probed_sample_rates(&collected), vec![(path.clone(), 37_800)]);
+        assert!(matches!(collected.last(), Some(LibraryEvent::BatchDone { count: 1, .. })));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Batch accounting is per batch id, not "whatever is at the front": a batch still waiting on its
+    /// repair must not swallow, or be finished by, the items of a batch that arrived after it.
+    #[test]
+    fn a_batch_waiting_on_a_repair_does_not_misattribute_a_later_batchs_items() {
+        let dir = temp_dir("repair-two-batches");
+        let odd = dir.join("odd.flac");
+        let standard = dir.join("standard.flac");
+        write_tagged_test_flac(&odd, 37_800, 30_000);
+        std::fs::copy(fixture_path("decoder-tone.flac"), &standard).unwrap();
+
+        let scanner = scanner_with_rate_repair(&dir);
+        let events = scanner.events();
+        let first = scanner.scan(vec![odd.clone()], false, HashSet::new());
+        let second = scanner.scan(vec![standard.clone()], false, HashSet::new());
+
+        let mut done = std::collections::HashMap::new();
+        let mut scanned_by_path = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while done.len() < 2 {
+            let wait = deadline.saturating_duration_since(std::time::Instant::now());
+            match events.recv_timeout(wait).expect("both batches should finish") {
+                LibraryEvent::BatchDone { batch, requested, count } => {
+                    done.insert(batch, (requested, count));
+                }
+                LibraryEvent::Scanned(record) => scanned_by_path.push(record.key.path.clone()),
+                _ => {}
+            }
+        }
+        assert_eq!(done[&first], (1, 1));
+        assert_eq!(done[&second], (1, 1));
+        scanned_by_path.sort();
+        assert_eq!(scanned_by_path, vec![odd, standard]);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }
+
+

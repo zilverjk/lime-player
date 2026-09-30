@@ -45,10 +45,14 @@ export global Theme {
     out property <color> icon-transport-disabled: #535852;
     out property <color> art-placeholder-bg: #1f221f;
     out property <color> art-placeholder-icon: #4c524b;
+    // Destructive actions (the album card's "Remove from Library" menu item, `§5.5`): text/icon
+    // color for that one item, plus its hover tint via `.with-alpha(...)` (no separate hover token).
+    out property <color> danger: #ff5a5f;
 
-    // Album format pill colors (`§5.5`/`§5.7`): MP3 reuses `accent-soft`/`accent-strong` above
-    // (the same lime green the Hi-Res badge already uses). Each pair follows that same shape — a
-    // dark, low-luminance background plus a bright, readable-on-black text color.
+    // Format pill colors (`§5.5`/`§5.7`), shared by the album-level pill and each per-track pill:
+    // MP3 reuses `accent-soft`/`accent-strong` above (the app's lime accent). Each pair follows
+    // that same shape — a dark, low-luminance background plus a bright, readable-on-black text
+    // color.
     out property <color> flac-soft: #241f33;
     out property <color> flac-strong: #b38ef5;
     out property <color> wavpack-soft: #332c1f;
@@ -57,6 +61,16 @@ export global Theme {
     out property <color> mix-strong: #5ab3f5;
     out property <color> wav-soft: #242524;
     out property <color> wav-strong: #c7cac6;
+
+    // "Now playing" animated bars (`PlayingBars`, widgets.slint), one gradient stop pair per bar
+    // family, sampled from `assets/icon.svg`'s own `outer`/`bar` gradient defs so the row indicator
+    // matches the app icon exactly. The outer two bars use `playing-bars-outer-*`; the inner three
+    // use `playing-bars-inner-*`.
+    out property <color> playing-bars-outer-top: #6be676;
+    out property <color> playing-bars-outer-bottom: #27cc4c;
+    out property <color> playing-bars-inner-top: #bdf65a;
+    out property <color> playing-bars-inner-mid: #8ef552;
+    out property <color> playing-bars-inner-bottom: #36e85a;
 
     // Typography (`§5.2`).
     out property <length> fs-caption: 10px;
@@ -87,6 +101,13 @@ export global Theme {
     out property <length> icon-small: 18px;
     out property <length> icon-inline: 14px;
     out property <length> icon-action: 16px;
+    // Bounding box (width) of the `PlayingBars` "now playing" indicator (widgets.slint) in the "#"
+    // column; its height follows the bars' own aspect ratio (see `PlayingBars`), so no separate
+    // height token exists here. Held at 24px rather than a smaller ~16px glyph size: below ~22px
+    // the individual bars are under ~3px wide, and Slint 1.18.1's software renderer mis-rasterizes
+    // a gradient-filled rounded rect that thin (confirmed empirically down to 20px, where the
+    // tallest/middle bar renders with a collapsed height) — see `PlayingBars`'s own comment.
+    out property <length> icon-playing-bars: 24px;
     out property <length> bar-art: 48px;
     out property <length> panel-art: 260px;
     out property <length> detail-art: 200px;
@@ -143,8 +164,10 @@ export global Icons {
     out property <image> panel-right: @image-url("icons/panel-right.svg");
     out property <image> circle-plus: @image-url("icons/circle-plus.svg");
     out property <image> list-next: @image-url("icons/list-next.svg");
-    out property <image> now-playing: @image-url("icons/now-playing.svg");
     out property <image> calendar: @image-url("icons/calendar.svg");
     out property <image> lyrics: @image-url("icons/lyrics.svg");
     out property <image> artists: @image-url("icons/artists.svg");
+    // Album card's "more" menu (`§5.5` "Remove from Library").
+    out property <image> more-vertical: @image-url("icons/more-vertical.svg");
+    out property <image> trash: @image-url("icons/trash.svg");
 }

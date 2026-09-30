@@ -8,7 +8,7 @@ use slint::Image;
 use crate::app_state::AppState;
 use crate::audio::{AudioInfo, AudioPlayer, PreparedTrack, QueueTrackSnapshot};
 use crate::library::format::{
-    format_album_card_subtitle, format_album_meta, format_badge, format_clock, format_library_summary, format_search_section_header, is_hi_res,
+    format_album_card_subtitle, format_album_meta, format_badge, format_clock, format_library_summary, format_search_section_header, track_format,
 };
 use crate::library::{
     AlbumSummary, ArtistSummary, Library, TrackKey, TrackRecord, display_album, display_artist, display_title, shuffled, track_key_string,
@@ -35,6 +35,7 @@ struct RowFallback<'a> {
 /// projection that already holds a `&TrackRecord` (`project_song_rows`, `project_album_tracks`).
 fn track_row_from_record(record: &TrackRecord, number: String) -> TrackRowData {
     let info = &record.info;
+    let format = track_format(&info.format);
     TrackRowData {
         key: track_key_string(&record.key).into(),
         number: number.into(),
@@ -44,7 +45,8 @@ fn track_row_from_record(record: &TrackRecord, number: String) -> TrackRowData {
         year: record.tags.year.map(|year| year.to_string()).unwrap_or_default().into(),
         duration: info.duration_ms.map(format_clock).unwrap_or_else(|| "\u{2014}:\u{2014}".to_owned()).into(),
         badge: format_badge(&info.format, info.bits_per_sample, info.sample_rate, info.is_float).into(),
-        hi_res: is_hi_res(info.bits_per_sample, info.sample_rate, info.format.eq_ignore_ascii_case("MP3")),
+        format_label: format.label().into(),
+        format_variant: format.variant().into(),
     }
 }
 
@@ -54,6 +56,7 @@ fn build_track_row(key: &TrackKey, library: &Library, number: String, fallback: 
         None => {
             let key = track_key_string(key);
             let duration = fallback.duration_ms.map(format_clock).unwrap_or_else(|| "\u{2014}:\u{2014}".to_owned());
+            let format = track_format(fallback.format);
             TrackRowData {
                 key: key.into(),
                 number: number.into(),
@@ -63,7 +66,8 @@ fn build_track_row(key: &TrackKey, library: &Library, number: String, fallback: 
                 year: fallback.year.into(),
                 duration: duration.into(),
                 badge: format_badge(fallback.format, fallback.bits_per_sample, fallback.sample_rate, fallback.is_float).into(),
-                hi_res: is_hi_res(fallback.bits_per_sample, fallback.sample_rate, fallback.format.eq_ignore_ascii_case("MP3")),
+                format_label: format.label().into(),
+                format_variant: format.variant().into(),
             }
         }
     }
@@ -526,15 +530,21 @@ mod tests {
         assert_eq!(rows[0].artist, "Real Artist");
         assert_eq!(rows[0].badge, "FLAC 24/96");
         assert_eq!(rows[0].duration, "1:35");
+        assert_eq!(rows[0].format_label, "FLAC", "a library-backed row's format pill comes from its own AudioInfo.format");
+        assert_eq!(rows[0].format_variant, "flac");
         assert_eq!(rows[1].number, "2");
         assert_eq!(rows[1].title, "Second Track", "no library record: falls back to the snapshot title");
         assert_eq!(rows[1].album, "Album B", "no library record: falls back to the snapshot parent folder");
         assert_eq!(rows[1].artist, "Unknown Artist");
         assert_eq!(rows[1].duration, "\u{2014}:\u{2014}");
+        assert_eq!(rows[1].format_label, "MP3", "a fallback row (no library record yet) still gets a format pill from the snapshot");
+        assert_eq!(rows[1].format_variant, "mp3");
         assert_eq!(
             rows[2].badge, "WavPack 32f/48",
             "a pending row with no library record must still badge as float from the snapshot, not silently as integer"
         );
+        assert_eq!(rows[2].format_label, "WavPack");
+        assert_eq!(rows[2].format_variant, "wavpack");
     }
 
     #[test]
@@ -551,6 +561,8 @@ mod tests {
         assert_eq!(current.album, "Fallback Album");
         assert_eq!(current.badge, "WavPack 32f/48");
         assert_eq!(current.duration, "3:20");
+        assert_eq!(current.format_label, "WavPack");
+        assert_eq!(current.format_variant, "wavpack");
     }
 
     #[test]
@@ -623,8 +635,12 @@ mod tests {
         let mut only = tagged_track("/music/Solo/01.flac", "FLAC", 16, 44_100, false, Some(200_000));
         only.tags.album = Some("Solo Album".into());
         only.tags.track_number = Some(1);
-        let key = crate::library::album_key(&only);
+        let path = only.key.clone();
         library.upsert(only);
+        // The library-resolved key: `only` carries no `ARTIST`/`ALBUMARTIST` at all, so `Library`
+        // resolves its `effective_album_artist` from `display_artist`'s "Unknown Artist" fallback
+        // (`EffectiveAlbumArtist`), which only the stored record reflects.
+        let key = crate::library::album_key(library.get(&path).unwrap());
 
         let (rows, _) = project_album_tracks(&library, &key);
 
@@ -639,9 +655,11 @@ mod tests {
         first.tags.album = Some("Folder Album".into());
         let mut second = tagged_track("/music/Folder/b.wav", "WAV", 16, 44_100, false, Some(180_000));
         second.tags.album = Some("Folder Album".into());
-        let key = crate::library::album_key(&first);
+        let path = first.key.clone();
         library.upsert(first);
         library.upsert(second);
+        // Library-resolved key — see the identical comment on the single-disc test above.
+        let key = crate::library::album_key(library.get(&path).unwrap());
 
         let (rows, _) = project_album_tracks(&library, &key);
 
@@ -670,6 +688,42 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].number, "2-02", "an untagged multi-disc track must fall back to its row index, not \"-00\"");
+    }
+
+    #[test]
+    fn track_rows_project_a_per_track_format_pill_for_every_format_family() {
+        let mut library = Library::new();
+        let mut mp3_track = tagged_track("/music/Mixed/01.mp3", "MP3", 16, 44_100, false, Some(60_000));
+        mp3_track.tags.album = Some("Mixed Bag".into());
+        mp3_track.tags.track_number = Some(1);
+        let mut flac_track = tagged_track("/music/Mixed/02.flac", "FLAC", 24, 96_000, false, Some(60_000));
+        flac_track.tags.album = Some("Mixed Bag".into());
+        flac_track.tags.track_number = Some(2);
+        let mut wavpack_track = tagged_track("/music/Mixed/03.wv", "WavPack", 24, 96_000, false, Some(60_000));
+        wavpack_track.tags.album = Some("Mixed Bag".into());
+        wavpack_track.tags.track_number = Some(3);
+        let mut wav_track = tagged_track("/music/Mixed/04.wav", "WAV", 16, 44_100, false, Some(60_000));
+        wav_track.tags.album = Some("Mixed Bag".into());
+        wav_track.tags.track_number = Some(4);
+        let path = mp3_track.key.clone();
+        library.upsert(mp3_track);
+        library.upsert(flac_track);
+        library.upsert(wavpack_track);
+        library.upsert(wav_track);
+        // Library-resolved key — see the identical comment on the single-disc test above.
+        let album_key = crate::library::album_key(library.get(&path).unwrap());
+
+        let (rows, _) = project_album_tracks(&library, &album_key);
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!((rows[0].format_label.as_str(), rows[0].format_variant.as_str()), ("MP3", "mp3"));
+        assert_eq!((rows[1].format_label.as_str(), rows[1].format_variant.as_str()), ("FLAC", "flac"));
+        assert_eq!((rows[2].format_label.as_str(), rows[2].format_variant.as_str()), ("WavPack", "wavpack"));
+        assert_eq!(
+            (rows[3].format_label.as_str(), rows[3].format_variant.as_str()),
+            ("WAV", "wav"),
+            "a per-track pill never aggregates to Mix — it always reflects that one track's own format"
+        );
     }
 
     #[test]
@@ -987,6 +1041,12 @@ mod ui_contract {
         &after[..end]
     }
 
+    /// `source` without its `//` comments (no `.slint` file holds a `//` inside a string), so a test
+    /// can assert something is absent from the code even when a comment explains why it is.
+    fn without_comments(source: &str) -> String {
+        source.lines().map(|line| line.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n")
+    }
+
     #[test]
     fn slint_sources_contain_no_mock_catalog_data() {
         let banned = [
@@ -1206,6 +1266,32 @@ mod ui_contract {
         assert_eq!(unified_bindings, 3, "Sidebar, TopBar and NowPlayingPanel must all forward MainWindow's unified-title-bar");
     }
 
+    /// "Remove from Library" (`CLAUDE.md` "Library exclusions"): the album card's three-dot menu
+    /// must use the dedicated `Theme.danger` token (declared and referenced, like the format-pill
+    /// tokens above) for both its trash icon and its label, its own popup must not use the default
+    /// `close-on-click` policy (same `ComboBox`-inside-a-popup trap as `output-popup`), and its
+    /// click handler must be scoped to a TouchArea distinct from the whole-card one so opening the
+    /// menu never also opens the album.
+    #[test]
+    fn remove_from_library_menu_contract() {
+        let declaration_needle = "out property <color> danger:";
+        assert!(THEME_SLINT.contains(declaration_needle), "theme.slint must declare `danger`");
+        assert!(WIDGETS_SLINT.contains("Theme.danger"), "`danger` is declared but never referenced in widgets.slint");
+
+        let album_tile = extract_component(WIDGETS_SLINT, "AlbumTile");
+        assert!(album_tile.contains("Icons.more-vertical"), "AlbumTile must render the three-dot Icons.more-vertical icon");
+        assert!(album_tile.contains("Icons.trash"), "AlbumTile's menu item must render Icons.trash");
+        assert!(album_tile.contains("\"Remove from Library\""), "AlbumTile's menu must offer exactly \"Remove from Library\"");
+        assert!(
+            album_tile.contains("close-policy: close-on-click-outside;"),
+            "AlbumTile's menu popup must not use the default close-on-click policy"
+        );
+        assert!(
+            album_tile.contains("menu-touch := TouchArea"),
+            "the three-dot button must have its own scoped TouchArea, distinct from the card's own"
+        );
+    }
+
     /// `PlayerBar`'s `output-popup` `ComboBox` and `NowPlayingPanel`'s own `ComboBox` both end up
     /// two-way bound to the same `MainWindow.selected-output-index` storage (chained `<=>`
     /// bindings), and Rust writes that index programmatically both at startup and on every
@@ -1242,6 +1328,269 @@ mod ui_contract {
         assert!(
             !now_playing_panel.contains("changed current-index =>"),
             "NowPlayingPanel's own ComboBox must not use `changed current-index`, which also fires on Rust's programmatic index writes"
+        );
+    }
+
+    /// The "now playing" indicator in `TrackRow`'s "#" column is an animated version of the app
+    /// icon's bars (`PlayingBars`), not the old static waveform glyph (`Icons.now-playing`,
+    /// `ui/icons/now-playing.svg` — removed once this landed, since nothing else referenced it).
+    #[test]
+    fn now_playing_indicator_uses_playing_bars_not_the_old_glyph() {
+        assert!(
+            !WIDGETS_SLINT.contains("Icons.now-playing") && !THEME_SLINT.contains("now-playing.svg"),
+            "the old now-playing glyph icon must be gone from widgets.slint/theme.slint"
+        );
+        assert!(
+            !std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/icons/now-playing.svg").exists(),
+            "ui/icons/now-playing.svg must be removed now that nothing references it"
+        );
+        assert!(WIDGETS_SLINT.contains("component PlayingBars"), "widgets.slint must declare PlayingBars");
+        let track_row = extract_component(WIDGETS_SLINT, "TrackRow");
+        assert!(
+            track_row.contains("if root.is-playing: PlayingBars"),
+            "TrackRow must render PlayingBars (not an Icon) for its current-track row"
+        );
+        assert!(
+            track_row.contains("animating: root.playing;"),
+            "TrackRow must drive PlayingBars.animating from real transport state, not just current-track status"
+        );
+    }
+    /// Space (`CLAUDE.md` "Media controls" -> "Spacebar"): a window-wide `FocusScope` that is an
+    /// ancestor of everything focusable (so a Space a focused control rejects still reaches it), given
+    /// the initial focus by `forward-focus` (nothing has focus at startup, and key events only travel
+    /// the focus item's ancestor chain). It must use the bubbling `key-pressed`: a `capture-key-pressed`
+    /// runs before the focused search field and would swallow every space typed into it.
+    #[test]
+    fn window_wide_key_scope_handles_space_without_stealing_it_from_the_search_field() {
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert!(main_window.contains("forward-focus: key-root;"), "MainWindow must forward the initial focus to key-root");
+        assert!(main_window.contains("callback space-pressed();"), "MainWindow must expose space-pressed for main.rs");
+        let scope_start = main_window.find("key-root := FocusScope").expect("MainWindow must declare `key-root := FocusScope`");
+        let scope = &main_window[scope_start..];
+        let handler_start = scope.find("key-pressed(event) =>").expect("key-root must handle the bubbling key-pressed");
+        let layout_start = scope.find("VerticalLayout {").expect("key-root must wrap the window's layout");
+        assert!(handler_start < layout_start, "the key handler is declared before the wrapped layout");
+        let handler = &scope[handler_start..layout_start];
+        assert!(handler.contains("event.text == Key.Space"), "the handler must match Space");
+        assert!(handler.contains("!event.repeat"), "holding Space must not flip play/pause on every auto-repeat");
+        for modifier in ["control", "meta", "alt"] {
+            assert!(handler.contains(&format!("!event.modifiers.{modifier}")), "Space with {modifier} is a shortcut, not playback");
+        }
+        assert!(handler.contains("root.space-pressed();") && handler.contains("return accept;") && handler.contains("return reject;"));
+        for wrapped in ["Sidebar {", "TopBar {", "content-area := Rectangle", "NowPlayingPanel {", "PlayerBar {"] {
+            assert!(scope.contains(wrapped), "`{wrapped}` must live inside key-root so its key events bubble to it");
+        }
+        assert!(
+            !without_comments(APP_SLINT).contains("capture-key-pressed") && !without_comments(WIDGETS_SLINT).contains("capture-key-pressed"),
+            "a capture handler would steal Space from the search field's TextInput"
+        );
+    }
+
+    /// The search field keeps the keyboard after a click elsewhere (Slint never clears focus on an
+    /// outside click, and the app's buttons and rows are `TouchArea`s that never take it), so
+    /// everything the user reaches by clicking something else hands it back to `key-root`; otherwise
+    /// Space would keep typing into the search box.
+    #[test]
+    fn search_focus_returns_to_the_window_scope() {
+        let top_bar = extract_component(APP_SLINT, "TopBar");
+        assert!(top_bar.contains("callback search-dismissed();"));
+        assert!(top_bar.contains("accepted => { root.search-dismissed(); }"), "Return in the search field must dismiss it");
+        let escape = &top_bar[top_bar.find("event.text == Key.Escape").expect("TopBar must handle Esc")..];
+        let escape = &escape[..escape.find("return accept;").expect("the Esc branch accepts the key")];
+        assert!(escape.contains("root.search-edited(\"\");"), "Esc still clears the query first");
+        assert!(escape.contains("root.search-dismissed();"), "Esc must also hand the keyboard back");
+
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert!(main_window.contains("search-dismissed => { root.release-search-focus(); }"));
+        assert!(
+            main_window.contains("function release-search-focus() {\n        key-root.focus();\n    }"),
+            "release-search-focus must give the keyboard to key-root"
+        );
+        assert!(
+            !without_comments(APP_SLINT).contains("clear-focus()"),
+            "clearing focus leaves no focus item at all, and Space would then reach nobody"
+        );
+        // A click on a row is the only thing that reports a selection (a table appearing while the user
+        // types a query reports nothing), so it always hands the keyboard back and records the key.
+        assert!(
+            main_window.contains("function row-selected(key: string) {\n        root.release-search-focus();\n        root.selected-track-key = key;\n    }"),
+            "a row click must release the search focus and record the clicked track's key"
+        );
+        // Every click-driven handler, each call counted so a newly added duplicate cannot skip it.
+        for call in [
+            "root.nav-selected(v);",
+            "root.nav-selected(View.albums);",
+            "root.nav-selected(View.queue);",
+            "root.back-requested();",
+            "root.open-files();",
+            "root.open-folder();",
+            "root.album-opened(key);",
+            "root.artist-opened(name);",
+            "root.remove-album-requested(key);",
+            "root.shuffle-all();",
+            "root.album-action(root.album-header.key, action);",
+            "root.play-pause-requested();",
+            "root.previous-track-requested();",
+            "root.next-track-requested();",
+            "root.seek-requested(f);",
+            "root.volume-requested(v, is-final);",
+            "root.now-playing-album-requested();",
+        ] {
+            let all = main_window.matches(call).count();
+            let releasing = main_window.matches(&format!("root.release-search-focus(); {call}")).count();
+            assert!(all > 0, "`{call}` is no longer forwarded by MainWindow: update this list");
+            assert_eq!(all, releasing, "every MainWindow forwarder of `{call}` must first call root.release-search-focus()");
+        }
+    }
+
+    /// The row selection is a track KEY, not a position: `MainWindow.selected-track-key` is what every
+    /// table highlights (`row.key == selected-key`) and what Space resolves against the visible rows.
+    /// An index would name whatever sits at that position after every library re-projection (a scan, a
+    /// `Started`), which replaces the tables' models under a table that stays on screen
+    /// — and resetting the index whenever `rows` changes, the earlier fix, dropped a clicked row's
+    /// highlight (and Space's target) within one re-projection.
+    #[test]
+    fn track_selection_is_keyed_by_track_key_and_survives_reprojection() {
+        // `TrackTable inherits`, not `TrackTable`: `extract_component` finds the first `component
+        // {name}` prefix, and `TrackTableHeader` is declared before `TrackTable`.
+        for table in ["TrackTable inherits", "VirtualizedTrackTable"] {
+            let body = extract_component(WIDGETS_SLINT, table);
+            let code = without_comments(body);
+            assert!(code.contains("in property <string> selected-key: \"\";"), "{table} must take the selected key from its owner");
+            assert!(code.contains("callback selected(string);"), "{table} must report the clicked row's key");
+            assert!(
+                code.contains("selected: root.selected-key != \"\" && row.key == root.selected-key;"),
+                "{table} must highlight the row whose key is selected, whatever position it is at"
+            );
+            assert!(code.contains("clicked => { root.selected(row.key); }"), "{table}: a click selects the row by its key");
+            assert!(
+                code.contains("activated(index) => { root.selected(row.key); root.activated(index); }"),
+                "{table}: a double click selects it too"
+            );
+            for stale in ["selected-index", "changed rows", "init =>", "root.select("] {
+                assert!(
+                    !code.contains(stale),
+                    "{table} must not keep a positional selection (`{stale}`): a reprojection would drop it or point it at another track"
+                );
+            }
+        }
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert!(main_window.contains("in-out property <string> selected-track-key: \"\";"), "MainWindow owns the selected key");
+        assert!(!without_comments(main_window).contains("track-selected"), "the key is read from the window when Space is pressed, not mirrored through a callback");
+        for kind in ["search", "songs", "recently-added", "album", "queue"] {
+            assert!(
+                main_window.contains(&format!("root.track-activated(TrackListKind.{kind}, i);")),
+                "the `{kind}` table's activation is still routed by kind"
+            );
+        }
+        // Every view forwards the key down and the clicked key up, through the one `row-selected`.
+        for (view, forwarded) in [
+            ("SearchResultsView", 1),
+            ("TrackListPage", 1),
+            ("AlbumDetailView", 1),
+            ("QueueView", 2),
+        ] {
+            let body = extract_component(APP_SLINT, view);
+            assert!(body.contains("in property <string> selected-key: \"\";") && body.contains("callback selected(string);"), "{view} must take the key and report clicks");
+            assert_eq!(body.matches("selected-key: root.selected-key;").count(), forwarded, "{view} must hand the key to each of its tables");
+            assert_eq!(body.matches("selected(k) => { root.selected(k); }").count(), forwarded, "{view} must forward each table's clicks");
+        }
+        assert_eq!(
+            main_window.matches("selected-key: root.selected-track-key;").count(),
+            5,
+            "the Search, Songs, Recently Added, album detail and Queue views must all show the same selection"
+        );
+        assert_eq!(main_window.matches("selected(k) => { root.row-selected(k); }").count(), 5);
+        // The queue's single "Now Playing" row is a table of its own and reports through the same path.
+        assert!(!without_comments(APP_SLINT).contains("current-selected"));
+    }
+
+    /// The selection belongs to the page it was made on: navigation callbacks (`sync_navigation`) and
+    /// search edits that change the list on screen (`apply_search_edit`) clear it in `main.rs`, and only
+    /// there — a re-projection of the same page (which never goes through either) must keep it, and so
+    /// must a search edit that leaves the effective query alone (Esc in an empty field).
+    #[test]
+    fn navigation_and_search_edits_clear_the_selection_and_reprojection_does_not() {
+        let main_rs = include_str!("main.rs");
+        let body_of = |signature: &str| -> String {
+            let start = main_rs.find(signature).unwrap_or_else(|| panic!("main.rs defines `{signature}`"));
+            let body = &main_rs[start..];
+            body[..body.find("\n}\n").expect("the function ends at a closing brace in column 0")].to_owned()
+        };
+        assert!(body_of("fn sync_navigation(").contains("clear_track_selection(window);"), "every navigation goes through sync_navigation");
+        let search_edit = body_of("fn apply_search_edit(");
+        assert!(search_edit.contains("clear_track_selection(window);"), "a new query is a new list");
+        assert_eq!(
+            search_edit.matches("navigation.effective_search_query()").count(),
+            2,
+            "the selection is cleared only when the effective query differs from what it was before the edit"
+        );
+        assert!(
+            body_of("fn clear_track_selection(").contains("window.set_selected_track_key(SharedString::default());"),
+            "clearing is writing the empty key"
+        );
+        let reprojection = body_of("fn project_and_set_library(");
+        assert!(
+            !reprojection.contains("selected_track_key") && !reprojection.contains("clear_track_selection"),
+            "a re-projection replaces rows only; the selection follows its track through it"
+        );
+        assert!(
+            main_rs.contains("apply_search_edit(&window, &mut navigation_for_search_edited.borrow_mut(), query.to_string());"),
+            "the search-edited callback must go through apply_search_edit"
+        );
+    }
+
+    /// An Output `ComboBox` that keeps the keyboard is a trap: Slint drops the focus item of a key press
+    /// when it is invisible (the details panel hidden), and key bubbling stops at a popup's edge, so
+    /// Space would reach nobody. Both forwarders of a choice hand the keyboard back to `key-root` once
+    /// the dropdown has closed, and hiding the panel does it for a `ComboBox` that still holds it.
+    #[test]
+    fn output_combo_boxes_never_keep_the_keyboard() {
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert_eq!(
+            main_window.matches("output-chosen(index) => { root.output-chosen(index); root.hand-focus-back-soon(); }").count(),
+            2,
+            "the panel's and the output popup's choice must both hand the keyboard back"
+        );
+        assert!(
+            main_window.contains("focus-handback := Timer {") && main_window.contains("root.release-search-focus();"),
+            "the hand-back is deferred by a Timer: the ComboBox takes the focus back after `selected` fires"
+        );
+        assert!(main_window.contains("function hand-focus-back-soon() {\n        focus-handback.running = true;\n    }"));
+        assert!(
+            main_window.contains("changed panel-shown => {\n        if (!root.panel-shown && now-playing-panel.output-focused) {"),
+            "hiding the panel must free the keyboard from its Output ComboBox (and only from it)"
+        );
+        let panel = extract_component(APP_SLINT, "NowPlayingPanel");
+        assert!(panel.contains("out property <bool> output-focused: output-combo.has-focus;"));
+        assert!(panel.contains("output-combo := ComboBox {"), "the panel's ComboBox must carry the id output-focused reads");
+    }
+
+    /// `main.rs`'s Space handler and its OS media session ask `play_button_enabled` whether there is
+    /// anything loaded or queued to act on; it must not drift from the expression the on-screen play
+    /// button uses to enable itself. Both sides are pinned: the Slint expression as a string, and the
+    /// helper's own truth table, which the same expression defines.
+    #[test]
+    fn space_mirrors_the_play_buttons_enabling_rule() {
+        let player_bar = extract_component(APP_SLINT, "PlayerBar");
+        assert!(
+            player_bar.contains("TouchArea { enabled: root.now-playing-title != \"\" || root.queue-count > 0;"),
+            "PlayerBar's play button enabling changed: update `play_button_enabled` in main.rs to match"
+        );
+        // `now-playing-title != "" || queue-count > 0`.
+        assert!(!crate::play_button_enabled("", 0), "nothing has played and the queue is empty: the button does nothing");
+        assert!(crate::play_button_enabled("Title", 0), "a track was loaded (the title is kept after Stopped)");
+        assert!(crate::play_button_enabled("", 1), "a queued track can be started");
+        assert!(crate::play_button_enabled("Title", 5));
+        assert!(!crate::play_button_enabled("", -1), "a nonsensical count is not a queue");
+        // No second copy of the rule in `main.rs`: the one place that reads the window's queue count
+        // is the helper's window wrapper, which the Space handler and the media session both use.
+        let main_rs = include_str!("main.rs");
+        assert_eq!(main_rs.matches("get_queue_count()").count(), 1, "the enabling rule must live in `play_button_enabled` only");
+        assert_eq!(
+            main_rs.matches("window_play_button_enabled(&window)").count(),
+            2,
+            "both the Space handler and the OS media session must ask the shared helper"
         );
     }
 }

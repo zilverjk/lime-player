@@ -29,11 +29,6 @@ pub fn format_badge(format: &str, bits_per_sample: u32, sample_rate: u32, is_flo
     }
 }
 
-/// `!lossy && (bits >= 24 || rate > 48 kHz)`; MP3 is the only lossy format in this milestone.
-pub fn is_hi_res(bits_per_sample: u32, sample_rate: u32, lossy: bool) -> bool {
-    !lossy && (bits_per_sample >= 24 || sample_rate > 48_000)
-}
-
 /// The now-playing format/size line: `"FLAC · 24-bit / 44.1 kHz\nStereo · 1,363 kbps"`. MP3 omits
 /// the bit depth; the kbps segment is dropped when the size or the duration is unknown.
 ///
@@ -264,6 +259,11 @@ pub fn aggregate_album_format<'a>(track_formats: impl Iterator<Item = &'a str>) 
             distinct.push(lower);
         }
     }
+    // Invariant this `_ => Mix` relies on: `probe_file` today only ever emits "mp3"/"flac"/
+    // "wavpack"/"wav". That's why a single unrecognized format string falling through to `Mix`
+    // can't misfire in practice. If `probe_file` ever gains a new format string, add a matching arm
+    // here too — otherwise every track of that new single format silently renders as "Mix Formats"
+    // instead of its own real format, and this `_` arm will not surface the mismatch.
     match distinct.as_slice() {
         [] => None,
         [only] => Some(match only.as_str() {
@@ -275,6 +275,17 @@ pub fn aggregate_album_format<'a>(track_formats: impl Iterator<Item = &'a str>) 
         }),
         _ => Some(AlbumFormat::Mix),
     }
+}
+
+/// A single track's own format pill (`§5.5` per-track format pill, `TrackRow` in
+/// `ui/widgets.slint`): the same `AlbumFormat` a lone track would aggregate to, reusing
+/// `aggregate_album_format` instead of duplicating its format-string match. In practice this never
+/// resolves to `AlbumFormat::Mix` — that variant only comes from two or more distinct formats, or
+/// one `aggregate_album_format` does not recognize, and neither happens for a single already-probed
+/// track's own `AudioInfo.format` string (`"FLAC"`, `"WAV"`, `"MP3"` or `"WavPack"`, `§5.5`'s
+/// `aggregate_album_format` doc comment).
+pub fn track_format(format: &str) -> AlbumFormat {
+    aggregate_album_format(std::iter::once(format)).unwrap_or(AlbumFormat::Wav)
 }
 
 fn thousands(value: u64) -> String {
@@ -340,14 +351,6 @@ mod tests {
         assert_eq!(format_badge("WavPack", 24, 96_000, false), "WavPack 24/96");
         assert_eq!(format_badge("WavPack", 32, 48_000, true), "WavPack 32f/48");
         assert_eq!(format_badge("MP3", 16, 44_100, false), "MP3");
-    }
-
-    #[test]
-    fn hi_res_rules() {
-        assert!(is_hi_res(24, 44_100, false));
-        assert!(is_hi_res(16, 96_000, false));
-        assert!(!is_hi_res(16, 44_100, false));
-        assert!(!is_hi_res(24, 44_100, true), "MP3-like lossy formats are never hi-res");
     }
 
     #[test]
@@ -474,6 +477,15 @@ mod tests {
         assert_eq!(AlbumFormat::WavPack.variant(), "wavpack");
         assert_eq!(AlbumFormat::Wav.variant(), "wav");
         assert_eq!(AlbumFormat::Mix.variant(), "mix");
+    }
+
+    #[test]
+    fn track_format_maps_each_format_string_to_its_own_pill() {
+        assert_eq!(track_format("MP3"), AlbumFormat::Mp3);
+        assert_eq!(track_format("FLAC"), AlbumFormat::Flac);
+        assert_eq!(track_format("WavPack"), AlbumFormat::WavPack);
+        assert_eq!(track_format("WAV"), AlbumFormat::Wav);
+        assert_eq!(track_format("flac"), AlbumFormat::Flac, "matched case-insensitively, like aggregate_album_format");
     }
 
     #[test]
