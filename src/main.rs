@@ -589,29 +589,38 @@ fn main() -> Result<(), slint::PlatformError> {
         let Some(parent) = folder_picker_parent_window.upgrade() else { return; };
         let scanner = Arc::clone(&scanner_for_open_folder);
         let parent_window = parent.window().window_handle();
-        let selection = pick_audio_folder(parent_window);
+        let selection = pick_audio_folders(parent_window);
         let status_window = open_folder_window.clone();
         let status_save_error = Rc::clone(&open_folder_save_error);
         let scanning_batches = Rc::clone(&open_folder_scanning_batches);
         let batch_kinds = Rc::clone(&open_folder_batch_kinds);
         let sources = Rc::clone(&open_folder_sources);
         if let Err(error) = slint::spawn_local(async move {
-            if let Some(folder) = selection.await {
+            if let Some(folders) = selection.await
+                && !folders.is_empty()
+            {
                 if let Some(window) = status_window.upgrade() {
-                    set_playback_status(&window, format!("Scanning {}…", folder.display()), &status_save_error);
+                    set_playback_status(&window, folder_scan_status(&folders), &status_save_error);
                 }
-                scanning_batches.set(scanning_batches.get() + 1);
-                // Same override rule as "Open Files…" above, for every track under the re-added
-                // folder (`CLAUDE.md` "Library exclusions").
-                sources.borrow_mut().include_folder(&folder);
-                let excluded = sources.borrow().excluded_tracks.clone();
-                let batch = scanner.scan_folder(folder.clone(), excluded);
-                batch_kinds.borrow_mut().insert(batch, BatchKind::OpenFolder);
+                // One `scan_folder` batch per chosen folder: each walks on its own thread
+                // (`LibraryScanner::scan_folder`) and reports its own `BatchDone`, which is what
+                // `scanning_batches` counts.
+                for folder in &folders {
+                    scanning_batches.set(scanning_batches.get() + 1);
+                    // Same override rule as "Open Files…" above, for every track under the re-added
+                    // folder (`CLAUDE.md` "Library exclusions").
+                    sources.borrow_mut().include_folder(folder);
+                    let excluded = sources.borrow().excluded_tracks.clone();
+                    let batch = scanner.scan_folder(folder.clone(), excluded);
+                    batch_kinds.borrow_mut().insert(batch, BatchKind::OpenFolder);
+                }
                 // Added to the library only (`batch_should_enqueue(BatchKind::OpenFolder)` is
-                // false) and persisted so it is re-walked at every startup, picking up files added
-                // to it since (`CLAUDE.md` "Persistent library").
+                // false) and persisted so they are re-walked at every startup, picking up files
+                // added to them since (`CLAUDE.md` "Persistent library").
                 let mut sources = sources.borrow_mut();
-                sources.add_folder(folder);
+                for folder in folders {
+                    sources.add_folder(folder);
+                }
                 if let Err(error) = sources.save() {
                     *status_save_error.borrow_mut() = Some(format!("Could not save library.json: {error}"));
                 }
@@ -1837,16 +1846,29 @@ async fn pick_audio_files(parent_window: slint::WindowHandle) -> Option<Vec<Path
         })
 }
 
-/// "Open Folder…": RFD's async folder picker, scheduled on Slint's event loop exactly like
-/// `pick_audio_files` above — never a synchronous `runModal()` inside a callback (`CLAUDE.md`).
-/// The chosen folder is walked recursively by `library::walker` (`LibraryScanner::scan_folder`),
-/// off the UI thread, not here.
-async fn pick_audio_folder(parent_window: slint::WindowHandle) -> Option<PathBuf> {
+/// "Open Folder…": RFD's async folder picker (multiple selection allowed), scheduled on Slint's
+/// event loop exactly like `pick_audio_files` above — never a synchronous `runModal()` inside a
+/// callback (`CLAUDE.md`). Each chosen folder is walked recursively by `library::walker`
+/// (`LibraryScanner::scan_folder`), off the UI thread, not here.
+async fn pick_audio_folders(parent_window: slint::WindowHandle) -> Option<Vec<PathBuf>> {
     rfd::AsyncFileDialog::new()
         .set_parent(&parent_window)
-        .pick_folder()
+        .pick_folders()
         .await
-        .map(|folder| folder.path().to_path_buf())
+        .map(|folders| {
+            folders
+                .into_iter()
+                .map(|folder| folder.path().to_path_buf())
+                .collect()
+        })
+}
+
+/// Status line shown while "Open Folder…" starts scanning `folders` (never empty).
+fn folder_scan_status(folders: &[PathBuf]) -> String {
+    match folders {
+        [folder] => format!("Scanning {}…", folder.display()),
+        _ => format!("Scanning {} folders…", folders.len()),
+    }
 }
 
 /// Recomputes the elapsed/duration/progress strings from `last`, the last `Timeline` the worker
@@ -2059,6 +2081,15 @@ mod batch_kind_tests {
         assert!(batch_should_enqueue(BatchKind::OpenFiles));
         assert!(!batch_should_enqueue(BatchKind::OpenFolder));
         assert!(!batch_should_enqueue(BatchKind::StartupRestore));
+    }
+
+    #[test]
+    fn folder_scan_status_names_a_single_folder_and_counts_several() {
+        assert_eq!(folder_scan_status(&[PathBuf::from("/music/Album")]), "Scanning /music/Album…");
+        assert_eq!(
+            folder_scan_status(&[PathBuf::from("/music/A"), PathBuf::from("/music/B")]),
+            "Scanning 2 folders…"
+        );
     }
 
     #[test]
