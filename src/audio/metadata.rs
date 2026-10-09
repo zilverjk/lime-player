@@ -36,7 +36,8 @@ const APEV2_KEY_MAX_LEN: usize = 255;
 /// bytes of the value's start (`§4.4` step 6).
 const APEV2_BINARY_FILENAME_SEARCH_LEN: usize = 256;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct TrackTags {
     pub title: Option<String>,
     pub artist: Option<String>,

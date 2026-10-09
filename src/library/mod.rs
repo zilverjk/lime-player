@@ -1,9 +1,10 @@
 //! The session library (`§3.3`): everything opened this run, keyed by path, grouped into albums
-//! and artists. The decoded `Library`/`TrackRecord` values here are still session-only and are
-//! never persisted; `store::LibrarySources` separately persists only *which paths* to re-scan
-//! (individually opened files and added folders) so `main.rs` can rebuild this same session
-//! library at the next startup by re-running them through `scanner::LibraryScanner`.
+//! and artists. `store::LibrarySources` persists *which paths* to re-scan (individually opened
+//! files and added folders) so `main.rs` can rebuild this library at the next startup by re-running
+//! them through `scanner::LibraryScanner`; `cache` additionally saves the decoded records and album
+//! pictures so the library shows at once at launch, before (and even without) that rescan.
 
+pub mod cache;
 pub mod cue;
 pub mod format;
 pub mod repair;
@@ -36,7 +37,7 @@ pub struct ArtworkPixels {
 /// replaces another for the same album only when its source compares strictly greater. The scanner's
 /// per-album dedup and `AppState`'s artwork cache both rely on this one ordering; do not reorder the
 /// variants (`artwork_source_orders_by_precedence` pins it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ArtworkSource {
     /// No picture was found.
     None,
@@ -271,12 +272,18 @@ impl Library {
             .filter(|(_, track)| resolution_group_key(track).as_ref().is_some_and(|(a, p)| a == album_norm && p == parent))
             .map(|(index, _)| index)
             .collect();
+        self.resolve_group_indices(&indices)
+    }
+
+    /// `resolve_group_for` for a group whose member indices the caller already knows (bulk loading
+    /// resolves every group once, from one pass over the tracks, instead of one scan per group).
+    fn resolve_group_indices(&mut self, indices: &[usize]) -> Vec<(TrackKey, String, String)> {
         if indices.is_empty() {
             return Vec::new();
         }
         let before: Vec<(TrackKey, String)> = indices.iter().map(|&index| (self.tracks[index].key.clone(), album_key(&self.tracks[index]))).collect();
         let effective = resolve_effective_album_artist(indices.iter().map(|&index| &self.tracks[index]));
-        for &index in &indices {
+        for &index in indices {
             self.tracks[index].effective_album_artist = effective.clone();
         }
         indices
@@ -291,6 +298,79 @@ impl Library {
 
     pub fn get(&self, key: &TrackKey) -> Option<&TrackRecord> {
         self.by_key.get(key).map(|&index| &self.tracks[index])
+    }
+
+    /// Every record in insertion (`added_seq`) order; the persistent library cache saves this
+    /// (`cache::CacheSnapshot`).
+    pub fn records(&self) -> &[TrackRecord] {
+        &self.tracks
+    }
+
+    /// Inserts a whole batch of records (the persistent cache load, `cache::load`) in the given
+    /// order, which becomes their `added_seq` order. Equivalent to calling `upsert` for each record
+    /// (a repeated `TrackKey` replaces the earlier one in place), except every album-artist group is
+    /// resolved ONCE at the end, from a single pass over the tracks: `upsert` rescans all tracks per
+    /// call, which is quadratic for a library of tens of thousands of tracks and far too slow on the
+    /// startup path. Reports no key transitions, since nothing downstream has seen the intermediate
+    /// keys.
+    pub fn load_records(&mut self, records: impl IntoIterator<Item = TrackRecord>) {
+        for mut record in records {
+            if let Some(&index) = self.by_key.get(&record.key) {
+                record.added_seq = self.tracks[index].added_seq;
+                self.tracks[index] = record;
+            } else {
+                record.added_seq = self.next_seq;
+                self.next_seq += 1;
+                self.by_key.insert(record.key.clone(), self.tracks.len());
+                self.tracks.push(record);
+            }
+        }
+        let mut groups: HashMap<(String, PathBuf), Vec<usize>> = HashMap::new();
+        for (index, track) in self.tracks.iter().enumerate() {
+            if let Some(group) = resolution_group_key(track) {
+                groups.entry(group).or_default().push(index);
+            }
+        }
+        for indices in groups.values() {
+            let _ = self.resolve_group_indices(indices);
+        }
+    }
+
+    /// Removes exactly the tracks in `keys` (a pruned cache entry whose file is gone, `cache`), and
+    /// re-resolves the album-artist group of every track it touched. Unlike `remove_album` it can
+    /// drop part of an album, so the remaining tracks of a group may land on another album key; every
+    /// distinct `(old_key, new_key)` such move is returned for the caller to migrate artwork and
+    /// navigation (`AppState::prune_tracks`).
+    pub fn remove_tracks(&mut self, keys: &HashSet<TrackKey>) -> Vec<(String, String)> {
+        let mut touched_groups: HashSet<(String, PathBuf)> = HashSet::new();
+        let before = self.tracks.len();
+        self.tracks.retain(|record| {
+            if keys.contains(&record.key) {
+                if let Some(group) = resolution_group_key(record) {
+                    touched_groups.insert(group);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        if self.tracks.len() == before {
+            return Vec::new();
+        }
+        self.by_key.clear();
+        for (index, record) in self.tracks.iter().enumerate() {
+            self.by_key.insert(record.key.clone(), index);
+        }
+        let mut transitions: Vec<(String, String)> = Vec::new();
+        for (album_norm, parent) in touched_groups {
+            for (_, old_key, new_key) in self.resolve_group_for(&album_norm, &parent) {
+                let pair = (old_key, new_key);
+                if !transitions.contains(&pair) {
+                    transitions.push(pair);
+                }
+            }
+        }
+        transitions
     }
 
     /// Removes every track belonging to album `key` from the session library and returns their

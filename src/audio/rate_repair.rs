@@ -276,7 +276,7 @@ fn not_writable(context: &str, error: &io::Error) -> RepairError {
 
 /// Flushes `file` to stable storage as durably as its filesystem allows: the temp file before it is
 /// verified and swapped in for the original, and the backup before the original is replaced.
-fn flush_durably(file: &File) -> io::Result<()> {
+pub(crate) fn flush_durably(file: &File) -> io::Result<()> {
     flush_with_fallback(|| file.sync_all(), || plain_fsync(file))
 }
 
@@ -340,7 +340,7 @@ fn flush_error(context: &'static str) -> impl FnOnce(io::Error) -> RepairError {
 /// Whether a flush failed only because the filesystem does not implement it. Both spellings are
 /// checked because macOS defines ENOTSUP (what smbfs returns) and EOPNOTSUPP as different values.
 #[cfg(unix)]
-fn is_flush_unsupported(error: &io::Error) -> bool {
+pub(crate) fn is_flush_unsupported(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP
@@ -348,7 +348,7 @@ fn is_flush_unsupported(error: &io::Error) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_flush_unsupported(_error: &io::Error) -> bool {
+pub(crate) fn is_flush_unsupported(_error: &io::Error) -> bool {
     false
 }
 
