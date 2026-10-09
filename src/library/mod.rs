@@ -7,6 +7,9 @@
 pub mod cache;
 pub mod cue;
 pub mod format;
+mod grouping;
+#[cfg(test)]
+mod grouping_tests;
 pub mod repair;
 pub mod scanner;
 pub mod store;
@@ -16,10 +19,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use unicode_normalization::UnicodeNormalization;
 
 use crate::audio::{AudioInfo, PreparedTrack, TrackTags};
-use format::aggregate_album_format;
+use format::aggregate_album_pill;
+pub use grouping::effective_disc_number;
+use grouping::{
+    CopyTrack, Derived, SourceKey, clean_album_title, derive, normalize_album_title, normalize_artist_key, parse_disc_designator, plan_copies,
+    resolve_scope_albums, source_key,
+};
 
 /// Decoded, downscaled album art (RGB8, longest side capped at 400 px by `scanner::decode_artwork`).
 /// Converted to a `slint::Image` on the UI thread only (`§3.3` "Artwork cache").
@@ -94,7 +101,7 @@ pub fn track_key_string(key: &TrackKey) -> String {
 /// The Library-level "effective album artist" for a `TrackRecord` (`§3.3` "Album grouping key"),
 /// resolved across every track that shares its (normalized album title, parent directory) group —
 /// not from this one record's own tags in isolation. `Library::upsert`/`remove_album` keep this in
-/// sync on every mutation (`Library::resolve_group_for`); a record built outside a `Library` (a
+/// sync on every mutation (`Library::regroup_scope`); a record built outside a `Library` (a
 /// test, or the scanner thread's transient pre-upsert records) stays `Unresolved`, and `album_key`
 /// falls back to this one record's own tags for it, matching the pre-group-resolution behavior.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -108,6 +115,17 @@ pub enum EffectiveAlbumArtist {
     /// No consistent artist could be resolved for the group (a compilation/soundtrack folder with
     /// different track artists and no `ALBUMARTIST` tag at all).
     VariousArtists,
+}
+
+/// The album a `Library`-resolved track belongs to (`CLAUDE.md` "Album grouping" — folder-majority
+/// title): not necessarily the track's own ALBUM tag, since a minority title folds into its folder's
+/// dominant one and an untagged track joins it. `norm` is the grouping-key form
+/// (`grouping::normalize_album_title`), `title` the title shown to the user (the group's most common
+/// cleaned raw title). `None` on a record means "not resolved by a `Library`, or no album at all".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectiveAlbum {
+    pub norm: String,
+    pub title: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,6 +148,13 @@ pub struct TrackRecord {
     /// See `EffectiveAlbumArtist`. Only `Library` ever writes a resolved value; every other
     /// constructor leaves it `Unresolved`.
     pub effective_album_artist: EffectiveAlbumArtist,
+    /// See `EffectiveAlbum`. Only `Library` ever writes it.
+    pub effective_album: Option<EffectiveAlbum>,
+    /// `Some(winner)` when this track is a lower-quality duplicate copy of the song `winner` inside the
+    /// same album (`CLAUDE.md` "Album grouping" — duplicate copies): kept in the `Library` (so
+    /// "Remove from Library" still covers it, `get` still finds it for playback) but hidden from every
+    /// view. Only `Library` ever writes it.
+    pub hidden_copy_of: Option<TrackKey>,
 }
 
 impl TrackRecord {
@@ -146,7 +171,14 @@ impl TrackRecord {
             artwork_source: ArtworkSource::None,
             added_seq: 0,
             effective_album_artist: EffectiveAlbumArtist::Unresolved,
+            effective_album: None,
+            hidden_copy_of: None,
         }
+    }
+
+    /// Whether views show this track (it is not a hidden duplicate copy).
+    pub fn is_visible(&self) -> bool {
+        self.hidden_copy_of.is_none()
     }
 }
 
@@ -181,10 +213,35 @@ pub struct ArtistSummary {
     pub track_count: usize,
 }
 
+/// One album-key change a `Library` mutation caused (`Library::upsert_detailed`): the tracks that
+/// moved from `old_key` to `new_key`, and the resolution groups (`resolution_group_key`) they belong
+/// to — which pictures cached under `old_key` follow them (`AppState::move_artwork`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyTransition {
+    pub old_key: String,
+    pub new_key: String,
+    pub groups: Vec<(String, PathBuf)>,
+}
+
 #[derive(Default)]
 pub struct Library {
     tracks: Vec<TrackRecord>,
     by_key: HashMap<TrackKey, usize>,
+    /// Parallel to `tracks`: each track's `grouping_scope_dir` and `album_key`, cached because the
+    /// regrouping on every insert and every query would otherwise recompute them for the whole
+    /// library. Kept in sync whenever a record's tags or resolution change.
+    scopes: Vec<PathBuf>,
+    keys: Vec<String>,
+    /// Parallel to `tracks`: the normalized values the grouping rules read (`grouping::Derived`),
+    /// computed once when a record is stored instead of on every regroup.
+    derived: Vec<Derived>,
+    /// Indices of the tracks of each grouping scope / each album key, maintained on insert, key change
+    /// and removal, so a regroup or a copy plan touches one folder or one album and never scans the
+    /// whole library.
+    scope_members: HashMap<PathBuf, Vec<usize>>,
+    album_members: HashMap<String, Vec<usize>>,
+    /// Interned copy-detection sources (`grouping::SourceKey`); ids are only ever compared for equality.
+    sources: HashMap<SourceKey, u32>,
     next_seq: u64,
 }
 
@@ -193,107 +250,227 @@ impl Library {
     /// original `added_seq` (`§3.3`). Two records that share a path but differ in `start_frame`/
     /// `end_frame` (distinct CUE sub-ranges of the same physical file) coexist as separate entries.
     ///
-    /// Also re-resolves `effective_album_artist` (`§3.3` "Album grouping key") for every track that
-    /// shares `record`'s (normalized album title, grouping-scope directory) group, including
-    /// `record` itself — not just for `record` alone — since one more/different `ALBUMARTIST` tag
-    /// arriving can shift the group's majority for tracks already stored here.
+    /// Then re-resolves everything the new record can influence (`regroup_scope`): the album each
+    /// track of its folder belongs to (folder-majority title) and the effective album artist of each
+    /// album whose membership changed, and afterwards which tracks of the affected albums are hidden
+    /// duplicate copies (`recompute_copies`). The result depends only on the current set of records,
+    /// never on the order they arrived in.
     ///
     /// Returns every distinct `(old_key, new_key)` album-key transition this call caused — not only
-    /// `record`'s own (though that is included whenever it actually changed): re-resolving the group
-    /// can also change an already-stored SIBLING track's own `effective_album_artist`, and so its
-    /// `album_key`, purely as a side effect (e.g. the group's majority flipping from a lone track's
-    /// own `ARTIST` to `VariousArtists` once a differently-tagged track joins, or back once enough
-    /// tracks establish a dominant primary artist). `AppState::apply_scanned` (`CLAUDE.md` "Album
-    /// grouping") uses this to migrate its artwork cache and recently-played list off every key this
-    /// call abandoned, not only the one for the track it just scanned — missing a sibling's silent
-    /// transition was the real cause of the "CD1 shows no artwork" bug: the first track of a group to
-    /// get its embedded/folder art decoded caches it under whatever key was current at that moment,
-    /// and a later track joining the group could move the whole group onto a different key without
-    /// that art ever being recomputed or re-cached under it.
-    pub fn upsert(&mut self, mut record: TrackRecord) -> Vec<(String, String)> {
-        let group = resolution_group_key(&record);
+    /// `record`'s own (though that is included whenever it actually changed): re-resolving the folder
+    /// can also change an already-stored SIBLING track's own `album_key` purely as a side effect (a
+    /// minority title folding into the dominant one, the group's artist majority flipping, an untagged
+    /// track joining). `AppState::apply_scanned` (`CLAUDE.md` "Album grouping") uses this to migrate its
+    /// artwork cache and recently-played list off every key this call abandoned — missing a sibling's
+    /// silent transition was the real cause of the "CD1 shows no artwork" bug.
+    pub fn upsert(&mut self, record: TrackRecord) -> Vec<(String, String)> {
+        self.upsert_detailed(record).into_iter().map(|transition| (transition.old_key, transition.new_key)).collect()
+    }
+
+    /// `upsert`, with the resolution groups that moved in each transition (`KeyTransition`).
+    pub fn upsert_detailed(&mut self, mut record: TrackRecord) -> Vec<KeyTransition> {
         let incoming_key = record.key.clone();
-        let previous_key = self.by_key.get(&incoming_key).map(|&index| album_key(&self.tracks[index]));
-        if let Some(&index) = self.by_key.get(&incoming_key) {
-            record.added_seq = self.tracks[index].added_seq;
-            self.tracks[index] = record;
-        } else {
-            record.added_seq = self.next_seq;
-            self.next_seq += 1;
-            self.by_key.insert(incoming_key.clone(), self.tracks.len());
-            self.tracks.push(record);
-        }
+        let incoming_group = resolution_group_key(&record);
+        let scope = grouping_scope_dir(&record);
+        let previous = self.by_key.get(&incoming_key).map(|&index| (self.keys[index].clone(), resolution_group_key(&self.tracks[index])));
+        let mut derived = derive(&record);
+        derived.source = self.source_id(&record);
 
-        let Some((album_norm, parent)) = group else { return Vec::new() };
-        let per_track = self.resolve_group_for(&album_norm, &parent);
+        let index = match self.by_key.get(&incoming_key) {
+            Some(&index) => {
+                record.added_seq = self.tracks[index].added_seq;
+                // Keep the previous resolution until `regroup_scope` replaces it, so the album the
+                // record leaves (if any) is known to lose a member.
+                record.effective_album = self.tracks[index].effective_album.clone();
+                record.effective_album_artist = self.tracks[index].effective_album_artist.clone();
+                self.tracks[index] = record;
+                self.derived[index] = derived;
+                index
+            }
+            None => {
+                record.added_seq = self.next_seq;
+                self.next_seq += 1;
+                let index = self.tracks.len();
+                self.by_key.insert(incoming_key.clone(), index);
+                self.tracks.push(record);
+                self.derived.push(derived);
+                self.scopes.push(scope.clone());
+                self.keys.push(String::new());
+                self.scope_members.entry(scope.clone()).or_default().push(index);
+                index
+            }
+        };
+        // The transient, unresolved key; `regroup_scope` replaces it with the resolved one.
+        let transient = album_key(&self.tracks[index]);
+        self.set_key(index, transient);
 
-        let mut transitions: Vec<(String, String)> = Vec::new();
-        for (track_key, before_key, after_key) in per_track {
+        let moved = self.regroup_scope(&scope, Some(index), false);
+        let mut transitions: Vec<KeyTransition> = Vec::new();
+        let mut affected: HashSet<String> = HashSet::new();
+        for (track_index, before_key) in moved {
+            let after_key = self.keys[track_index].clone();
+            affected.insert(before_key.clone());
+            affected.insert(after_key.clone());
             // The incoming record's own before/after is reported below instead, using the key it
-            // truly held *before this whole call* (`previous_key`) — `resolve_group_for`'s own
-            // "before" snapshot for it is only the transient, pre-group-resolution fallback key
-            // computed a few lines up (e.g. `af:`), which nothing outside this function ever
+            // truly held *before this whole call*: `regroup_scope`'s "before" for it is only the
+            // transient, unresolved key set a few lines up, which nothing outside this function ever
             // observed or cached anything under.
-            if track_key == incoming_key {
+            if track_index == index {
                 continue;
             }
-            let pair = (before_key, after_key);
-            if pair.0 != pair.1 && !transitions.contains(&pair) {
-                transitions.push(pair);
-            }
+            note_transition(&mut transitions, before_key, after_key, resolution_group_key(&self.tracks[track_index]).into_iter().collect());
         }
-        if let Some(previous_key) = previous_key {
-            let final_key = self.by_key.get(&incoming_key).map(|&index| album_key(&self.tracks[index])).unwrap_or_default();
-            if previous_key != final_key && !transitions.contains(&(previous_key.clone(), final_key.clone())) {
-                transitions.push((previous_key, final_key));
-            }
+        if let Some((previous_key, previous_group)) = previous {
+            let groups = incoming_group.into_iter().chain(previous_group).collect();
+            affected.insert(previous_key.clone());
+            note_transition(&mut transitions, previous_key, self.keys[index].clone(), groups);
         }
+        self.recompute_copies(&affected);
         transitions
     }
 
-    /// Recomputes `effective_album_artist` for every currently-stored track whose own (normalized
-    /// album title, grouping-scope directory) equals `(album_norm, parent)`, from scratch, using only
-    /// the group's *current* membership — never anything cached from before. This is what keeps the
-    /// result deterministic regardless of the order tracks arrived in: two libraries built from the
-    /// same final set of tracks, in any insertion order, end up with the same resolution for every
-    /// group. A no-op (empty result) if the group is currently empty (e.g. its last track was just
-    /// removed).
-    ///
-    /// Returns, for every member whose `album_key()` actually changed, `(TrackKey, old_key,
-    /// new_key)` — the "before" is this same function's own snapshot taken just before resolution,
-    /// so for a track being inserted/replaced in the same `upsert` call that triggered this, it
-    /// reflects the transient pre-resolution fallback key, not whatever it held before that call
-    /// (see `upsert`'s own doc comment for how the two are combined).
-    fn resolve_group_for(&mut self, album_norm: &str, parent: &Path) -> Vec<(TrackKey, String, String)> {
-        let indices: Vec<usize> = self
-            .tracks
-            .iter()
-            .enumerate()
-            .filter(|(_, track)| resolution_group_key(track).as_ref().is_some_and(|(a, p)| a == album_norm && p == parent))
-            .map(|(index, _)| index)
-            .collect();
-        self.resolve_group_indices(&indices)
+    /// The interned id of `record`'s copy-detection source.
+    fn source_id(&mut self, record: &TrackRecord) -> u32 {
+        let next = self.sources.len() as u32;
+        *self.sources.entry(source_key(record)).or_insert(next)
     }
 
-    /// `resolve_group_for` for a group whose member indices the caller already knows (bulk loading
-    /// resolves every group once, from one pass over the tracks, instead of one scan per group).
-    fn resolve_group_indices(&mut self, indices: &[usize]) -> Vec<(TrackKey, String, String)> {
+    /// Moves track `index` onto album key `key` in the cached keys and the album index.
+    fn set_key(&mut self, index: usize, key: String) {
+        let old = std::mem::replace(&mut self.keys[index], key);
+        if old == self.keys[index] {
+            return;
+        }
+        if !old.is_empty()
+            && let Some(members) = self.album_members.get_mut(&old)
+        {
+            if let Some(position) = members.iter().position(|&member| member == index) {
+                members.swap_remove(position);
+            }
+            if members.is_empty() {
+                self.album_members.remove(&old);
+            }
+        }
+        self.album_members.entry(self.keys[index].clone()).or_default().push(index);
+    }
+
+    /// Recomputes, from the folder's current membership alone, which album every track whose
+    /// `grouping_scope_dir` is `scope` belongs to and each affected album's effective album artist
+    /// (`CLAUDE.md` "Album grouping"):
+    ///
+    /// 1. `resolve_scope_albums`: a track's album is its own ALBUM title unless the folder-majority
+    ///    rule folds it into the folder's dominant title (or, untagged, joins it).
+    /// 2. Per album whose membership changed (or all of them with `all_albums`),
+    ///    `resolve_effective_album_artist` picks one artist for all its tracks. An album whose members
+    ///    did not change keeps its artist: it is a pure function of those members' tags.
+    ///
+    /// `forced` is the record just inserted or replaced: its album is always re-resolved and it is
+    /// always reported. Returns `(index, key before)` for every track whose album key changed, plus
+    /// `forced` — the "before" is the cached key from the last time the track was resolved, so for the
+    /// forced record it is the transient unresolved key (see `upsert_detailed`). Empty for a scope with
+    /// no tracks.
+    fn regroup_scope(&mut self, scope: &Path, forced: Option<usize>, all_albums: bool) -> Vec<(usize, String)> {
+        let Some(indices) = self.scope_members.get(scope).cloned() else { return Vec::new() };
         if indices.is_empty() {
             return Vec::new();
         }
-        let before: Vec<(TrackKey, String)> = indices.iter().map(|&index| (self.tracks[index].key.clone(), album_key(&self.tracks[index]))).collect();
-        let effective = resolve_effective_album_artist(indices.iter().map(|&index| &self.tracks[index]));
-        for &index in indices {
-            self.tracks[index].effective_album_artist = effective.clone();
+        let resolved = {
+            let tracks: Vec<&Derived> = indices.iter().map(|&index| &self.derived[index]).collect();
+            resolve_scope_albums(&tracks)
+        };
+
+        let mut dirty: HashSet<String> = HashSet::new();
+        let mut changed: Vec<usize> = Vec::new();
+        for (position, &index) in indices.iter().enumerate() {
+            let new_album = resolved.assignment[position].map(|group| &resolved.groups[group]);
+            let record = &mut self.tracks[index];
+            let mut touched = forced == Some(index);
+            if record.effective_album.as_ref() != new_album {
+                // The album the track left loses a member, the one it joins gains one.
+                if let Some(old) = &record.effective_album {
+                    dirty.insert(old.norm.clone());
+                }
+                record.effective_album = new_album.cloned();
+                if new_album.is_none() {
+                    record.effective_album_artist = EffectiveAlbumArtist::Unresolved;
+                }
+                touched = true;
+            }
+            if touched || all_albums {
+                if let Some(album) = new_album {
+                    dirty.insert(album.norm.clone());
+                }
+            }
+            if touched {
+                changed.push(position);
+            }
         }
-        indices
-            .iter()
-            .zip(before)
-            .filter_map(|(&index, (track_key, before_key))| {
-                let after_key = album_key(&self.tracks[index]);
-                (before_key != after_key).then_some((track_key, before_key, after_key))
-            })
-            .collect()
+
+        if !dirty.is_empty() {
+            let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+            for (position, group) in resolved.assignment.iter().enumerate() {
+                if let Some(group) = group
+                    && dirty.contains(&resolved.groups[*group].norm)
+                {
+                    members.entry(*group).or_default().push(position);
+                }
+            }
+            for positions in members.values() {
+                let artist = resolve_effective_album_artist(positions.iter().map(|&position| &self.derived[indices[position]]));
+                for &position in positions {
+                    let record = &mut self.tracks[indices[position]];
+                    if record.effective_album_artist != artist {
+                        record.effective_album_artist = artist.clone();
+                        changed.push(position);
+                    }
+                }
+            }
+        }
+
+        changed.sort_unstable();
+        changed.dedup();
+        let mut moved = Vec::new();
+        for position in changed {
+            let index = indices[position];
+            let key = album_key(&self.tracks[index]);
+            if key != self.keys[index] || forced == Some(index) {
+                let before = self.keys[index].clone();
+                self.set_key(index, key);
+                moved.push((index, before));
+            }
+        }
+        moved
+    }
+
+    /// Recomputes `hidden_copy_of` for every track whose album key is in `keys` (`plan_copies` per
+    /// album, from the album's current members alone).
+    fn recompute_copies(&mut self, keys: &HashSet<String>) {
+        let mut plans: Vec<(usize, Option<TrackKey>)> = Vec::new();
+        for key in keys {
+            let Some(members) = self.album_members.get(key) else { continue };
+            let source = self.derived[members[0]].source;
+            let hidden = if members.iter().all(|&index| self.derived[index].source == source) {
+                // One source: nothing can be a copy.
+                vec![None; members.len()]
+            } else {
+                let tracks: Vec<CopyTrack> = members.iter().map(|&index| CopyTrack { record: &self.tracks[index], derived: &self.derived[index] }).collect();
+                plan_copies(&tracks)
+            };
+            for (&index, hidden) in members.iter().zip(hidden) {
+                if self.tracks[index].hidden_copy_of != hidden {
+                    plans.push((index, hidden));
+                }
+            }
+        }
+        for (index, hidden) in plans {
+            self.tracks[index].hidden_copy_of = hidden;
+        }
+    }
+
+    /// Every hidden duplicate copy with the album key it belongs to (dev-only library dump).
+    #[cfg(test)]
+    pub fn hidden_copies(&self) -> Vec<(&str, &TrackRecord)> {
+        self.tracks.iter().zip(&self.keys).filter(|(track, _)| !track.is_visible()).map(|(track, key)| (key.as_str(), track)).collect()
     }
 
     pub fn get(&self, key: &TrackKey) -> Option<&TrackRecord> {
@@ -301,124 +478,198 @@ impl Library {
     }
 
     /// Every record in insertion (`added_seq`) order; the persistent library cache saves this
-    /// (`cache::CacheSnapshot`).
+    /// (`cache::CacheSnapshot`). Only raw records are saved: the grouping state derived from them
+    /// (`effective_album`, `effective_album_artist`, `hidden_copy_of`) is recomputed on load.
     pub fn records(&self) -> &[TrackRecord] {
         &self.tracks
     }
 
     /// Inserts a whole batch of records (the persistent cache load, `cache::load`) in the given
-    /// order, which becomes their `added_seq` order. Equivalent to calling `upsert` for each record
-    /// (a repeated `TrackKey` replaces the earlier one in place), except every album-artist group is
-    /// resolved ONCE at the end, from a single pass over the tracks: `upsert` rescans all tracks per
-    /// call, which is quadratic for a library of tens of thousands of tracks and far too slow on the
-    /// startup path. Reports no key transitions, since nothing downstream has seen the intermediate
-    /// keys.
+    /// order, which becomes their `added_seq` order. Equivalent to calling `upsert` for each record (a
+    /// repeated `TrackKey` replaces the earlier one in place) — same albums, effective album artists,
+    /// disc numbers, hidden copies and indices, whatever the order — except every touched folder is
+    /// regrouped ONCE and the duplicate copies of every touched album are planned ONCE, after all the
+    /// records are stored: `upsert` regroups its folder per call, which is quadratic for a big folder
+    /// and far too slow on the startup path. Any grouping state the incoming records carry is
+    /// discarded and recomputed. Reports no key transitions, since nothing downstream has seen the
+    /// intermediate keys: only call it before any artwork, recent album or `Navigation` entry exists
+    /// (its one app caller, `AppState::restore_cache`, runs at startup before the first scan). A
+    /// later reload path would have to report transitions like `upsert_detailed` does.
     pub fn load_records(&mut self, records: impl IntoIterator<Item = TrackRecord>) {
+        let mut touched_scopes: HashSet<PathBuf> = HashSet::new();
+        let mut affected: HashSet<String> = HashSet::new();
         for mut record in records {
-            if let Some(&index) = self.by_key.get(&record.key) {
-                record.added_seq = self.tracks[index].added_seq;
-                self.tracks[index] = record;
-            } else {
-                record.added_seq = self.next_seq;
-                self.next_seq += 1;
-                self.by_key.insert(record.key.clone(), self.tracks.len());
-                self.tracks.push(record);
+            record.effective_album = None;
+            record.effective_album_artist = EffectiveAlbumArtist::Unresolved;
+            record.hidden_copy_of = None;
+            let scope = grouping_scope_dir(&record);
+            let mut derived = derive(&record);
+            derived.source = self.source_id(&record);
+            let index = match self.by_key.get(&record.key) {
+                Some(&index) => {
+                    record.added_seq = self.tracks[index].added_seq;
+                    affected.insert(self.keys[index].clone());
+                    if self.scopes[index] != scope {
+                        // The record moved folders: its old folder loses a member.
+                        let old = std::mem::replace(&mut self.scopes[index], scope.clone());
+                        if let Some(members) = self.scope_members.get_mut(&old) {
+                            members.retain(|&member| member != index);
+                        }
+                        touched_scopes.insert(old);
+                        self.scope_members.entry(scope.clone()).or_default().push(index);
+                    }
+                    self.tracks[index] = record;
+                    self.derived[index] = derived;
+                    index
+                }
+                None => {
+                    record.added_seq = self.next_seq;
+                    self.next_seq += 1;
+                    let index = self.tracks.len();
+                    self.by_key.insert(record.key.clone(), index);
+                    self.tracks.push(record);
+                    self.derived.push(derived);
+                    self.scopes.push(scope.clone());
+                    self.keys.push(String::new());
+                    self.scope_members.entry(scope.clone()).or_default().push(index);
+                    index
+                }
+            };
+            // The transient, unresolved key; `regroup_scope` replaces it with the resolved one.
+            let transient = album_key(&self.tracks[index]);
+            self.set_key(index, transient);
+            touched_scopes.insert(scope);
+        }
+        for scope in &touched_scopes {
+            for (index, before_key) in self.regroup_scope(scope, None, true) {
+                affected.insert(before_key);
+                affected.insert(self.keys[index].clone());
+            }
+            // Albums that did not move still need their copies planned (every record is new here).
+            if let Some(members) = self.scope_members.get(scope) {
+                affected.extend(members.iter().map(|&index| self.keys[index].clone()));
             }
         }
-        let mut groups: HashMap<(String, PathBuf), Vec<usize>> = HashMap::new();
-        for (index, track) in self.tracks.iter().enumerate() {
-            if let Some(group) = resolution_group_key(track) {
-                groups.entry(group).or_default().push(index);
-            }
-        }
-        for indices in groups.values() {
-            let _ = self.resolve_group_indices(indices);
-        }
+        self.recompute_copies(&affected);
     }
 
-    /// Removes exactly the tracks in `keys` (a pruned cache entry whose file is gone, `cache`), and
-    /// re-resolves the album-artist group of every track it touched. Unlike `remove_album` it can
-    /// drop part of an album, so the remaining tracks of a group may land on another album key; every
-    /// distinct `(old_key, new_key)` such move is returned for the caller to migrate artwork and
-    /// navigation (`AppState::prune_tracks`).
-    pub fn remove_tracks(&mut self, keys: &HashSet<TrackKey>) -> Vec<(String, String)> {
-        let mut touched_groups: HashSet<(String, PathBuf)> = HashSet::new();
-        let before = self.tracks.len();
-        self.tracks.retain(|record| {
-            if keys.contains(&record.key) {
-                if let Some(group) = resolution_group_key(record) {
-                    touched_groups.insert(group);
-                }
-                false
-            } else {
-                true
-            }
-        });
-        if self.tracks.len() == before {
+    /// Removes exactly the tracks in `keys` (a pruned cache entry whose file is gone, `cache`) and
+    /// re-resolves everything they touched, like `remove_album_detailed` does for a whole album: the
+    /// remaining tracks of the folders involved may land on other album keys, and a removed visible
+    /// copy promotes the next one. Returns every album-key transition that caused, for the caller to
+    /// migrate artwork and navigation (`AppState::prune_tracks`).
+    pub fn remove_tracks(&mut self, keys: &HashSet<TrackKey>) -> Vec<KeyTransition> {
+        let (removed, touched_scopes, removed_albums) = self.remove_indices(|library, index| keys.contains(&library.tracks[index].key));
+        if removed.is_empty() {
             return Vec::new();
         }
-        self.by_key.clear();
-        for (index, record) in self.tracks.iter().enumerate() {
-            self.by_key.insert(record.key.clone(), index);
-        }
-        let mut transitions: Vec<(String, String)> = Vec::new();
-        for (album_norm, parent) in touched_groups {
-            for (_, old_key, new_key) in self.resolve_group_for(&album_norm, &parent) {
-                let pair = (old_key, new_key);
-                if !transitions.contains(&pair) {
-                    transitions.push(pair);
-                }
-            }
-        }
-        transitions
+        self.reresolve_after_removal(touched_scopes, removed_albums)
     }
 
-    /// Removes every track belonging to album `key` from the session library and returns their
-    /// `TrackKey`s ("Remove from Library", `CLAUDE.md` "Library exclusions"). Non-destructive: this
-    /// only drops the in-memory `TrackRecord`s here — it never touches a file on disk and never
-    /// reaches into `AudioPlayer`'s queue or active stream (the library and playback are separate,
-    /// session-only state; see `main.rs`'s `on_remove_album_requested` for where the two are kept
-    /// decoupled). The caller is expected to persist the returned keys as an exclusion
-    /// (`store::LibrarySources::exclude_tracks`) so a later rescan (startup restore) does not bring
-    /// them back. Returns an empty `Vec` if `key` matches no album.
+    /// Removes every track belonging to album `key` from the session library — its visible tracks AND
+    /// its hidden duplicate copies — and returns their `TrackKey`s ("Remove from Library", `CLAUDE.md`
+    /// "Library exclusions"). Non-destructive: this only drops the in-memory `TrackRecord`s here — it
+    /// never touches a file on disk and never reaches into `AudioPlayer`'s queue or active stream (the
+    /// library and playback are separate, session-only state; see `main.rs`'s
+    /// `on_remove_album_requested` for where the two are kept decoupled). The caller is expected to
+    /// persist the returned keys as an exclusion (`store::LibrarySources::exclude_tracks`) so a later
+    /// rescan (startup restore) does not bring any copy back. Returns an empty `Vec` if `key` matches
+    /// no album. Test-only shorthand: the app goes through `remove_album_detailed` (via
+    /// `AppState::remove_album`) so survivors' key transitions are migrated.
+    #[cfg(test)]
     pub fn remove_album(&mut self, key: &str) -> Vec<TrackKey> {
+        self.remove_album_detailed(key).0
+    }
+
+    /// `remove_album`, plus every album-key transition the removal caused for the SURVIVORS: the
+    /// removed tracks' folders are re-resolved, and a removal can shift what is left (the dominant
+    /// title's share grows, the fold cap shrinks, an album's members change), moving an
+    /// already-stored track onto another key exactly like `upsert_detailed` can. The caller migrates
+    /// its artwork cache and navigation off the abandoned keys the same way it does for a scan.
+    pub fn remove_album_detailed(&mut self, key: &str) -> (Vec<TrackKey>, Vec<KeyTransition>) {
+        let (removed, touched_scopes, removed_albums) = self.remove_indices(|library, index| library.keys[index] == key);
+        let transitions = self.reresolve_after_removal(touched_scopes, removed_albums);
+        (removed, transitions)
+    }
+
+    /// Drops every track `doomed` selects and rebuilds the position-dependent indices. Returns the
+    /// removed `TrackKey`s, every folder a removed track sat in and every album key it belonged to.
+    fn remove_indices(&mut self, doomed: impl Fn(&Library, usize) -> bool) -> (Vec<TrackKey>, HashSet<PathBuf>, HashSet<String>) {
         let mut removed = Vec::new();
-        // Every resolution group (`resolution_group_key`) touched by a removed track: usually
-        // emptied entirely by this removal (an album key's tracks are always whole groups), but
-        // re-resolving them afterward — rather than assuming that — keeps this correct even if a
-        // future removal path ever drops less than a whole group, and leaves no stale
-        // `effective_album_artist` behind for a track a caller re-adds under the same group later.
-        let mut touched_groups: HashSet<(String, PathBuf)> = HashSet::new();
-        self.tracks.retain(|record| {
-            if album_key(record) == key {
-                removed.push(record.key.clone());
-                if let Some(group) = resolution_group_key(record) {
-                    touched_groups.insert(group);
-                }
-                false
+        // Every folder a removed track sat in: the remaining tracks there are re-resolved afterwards,
+        // which keeps their grouping correct even if a removal ever drops less than a whole folder
+        // group, and leaves no stale resolution behind for a track a caller re-adds later.
+        let mut touched_scopes: HashSet<PathBuf> = HashSet::new();
+        let mut removed_albums: HashSet<String> = HashSet::new();
+        let mut kept = 0usize;
+        for index in 0..self.tracks.len() {
+            if doomed(self, index) {
+                removed.push(self.tracks[index].key.clone());
+                touched_scopes.insert(self.scopes[index].clone());
+                removed_albums.insert(self.keys[index].clone());
             } else {
-                true
+                self.tracks.swap(kept, index);
+                self.scopes.swap(kept, index);
+                self.keys.swap(kept, index);
+                self.derived.swap(kept, index);
+                kept += 1;
             }
-        });
-        // `by_key` holds indices into `tracks`, which `retain` just shifted; cheap to rebuild
-        // outright rather than patch in place — a removal is a rare, user-initiated action, not a
-        // hot path, and this keeps the index provably correct.
+        }
+        if removed.is_empty() {
+            return (removed, touched_scopes, removed_albums);
+        }
+        // Survivors are compacted in their original relative order, so `added_seq` ordering holds.
+        self.tracks.truncate(kept);
+        self.scopes.truncate(kept);
+        self.keys.truncate(kept);
+        self.derived.truncate(kept);
+        // The index maps hold indices into `tracks`, which just shifted; cheap to rebuild outright
+        // rather than patch in place — a removal is a rare, user-initiated action, not a hot path.
         self.by_key.clear();
+        self.scope_members.clear();
+        self.album_members.clear();
         for (index, record) in self.tracks.iter().enumerate() {
             self.by_key.insert(record.key.clone(), index);
+            self.scope_members.entry(self.scopes[index].clone()).or_default().push(index);
+            self.album_members.entry(self.keys[index].clone()).or_default().push(index);
         }
-        for (album_norm, parent) in touched_groups {
-            // A removal can shift the remaining group's resolution too (e.g. dropping the tracks
-            // that made up a majority) — not surfaced to the caller today, same as before this
-            // function started returning per-key transitions from `resolve_group_for`. Removal is a
-            // rare, user-initiated action that immediately renders "Remove from Library" and never
-            // shows the just-removed album's own artwork/back-stack entry again, so a since-changed
-            // sibling album's art/recent-albums entry lingering under an abandoned key one poll cycle
-            // longer than `upsert`'s own transitions do is an accepted, narrower gap — unlike the
-            // scan-time case, there is no equivalent test coverage requiring it here.
-            let _ = self.resolve_group_for(&album_norm, &parent);
+        (removed, touched_scopes, removed_albums)
+    }
+
+    /// Regroups the folders a removal touched and re-plans the duplicate copies of every album it
+    /// touched (the albums the removed tracks left, and the ones survivors moved between). Returns
+    /// the key transitions of the survivors.
+    fn reresolve_after_removal(&mut self, touched_scopes: HashSet<PathBuf>, removed_albums: HashSet<String>) -> Vec<KeyTransition> {
+        let mut affected = removed_albums;
+        let mut transitions: Vec<KeyTransition> = Vec::new();
+        for scope in touched_scopes {
+            for (index, before_key) in self.regroup_scope(&scope, None, true) {
+                let after_key = self.keys[index].clone();
+                affected.insert(before_key.clone());
+                affected.insert(after_key.clone());
+                note_transition(&mut transitions, before_key, after_key, resolution_group_key(&self.tracks[index]).into_iter().collect());
+            }
         }
-        removed
+        self.recompute_copies(&affected);
+        transitions
+    }
+}
+
+/// Records the `old_key` -> `new_key` move of `groups` in `transitions` (merging with an existing
+/// entry for the same pair); a no-op move is ignored.
+fn note_transition(transitions: &mut Vec<KeyTransition>, old_key: String, new_key: String, groups: Vec<(String, PathBuf)>) {
+    if old_key == new_key {
+        return;
+    }
+    match transitions.iter_mut().find(|t| t.old_key == old_key && t.new_key == new_key) {
+        Some(existing) => {
+            for group in groups {
+                if !existing.groups.contains(&group) {
+                    existing.groups.push(group);
+                }
+            }
+        }
+        None => transitions.push(KeyTransition { old_key, new_key, groups }),
     }
 }
 
@@ -483,19 +734,24 @@ impl Library {
     }
 
     pub fn album(&self, key: &str) -> Option<AlbumSummary> {
-        let tracks: Vec<&TrackRecord> = self.tracks.iter().filter(|track| album_key(track) == key).collect();
+        let tracks = self.visible_album_tracks(key);
         if tracks.is_empty() { None } else { Some(summarize_album(&tracks)) }
+    }
+
+    /// The visible tracks of album `key`, in library order (hidden duplicate copies excluded).
+    fn visible_album_tracks(&self, key: &str) -> Vec<&TrackRecord> {
+        self.tracks.iter().zip(&self.keys).filter(|(track, track_key)| track_key.as_str() == key && track.is_visible()).map(|(track, _)| track).collect()
     }
 
     /// The tracks of album `key`, sorted by disc, track number, then title, then path (a stable
     /// tie-break for tracks that carry no numbering at all).
     pub fn album_tracks(&self, key: &str) -> Vec<&TrackRecord> {
-        let mut tracks: Vec<&TrackRecord> = self.tracks.iter().filter(|track| album_key(track) == key).collect();
+        let mut tracks = self.visible_album_tracks(key);
         // `sort_by_cached_key`, not `sort_by`: an O(n log n) comparator would otherwise lowercase
         // `display_title` again on every comparison instead of once per track (`§6`, same fix as
         // `songs` below).
         tracks.sort_by_cached_key(|track| {
-            (track.tags.disc_number.unwrap_or(0), track.tags.track_number.unwrap_or(0), display_title(track).to_lowercase(), track.key.clone())
+            (effective_disc_number(track).unwrap_or(0), track.tags.track_number.unwrap_or(0), display_title(track).to_lowercase(), track.key.clone())
         });
         tracks
     }
@@ -511,7 +767,7 @@ impl Library {
             (
                 display_artist(track).to_lowercase(),
                 display_album(track).to_lowercase(),
-                track.tags.disc_number.unwrap_or(0),
+                effective_disc_number(track).unwrap_or(0),
                 track.tags.track_number.unwrap_or(0),
                 display_title(track).to_lowercase(),
             )
@@ -539,12 +795,12 @@ impl Library {
         // not just their own name: a genre- or album-only query (e.g. "jazz") must still surface
         // the artists behind those tracks, the same broadening `albums` gets above.
         let mut matched: HashSet<String> = HashSet::new();
-        for track in &self.tracks {
+        for (track, track_album_key) in self.tracks.iter().zip(&self.keys).filter(|(track, _)| track.is_visible()) {
             let artist = display_artist(track);
             let key = artist.to_lowercase();
             display_names.entry(key.clone()).or_insert(artist);
             *track_counts.entry(key.clone()).or_insert(0) += 1;
-            albums_by_artist.entry(key.clone()).or_default().insert(album_key(track));
+            albums_by_artist.entry(key.clone()).or_default().insert(track_album_key.clone());
             if needle.is_empty() || track_matches_query(track, &needle) {
                 matched.insert(key);
             }
@@ -564,8 +820,8 @@ impl Library {
 
     fn album_groups(&self) -> HashMap<String, Vec<&TrackRecord>> {
         let mut groups: HashMap<String, Vec<&TrackRecord>> = HashMap::new();
-        for track in &self.tracks {
-            groups.entry(album_key(track)).or_default().push(track);
+        for (track, key) in self.tracks.iter().zip(&self.keys).filter(|(track, _)| track.is_visible()) {
+            groups.entry(key.clone()).or_default().push(track);
         }
         groups
     }
@@ -575,9 +831,9 @@ impl Library {
     fn filtered_tracks(&self, query: &str) -> Vec<&TrackRecord> {
         let needle = normalize_for_search(query.trim());
         if needle.is_empty() {
-            return self.tracks.iter().collect();
+            return self.tracks.iter().filter(|track| track.is_visible()).collect();
         }
-        self.tracks.iter().filter(|track| track_matches_query(track, &needle)).collect()
+        self.tracks.iter().filter(|track| track.is_visible() && track_matches_query(track, &needle)).collect()
     }
 }
 
@@ -605,7 +861,7 @@ pub fn normalize_for_search(input: &str) -> String {
     input.to_lowercase().chars().map(strip_latin_diacritic).collect()
 }
 
-fn strip_latin_diacritic(c: char) -> char {
+pub(super) fn strip_latin_diacritic(c: char) -> char {
     match c {
         'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
         'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => 'e',
@@ -621,24 +877,27 @@ fn strip_latin_diacritic(c: char) -> char {
 
 fn summarize_album(tracks: &[&TrackRecord]) -> AlbumSummary {
     let key = album_key(tracks[0]);
-    let title = display_album(tracks[0]);
-    // Every track in `tracks` shares one album key, which (once resolved by `Library`) means they
-    // all share one `effective_album_artist` too — reading it off `tracks[0]` alone is safe. The
-    // `Unresolved` arm is only a defensive fallback: `summarize_album`'s one caller (`album_groups`,
-    // over `self.tracks`) only ever sees Library-resolved records.
-    let artist = match &tracks[0].effective_album_artist {
+    // The tracks of one album key can come from several folders (a FLAC folder and a WavPack
+    // sibling) whose resolved title/artist spellings differ; show the most common one, ties broken
+    // by the smallest string, so the header never depends on library order.
+    let title = most_common(tracks.iter().map(|track| display_album(track))).unwrap_or_default();
+    // Every track in `tracks` shares one album key. The `Unresolved` arm is only a defensive
+    // fallback: `summarize_album`'s one caller (`album_groups`, over `self.tracks`) only ever sees
+    // Library-resolved records.
+    let artist = most_common(tracks.iter().map(|track| match &track.effective_album_artist {
         EffectiveAlbumArtist::Known(artist) => artist.clone(),
         EffectiveAlbumArtist::VariousArtists => "Various Artists".to_owned(),
-        EffectiveAlbumArtist::Unresolved => match resolve_effective_album_artist(tracks.iter().copied()) {
+        EffectiveAlbumArtist::Unresolved => match resolve_effective_album_artist(std::iter::once(&derive(track))) {
             EffectiveAlbumArtist::Known(artist) => artist,
             _ => "Various Artists".to_owned(),
         },
-    };
+    }))
+    .unwrap_or_default();
     let year = tracks.iter().filter_map(|track| track.tags.year).min();
     let total_duration_ms = tracks.iter().filter_map(|track| track.info.duration_ms).sum();
     let first_added_seq = tracks.iter().map(|track| track.added_seq).min().unwrap_or(0);
-    let (format_label, format_variant) = match aggregate_album_format(tracks.iter().map(|track| track.info.format.as_str())) {
-        Some(format) => (format.label().to_owned(), format.variant().to_owned()),
+    let (format_label, format_variant) = match aggregate_album_pill(tracks.iter().map(|track| (track.info.format.as_str(), track.info.bits_per_sample, track.info.sample_rate))) {
+        Some((format, variant)) => (format.label().to_owned(), variant.to_owned()),
         None => (String::new(), String::new()),
     };
     AlbumSummary { key, title, artist, year, track_count: tracks.len(), total_duration_ms, first_added_seq, format_label, format_variant }
@@ -664,20 +923,38 @@ fn summarize_album(tracks: &[&TrackRecord]) -> AlbumSummary {
 ///   thread's transient pre-upsert record): falls back to this one record's own tags, exactly the
 ///   way `album_key` behaved before group-level resolution existed (`aa:`/`af:`/`dir:`).
 pub fn album_key(record: &TrackRecord) -> String {
-    let scope = grouping_scope_dir(record);
-    let Some(album) = normalized_album(record) else {
-        return format!("dir:{}", scope.display());
+    let album = match &record.effective_album {
+        Some(album) => album.norm.clone(),
+        None => match normalized_album(record) {
+            Some(album) => album,
+            None => return format!("dir:{}", grouping_scope_dir(record).display()),
+        },
     };
     match &record.effective_album_artist {
-        EffectiveAlbumArtist::Known(artist) => format!("aa:{}\u{1f}{}", normalize_key_text(artist), album),
-        EffectiveAlbumArtist::VariousArtists => format!("va:{}\u{1f}{}", album, scope.display()),
+        EffectiveAlbumArtist::Known(artist) => format!("aa:{}\u{1f}{}", normalize_artist_key(artist), album),
+        EffectiveAlbumArtist::VariousArtists => format!("va:{}\u{1f}{}", album, grouping_scope_dir(record).display()),
         EffectiveAlbumArtist::Unresolved => {
             match record.tags.album_artist.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(album_artist) => format!("aa:{}\u{1f}{}", normalize_key_text(album_artist), album),
-                None => format!("af:{}\u{1f}{}", album, scope.display()),
+                Some(album_artist) => format!("aa:{}\u{1f}{}", normalize_artist_key(album_artist), album),
+                None => format!("af:{}\u{1f}{}", album, grouping_scope_dir(record).display()),
             }
         }
     }
+}
+
+/// The grouping-key form of an album title (dev-only library dump).
+#[cfg(test)]
+pub fn album_title_key(title: &str) -> String {
+    normalize_album_title(title)
+}
+
+/// The most frequent string of `items`, ties broken by the smallest one.
+fn most_common(items: impl Iterator<Item = String>) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for item in items {
+        *counts.entry(item).or_default() += 1;
+    }
+    counts.into_iter().max_by(|(a, count_a), (b, count_b)| count_a.cmp(count_b).then_with(|| b.cmp(a))).map(|(item, _)| item)
 }
 
 fn parent_dir(record: &TrackRecord) -> PathBuf {
@@ -715,48 +992,23 @@ fn grouping_scope_dir(record: &TrackRecord) -> PathBuf {
 /// NOT match a bare `"CD"`/`"Disc"` with no number (ambiguous — could be a genre or label folder)
 /// or a word that merely starts the same way (`"Discography"`, `"Disco"`).
 pub(crate) fn is_disc_subfolder_name(name: &str) -> bool {
-    let lower = name.trim().to_ascii_lowercase();
-    const WORDS: [&str; 3] = ["disc", "disk", "cd"];
-    WORDS.into_iter().any(|word| {
-        lower.strip_prefix(word).is_some_and(|rest| disc_number_prefix_len(rest.trim_start_matches([' ', '.', '-', '_'])) > 0)
-    })
-}
-
-/// `> 0` when `rest` (already lowercased) starts with a disc-number token: one or more ASCII
-/// digits, or one of the spelled-out numbers `"one"`..`"ten"` a disc rip's folder name sometimes
-/// uses (`"Disc One"`).
-fn disc_number_prefix_len(rest: &str) -> usize {
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    if digits > 0 {
-        return digits;
-    }
-    const SPELLED: [&str; 10] = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
-    SPELLED.into_iter().find(|word| rest.starts_with(word)).map_or(0, str::len)
+    parse_disc_designator(&name.to_ascii_lowercase()).is_some()
 }
 
 fn normalized_album(record: &TrackRecord) -> Option<String> {
-    record.tags.album.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(normalize_key_text)
+    record.tags.album.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(normalize_album_title)
 }
 
-/// The group a record's `effective_album_artist` is resolved within: every track sharing this same
-/// (normalized album title, grouping-scope directory) pair (`grouping_scope_dir`), including CUE
-/// tracks of the same sheet (they share both the sheet-level album tag and their physical file's
-/// directory) and, for a multi-disc release, every disc subfolder's tracks together. `None` for a
-/// record with no album tag at all — it never takes part in album-artist resolution, since its
-/// `album_key` is the directory-only `dir:` fallback regardless.
+/// The artwork contributor of a record (`AppState::cache_artwork`): its own (normalized album title,
+/// grouping-scope directory) pair — `grouping_scope_dir` makes the disc subfolders of one release
+/// share a scope — computed from the record's OWN tags, so it is stable however the folder-majority
+/// rule later regroups the track. The empty title stands for "no album tag" (the `dir:` fallback).
 ///
-/// `AppState`'s artwork cache also files each picture under its contributor's group: the group is the
-/// unit that moves to another album key together when its resolution changes.
+/// `AppState`'s artwork cache files each picture under its contributor's group: the group is the
+/// unit that moves to another album key together when its resolution changes
+/// (`KeyTransition::groups`).
 pub(crate) fn resolution_group_key(record: &TrackRecord) -> Option<(String, PathBuf)> {
-    normalized_album(record).map(|album| (album, grouping_scope_dir(record)))
-}
-
-/// Case-insensitive, trimmed, whitespace-collapsed, Unicode-NFC-normalized text for an album-key
-/// component (`§3.3` "Album grouping key"): NFC first, so a title/artist typed or tagged with
-/// precomposed accents (`"café"`) and the same text in combining-mark form (`"cafe\u{301}"`) — two
-/// different taggers can each produce either for the same characters — group identically.
-fn normalize_key_text(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ").nfc().collect::<String>().to_lowercase()
+    Some((normalized_album(record).unwrap_or_default(), grouping_scope_dir(record)))
 }
 
 /// A dominant primary artist must cover at least this share of the group's tracks to win (`§3.3`
@@ -789,26 +1041,31 @@ const PRIMARY_ARTIST_MAJORITY_THRESHOLD: f64 = 0.6;
 ///    `"<that artist> with Someone"` (`dominant_primary_artist`) — covers at least
 ///    `PRIMARY_ARTIST_MAJORITY_THRESHOLD` of the group's tracks, that artist is used.
 /// 3. Otherwise, `VariousArtists`.
-fn resolve_effective_album_artist<'a>(tracks: impl Iterator<Item = &'a TrackRecord>) -> EffectiveAlbumArtist {
-    let tracks: Vec<&TrackRecord> = tracks.collect();
+fn resolve_effective_album_artist<'a>(tracks: impl Iterator<Item = &'a Derived>) -> EffectiveAlbumArtist {
+    let tracks: Vec<&Derived> = tracks.collect();
 
-    let mut album_artist_variants: HashMap<String, Vec<String>> = HashMap::new();
+    let mut album_artist_variants: HashMap<&str, Vec<&str>> = HashMap::new();
     for track in &tracks {
-        if let Some(album_artist) = track.tags.album_artist.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            album_artist_variants.entry(normalize_key_text(album_artist)).or_default().push(album_artist.to_owned());
+        if let Some((norm, raw)) = &track.album_artist {
+            album_artist_variants.entry(norm.as_str()).or_default().push(raw.as_str());
         }
     }
     if !album_artist_variants.is_empty() {
         return EffectiveAlbumArtist::Known(pick_majority_variant(album_artist_variants));
     }
 
-    let mut primary_variants: HashMap<String, Vec<String>> = HashMap::new();
-    for track in &tracks {
-        let artist = display_artist(track);
-        let primary = strip_feat_suffix(&artist).to_owned();
-        primary_variants.entry(normalize_key_text(&primary)).or_default().push(primary);
+    // A track with no artist tag at all (an untagged file that joined the album through the
+    // folder-majority rule) has no vote: its "Unknown Artist" placeholder must not dilute the real
+    // artist's share. When no track has an artist the placeholder is unanimous, as it always was.
+    let mut voters: Vec<&Derived> = tracks.iter().copied().filter(|track| track.has_artist).collect();
+    if voters.is_empty() {
+        voters = tracks.clone();
     }
-    match dominant_primary_artist(&primary_variants, tracks.len()) {
+    let mut primary_variants: HashMap<&str, Vec<&str>> = HashMap::new();
+    for track in &voters {
+        primary_variants.entry(track.primary.0.as_str()).or_default().push(track.primary.1.as_str());
+    }
+    match dominant_primary_artist(&primary_variants, voters.len()) {
         Some(artist) => EffectiveAlbumArtist::Known(artist),
         None => EffectiveAlbumArtist::VariousArtists,
     }
@@ -822,7 +1079,7 @@ fn resolve_effective_album_artist<'a>(tracks: impl Iterator<Item = &'a TrackReco
 /// Garfunkel"`, `"Florence + The Machine"`); those are only ever treated as a featuring separator
 /// contextually, by `dominant_primary_artist`'s own majority-aware second pass, never unconditionally
 /// here. Returns `artist` trimmed, unchanged, when no marker is found.
-fn strip_feat_suffix(artist: &str) -> &str {
+pub(super) fn strip_feat_suffix(artist: &str) -> &str {
     let lower = artist.to_ascii_lowercase();
     const INLINE_MARKERS: [&str; 5] = [" feat. ", " feat ", " ft. ", " ft ", " featuring "];
     const BRACKET_MARKERS: [&str; 4] = ["(feat", "(ft.", "(ft ", "[feat"];
@@ -851,53 +1108,56 @@ fn strip_feat_suffix(artist: &str) -> &str {
 /// established winner, never as a blind split of every `&`: a uniform album by "Earth, Wind & Fire"
 /// already reaches 100% agreement on the full name in the first pass and never even reaches this
 /// fold-in step, so a real band name is never split apart.
-fn dominant_primary_artist(variants: &HashMap<String, Vec<String>>, total: usize) -> Option<String> {
+fn dominant_primary_artist(variants: &HashMap<&str, Vec<&str>>, total: usize) -> Option<String> {
     if total == 0 {
         return None;
     }
     let (winner_norm, _) = variants
         .iter()
-        .map(|(norm, occurrences)| (norm.clone(), occurrences.len()))
+        .map(|(norm, occurrences)| (*norm, occurrences.len()))
         .max_by(|(norm_a, count_a), (norm_b, count_b)| count_a.cmp(count_b).then_with(|| norm_b.cmp(norm_a)))?;
 
     let covered: usize = variants
         .iter()
-        .filter(|(norm, _)| **norm == winner_norm || collaborator_prefix_matches(norm, &winner_norm))
+        .filter(|(norm, occurrences)| **norm == winner_norm || occurrences.iter().any(|raw| collaborator_prefix_matches(raw, winner_norm)))
         .map(|(_, occurrences)| occurrences.len())
         .sum();
     if (covered as f64) / (total as f64) < PRIMARY_ARTIST_MAJORITY_THRESHOLD {
         return None;
     }
 
-    // Winning display string: majority-vote among the winner's own original-cased occurrences only
-    // (a collaborator variant's casing never contributes), same tie-break as `pick_majority_variant`.
-    let mut winners = variants.get(&winner_norm).cloned().unwrap_or_default();
-    winners.sort();
-    winners.into_iter().next()
+    // Winning display string: the winner's own most common original spelling (a collaborator
+    // variant's spelling never contributes), same tie-break as `pick_majority_variant`.
+    variants.get(winner_norm).and_then(|occurrences| most_common(occurrences.iter().map(|raw| (*raw).to_owned())))
 }
 
-/// Whether normalized primary-artist text `candidate` reads as `"{winner} & ..."`/`"{winner} x
+/// Whether primary-artist text `candidate` (as tagged) reads as `"{winner} & ..."`/`"{winner} x
 /// ..."`/`"{winner} with ..."` — a featuring credit spelled with a separator rather than
-/// `feat.`/`ft.`/`featuring` (`dominant_primary_artist`). Both arguments are already
-/// `normalize_key_text`-normalized, so the comparison is case/whitespace/Unicode-form-insensitive.
+/// `feat.`/`ft.`/`featuring` (`dominant_primary_artist`). `winner` is an already-normalized artist
+/// key (`normalize_artist_key`), so the comparison ignores case, accents and punctuation.
 fn collaborator_prefix_matches(candidate: &str, winner: &str) -> bool {
-    [" & ", " x ", " with "].into_iter().any(|separator| candidate.split_once(separator).is_some_and(|(left, _)| left == winner))
+    let lower = candidate.to_ascii_lowercase();
+    // `to_ascii_lowercase` keeps byte offsets, so an offset found in `lower` slices `candidate` safely.
+    [" & ", " x ", " with "]
+        .into_iter()
+        .filter_map(|separator| lower.find(separator))
+        .min()
+        .is_some_and(|position| normalize_artist_key(&candidate[..position]) == winner)
 }
 
 /// Picks the winning display string among `variants` (normalized text -> every original-cased
 /// occurrence seen): the normalized key with the most occurrences, ties broken by the
-/// lexicographically smallest normalized key, then the lexicographically smallest original-cased
-/// occurrence within it — a pure function of the current value multiset, so the result never depends
-/// on iteration or arrival order.
-fn pick_majority_variant(variants: HashMap<String, Vec<String>>) -> String {
-    let (_, mut winners) = variants
+/// lexicographically smallest normalized key, then that key's most common original spelling, ties
+/// broken by the smallest string — a pure function of the current value multiset, so the result
+/// never depends on iteration or arrival order.
+fn pick_majority_variant(variants: HashMap<&str, Vec<&str>>) -> String {
+    let (_, winners) = variants
         .into_iter()
         .max_by(|(norm_a, occurrences_a), (norm_b, occurrences_b)| {
             occurrences_a.len().cmp(&occurrences_b.len()).then_with(|| norm_b.cmp(norm_a))
         })
         .expect("variants is non-empty");
-    winners.sort();
-    winners.into_iter().next().expect("each variant has at least one occurrence")
+    most_common(winners.into_iter().map(str::to_owned)).expect("each variant has at least one occurrence")
 }
 
 pub fn display_title(record: &TrackRecord) -> String {
@@ -917,13 +1177,16 @@ pub fn display_artist(record: &TrackRecord) -> String {
 }
 
 pub fn display_album(record: &TrackRecord) -> String {
+    if let Some(album) = &record.effective_album {
+        return album.title.clone();
+    }
     record
         .tags
         .album
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_owned)
+        .map(clean_album_title)
         .or_else(|| record.key.path.parent().and_then(Path::file_name).and_then(|name| name.to_str()).map(str::to_owned))
         .unwrap_or_else(|| "Unknown Album".to_owned())
 }
@@ -979,6 +1242,8 @@ mod tests {
             artwork_source: ArtworkSource::None,
             added_seq,
             effective_album_artist: EffectiveAlbumArtist::Unresolved,
+            effective_album: None,
+            hidden_copy_of: None,
         }
     }
 
@@ -1036,7 +1301,9 @@ mod tests {
     #[test]
     fn album_summary_precomputes_format_label_and_variant() {
         fn track_with_format(path: &str, format: &str, added_seq: u64) -> TrackRecord {
-            let mut record = track(path, tags("Song", "Artist", "Uniform", None), Some(60_000), added_seq);
+            // A distinct title per file: two same-titled tracks of different formats would be hidden
+            // duplicate copies of one song.
+            let mut record = track(path, tags(&format!("Song {path}"), "Artist", "Uniform", None), Some(60_000), added_seq);
             record.info.format = format.to_owned();
             record
         }
@@ -1057,6 +1324,26 @@ mod tests {
         let mixed_album = mixed.albums("", None).into_iter().find(|album| album.title == "Mixed").expect("mixed album");
         assert_eq!(mixed_album.format_label, "Mix Formats");
         assert_eq!(mixed_album.format_variant, "mix");
+    }
+
+    /// The album pill turns gold only when every track is hi-res FLAC/WavPack (`aggregate_album_pill`).
+    #[test]
+    fn album_summary_variant_is_hires_only_when_every_track_is_hires() {
+        fn hires_track(path: &str, bits: u32, rate: u32, added_seq: u64) -> TrackRecord {
+            let mut record = track(path, tags("Song", "Artist", "Gold", None), Some(60_000), added_seq);
+            record.info.format = "FLAC".to_owned();
+            record.info.bits_per_sample = bits;
+            record.info.sample_rate = rate;
+            record
+        }
+
+        let gold = library_with(vec![hires_track("/music/Gold/a.flac", 24, 96_000, 0), hires_track("/music/Gold/b.flac", 24, 192_000, 1)]);
+        let gold_album = gold.albums("", None).into_iter().next().expect("one album");
+        assert_eq!((gold_album.format_label.as_str(), gold_album.format_variant.as_str()), ("FLAC", "hires"));
+
+        let partial = library_with(vec![hires_track("/music/Gold/a.flac", 24, 96_000, 0), hires_track("/music/Gold/b.flac", 16, 44_100, 1)]);
+        let partial_album = partial.albums("", None).into_iter().next().expect("one album");
+        assert_eq!(partial_album.format_variant, "flac");
     }
 
     #[test]
@@ -1182,6 +1469,8 @@ mod tests {
             artwork_source: ArtworkSource::None,
             added_seq,
             effective_album_artist: EffectiveAlbumArtist::Unresolved,
+            effective_album: None,
+            hidden_copy_of: None,
         }
     }
 
@@ -1329,6 +1618,8 @@ mod tests {
             artwork_source: ArtworkSource::None,
             added_seq: 0,
             effective_album_artist: EffectiveAlbumArtist::Unresolved,
+            effective_album: None,
+            hidden_copy_of: None,
         };
 
         assert!(record.tags.title.is_none(), "the fixture's INFO chunk has no INAM tag");
@@ -1593,6 +1884,23 @@ mod tests {
     }
 
     #[test]
+    fn collaborator_fold_in_does_not_depend_on_which_spelling_comes_first() {
+        // "Band & Friends" and "Band + Friends" share one normalized key, so they are one variant
+        // bucket; the fold-in must hold whichever spelling happens to be listed first.
+        for (first, second) in [("Band & Friends", "Band + Friends"), ("Band + Friends", "Band & Friends")] {
+            let library = library_with(vec![
+                track("/music/Order/a.flac", tags("A", "Band", "Order Album", None), Some(100_000), 0),
+                track("/music/Order/b.flac", tags("B", "Band", "Order Album", None), Some(100_000), 1),
+                track("/music/Order/c.flac", tags("C", first, "Order Album", None), Some(100_000), 2),
+                track("/music/Order/d.flac", tags("D", second, "Order Album", None), Some(100_000), 3),
+            ]);
+            let albums = library.albums("", None);
+            assert_eq!(albums.len(), 1, "{first} / {second}");
+            assert_eq!(albums[0].artist, "Band", "{first} / {second}");
+        }
+    }
+
+    #[test]
     fn cue_sheet_performer_becomes_the_effective_album_artist_via_the_ordinary_albumartist_majority() {
         // A cue-derived track's own `ALBUMARTIST` tag is already the sheet's sheet-level `PERFORMER`
         // once one exists (`scanner::merge_cue_tags`), so it reaches step 1 (explicit `ALBUMARTIST`
@@ -1708,6 +2016,148 @@ mod tests {
             ordered.iter().any(|t| t.artwork_source == ArtworkSource::Embedded),
             "at least one track's embedded artwork must be resolvable for the merged album"
         );
+    }
+
+    /// The grouping a library ended up with, independent of insertion order: per record its folder,
+    /// album key, hidden-copy winner and effective disc number; the visible albums and songs; and the
+    /// incremental indices (`scope_members`, `album_members`) translated to track keys.
+    fn grouping_fingerprint(library: &Library) -> Vec<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for (index, record) in library.tracks.iter().enumerate() {
+            assert_eq!(library.by_key[&record.key], index, "by_key points at the record's position");
+            assert_eq!(library.keys[index], album_key(record), "the cached key is the record's own key");
+            assert_eq!(library.scopes[index], grouping_scope_dir(record), "the cached scope is the record's own scope");
+            lines.push(format!(
+                "record {:?} scope={:?} key={} hidden_behind={:?} disc={:?}",
+                record.key,
+                library.scopes[index],
+                library.keys[index],
+                record.hidden_copy_of,
+                effective_disc_number(record)
+            ));
+        }
+        let names = |members: &Vec<usize>| {
+            let mut keys: Vec<String> = members.iter().map(|&index| format!("{:?}", library.tracks[index].key)).collect();
+            keys.sort();
+            keys
+        };
+        for (scope, members) in &library.scope_members {
+            lines.push(format!("scope {scope:?} -> {:?}", names(members)));
+        }
+        for (key, members) in &library.album_members {
+            lines.push(format!("album_members {key} -> {:?}", names(members)));
+        }
+        for album in library.albums("", None) {
+            let songs: Vec<String> = library.album_tracks(&album.key).iter().map(|record| format!("{:?}", record.key)).collect();
+            lines.push(format!(
+                "album {} {:?} by {:?} x{} {}/{} {:?}",
+                album.key, album.title, album.artist, album.track_count, album.format_label, album.format_variant, songs
+            ));
+        }
+        let mut songs: Vec<String> = library.songs("").iter().map(|record| format!("{:?}", record.key)).collect();
+        songs.sort();
+        lines.push(format!("songs {songs:?}"));
+        lines.sort();
+        lines
+    }
+
+    /// A library with every grouping rule in play: a folder-majority fold (a minority title and an
+    /// untagged track), a FLAC album duplicated as a higher-resolution WavPack sibling folder, a
+    /// two-disc box in `CD1`/`CD2` subfolders without `DISCNUMBER`, and an unrelated single.
+    fn dedupe_fixture() -> Vec<TrackRecord> {
+        let mut records = Vec::new();
+        let titles = ["One", "Two", "Three", "Four", "Five", "Six"];
+        for (number, title) in titles.iter().enumerate() {
+            let mut flac = track(&format!("/m/Alpha/{number:02} {title}.flac"), tags(title, "Alpha", "Alpha Album", None), Some(200_000), 0);
+            flac.tags.track_number = Some(number as u32 + 1);
+            records.push(flac);
+            let mut wavpack = track(&format!("/m/Alpha WV/{number:02} {title}.wv"), tags(title, "Alpha", "Alpha Album", Some("Alpha")), Some(200_500), 0);
+            wavpack.info.format = "WavPack".into();
+            wavpack.info.bits_per_sample = 24;
+            wavpack.info.sample_rate = 96_000;
+            records.push(wavpack);
+        }
+        records.push(track("/m/Alpha/06 Bonus.flac", tags("Bonus", "Alpha", "Alpha Album Bonus", None), Some(180_000), 0));
+        let mut untagged = track("/m/Alpha/07 Hidden.flac", TrackTags::default(), Some(120_000), 0);
+        untagged.tags.title = Some("Hidden".into());
+        records.push(untagged);
+        for disc in 1..=2 {
+            for number in 1..=3 {
+                records.push(track(
+                    &format!("/m/Box/CD{disc}/{number:02} Song {disc}-{number}.flac"),
+                    tags(&format!("Song {disc}-{number}"), "Boxer", &format!("The Box (CD{disc})"), Some("Boxer")),
+                    Some(210_000),
+                    0,
+                ));
+            }
+        }
+        records.push(track("/m/Singles/Lonely.flac", tags("Lonely", "Solo", "Lonely", None), Some(190_000), 0));
+        records
+    }
+
+    #[test]
+    fn load_records_builds_the_same_library_as_upserting_in_any_order() {
+        let records = dedupe_fixture();
+
+        let mut upserted = Library::new();
+        for record in records.iter().cloned() {
+            upserted.upsert(record);
+        }
+        let expected = grouping_fingerprint(&upserted);
+        assert!(upserted.records().iter().any(|record| !record.is_visible()), "the fixture must contain hidden copies");
+        assert!(upserted.records().iter().any(|record| record.effective_album.is_some()), "the fixture must exercise the folder fold");
+        assert!(
+            upserted.records().iter().any(|record| effective_disc_number(record) == Some(2)),
+            "the fixture must exercise disc numbers from subfolders"
+        );
+
+        let mut reversed = records.clone();
+        reversed.reverse();
+        let mut shuffled = records.clone();
+        shuffled.sort_by_key(|record| record.key.path.to_string_lossy().bytes().map(usize::from).sum::<usize>() % 13);
+
+        for (name, order) in [("saved order", records.clone()), ("reversed", reversed.clone()), ("shuffled", shuffled)] {
+            let mut loaded = Library::new();
+            loaded.load_records(order);
+            assert_eq!(grouping_fingerprint(&loaded), expected, "load_records ({name}) must equal upsert");
+        }
+
+        // Upserting in a different order than loading gives the same grouping too (order independence).
+        let mut upserted_reversed = Library::new();
+        for record in reversed {
+            upserted_reversed.upsert(record);
+        }
+        assert_eq!(grouping_fingerprint(&upserted_reversed), expected);
+
+        // Grouping state carried by incoming records is discarded and recomputed, and a repeated key
+        // replaces the earlier record in place.
+        let mut stale = records.clone();
+        for record in &mut stale {
+            record.hidden_copy_of = Some(TrackKey::whole_file(PathBuf::from("/nowhere.flac")));
+        }
+        let mut loaded = Library::new();
+        loaded.load_records(stale);
+        loaded.load_records(records.clone());
+        assert_eq!(grouping_fingerprint(&loaded), expected, "reloading the same records recomputes everything");
+        assert_eq!(loaded.records().len(), records.len());
+    }
+
+    #[test]
+    fn remove_tracks_regroups_like_a_library_built_without_them() {
+        let records = dedupe_fixture();
+        let doomed: HashSet<TrackKey> = records.iter().filter(|record| record.info.format == "WavPack").map(|record| record.key.clone()).collect();
+
+        let mut loaded = Library::new();
+        loaded.load_records(records.clone());
+        assert!(loaded.records().iter().any(|record| !record.is_visible()), "the FLAC copies start hidden");
+        loaded.remove_tracks(&doomed);
+
+        let mut expected = Library::new();
+        for record in records.into_iter().filter(|record| !doomed.contains(&record.key)) {
+            expected.upsert(record);
+        }
+        assert_eq!(grouping_fingerprint(&loaded), grouping_fingerprint(&expected));
+        assert!(loaded.records().iter().all(TrackRecord::is_visible), "with the winners gone every FLAC copy is visible again");
     }
 
     /// The derived `Ord` is the artwork precedence the scanner and `AppState` compare with: a named

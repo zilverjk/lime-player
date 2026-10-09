@@ -783,6 +783,8 @@ fn build_cue_track_records(file: CuePhase2File, artwork: &mut BatchArtwork) -> V
             // track of one CUE sheet shares the sheet-level album/album-artist tags anyway, so once
             // these reach `Library::upsert`, they resolve to the same group regardless.
             effective_album_artist: EffectiveAlbumArtist::Unresolved,
+            effective_album: None,
+            hidden_copy_of: None,
         });
     }
     if let Some(first) = records.iter_mut().find(|record| !artwork.is_excluded(&record.key)) {
@@ -923,6 +925,8 @@ fn scan_details(track: PreparedTrack, artwork: &mut BatchArtwork) -> TrackRecord
         // `Unresolved`. `album_key` then falls back to this one record's own tags for the
         // `BatchArtwork::tiers` dedup key (see `attach_artwork` for what a wrong guess costs).
         effective_album_artist: EffectiveAlbumArtist::Unresolved,
+        effective_album: None,
+        hidden_copy_of: None,
     };
 
     attach_artwork(&mut record, metadata.picture.as_ref(), artwork);

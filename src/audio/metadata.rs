@@ -101,6 +101,12 @@ fn read_symphonia_metadata(path: &Path) -> Result<TrackMetadata, DecoderError> {
         }
     }
 
+    // Per-field precedence: the container's native tags (Vorbis comment, ...) > ID3v2 > ID3v1. A FLAC
+    // wrapped in a leading ID3v2 and a trailing ID3v1 carries three revisions; the ID3v1 one holds
+    // 30-character truncated fields ("The Definitive Groove Collec..") that must never override the
+    // native comment, so the revisions are applied best source first ("first non-empty value wins").
+    revisions.sort_by_key(|revision| metadata_source_rank(revision.info.short_name));
+
     let mut tags = TrackTags::default();
     let mut year_tier = u8::MAX;
     for revision in &revisions {
@@ -114,6 +120,16 @@ fn read_symphonia_metadata(path: &Path) -> Result<TrackMetadata, DecoderError> {
     let picture = select_embedded_picture(&revisions);
 
     Ok(TrackMetadata { tags, picture })
+}
+
+/// Precedence of a symphonia metadata source (lower wins): native container tags first, then
+/// ID3v2, then the truncated, legacy ID3v1.
+fn metadata_source_rank(short_name: &str) -> u8 {
+    match short_name {
+        "id3v1" => 2,
+        "id3v2" => 1,
+        _ => 0,
+    }
 }
 
 /// Applies every standard tag in `list` to `tags`, honoring "first non-empty value per field
@@ -637,6 +653,58 @@ mod tests {
         let path = temp_path("tagged.flac");
         std::fs::write(&path, out).unwrap();
         path
+    }
+
+    /// A 128-byte ID3v1 tag with 30-byte, NUL-padded fields.
+    fn id3v1_tag(title: &str, artist: &str, album: &str, year: &str) -> Vec<u8> {
+        fn field(text: &str, len: usize) -> Vec<u8> {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.resize(len, 0);
+            bytes
+        }
+        let mut tag = b"TAG".to_vec();
+        tag.extend(field(title, 30));
+        tag.extend(field(artist, 30));
+        tag.extend(field(album, 30));
+        tag.extend(field(year, 4));
+        tag.extend(field("", 30));
+        tag.push(255);
+        assert_eq!(tag.len(), 128);
+        tag
+    }
+
+    #[test]
+    fn flac_vorbis_comment_outranks_leading_id3v2_and_trailing_id3v1() {
+        let flac_path = build_tagged_flac();
+        let flac = std::fs::read(&flac_path).unwrap();
+        std::fs::remove_file(&flac_path).unwrap();
+
+        let mut frames = Vec::new();
+        frames.extend_from_slice(&id3v2_text_frame(b"TALB", "ID3v2 Album"));
+        frames.extend_from_slice(&id3v2_text_frame(b"TCON", "ID3v2 Genre"));
+        let mut wrapped = b"ID3".to_vec();
+        wrapped.extend_from_slice(&[3, 0, 0]);
+        wrapped.extend_from_slice(&syncsafe_encode(frames.len()));
+        wrapped.extend_from_slice(&frames);
+        wrapped.extend_from_slice(&flac);
+        wrapped.extend_from_slice(&id3v1_tag("ID3v1 Title", "ID3v1 Artist", "Test Album Truncated By Id", "1999"));
+
+        let path = temp_path("wrapped.flac");
+        std::fs::write(&path, wrapped).unwrap();
+        let metadata = read_metadata(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(metadata.tags.album.as_deref(), Some("Test Album"), "the Vorbis comment beats ID3v2 and ID3v1");
+        assert_eq!(metadata.tags.title.as_deref(), Some("Test Title"));
+        assert_eq!(metadata.tags.artist.as_deref(), Some("Test Artist"));
+        assert_eq!(metadata.tags.year, Some(2021), "the Vorbis date beats the ID3v1 year");
+        assert_eq!(metadata.tags.genre.as_deref(), Some("Test Genre"));
+    }
+
+    #[test]
+    fn metadata_source_rank_orders_native_then_id3v2_then_id3v1() {
+        assert!(metadata_source_rank("vorbis") < metadata_source_rank("id3v2"));
+        assert!(metadata_source_rank("id3v2") < metadata_source_rank("id3v1"));
     }
 
     #[test]

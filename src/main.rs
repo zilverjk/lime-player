@@ -5,6 +5,8 @@ mod media_controls;
 mod settings;
 mod view_model;
 #[cfg(test)]
+mod library_dump;
+#[cfg(test)]
 mod ui_snapshot;
 
 slint::include_modules!();
@@ -16,8 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_state::{
-    AppState, Navigation, PendingVolume, expire_pending_volume, project_now_playing, resolve_volume_event, should_send_volume,
-    unavailable_label,
+    AppState, Navigation, PendingVolume, expire_pending_volume, now_playing_album_available, now_playing_album_key, project_now_playing,
+    resolve_volume_event,
+    should_send_volume, unavailable_label,
 };
 use audio::{AudioInfo, AudioPlayer, OutputDevice, PlaybackEvent, PlayerSettings, PreparedTrack, QueueTrackSnapshot, enumerate_outputs};
 use library::{TrackKey, TrackRecord};
@@ -360,6 +363,10 @@ fn main() -> Result<(), slint::PlatformError> {
     // The now-playing path/duration come from the last `Started`/`Timeline` events (`§6` Stage 2);
     // `on_seek_requested` needs both to turn a fraction into a `player.seek(path, ms)` call.
     let now_playing_key = Rc::new(RefCell::new(None::<TrackKey>));
+    // The track the player bar and the panel SHOW (`PanelNowPlaying::key`): unlike `now_playing_key`
+    // it survives `Stopped`/`Inactive`, because the bar deliberately keeps the last track on screen, so
+    // the now-playing click zones keep working for as long as that track is in the library.
+    let shown_now_playing_key = Rc::new(RefCell::new(None::<TrackKey>));
     let now_playing_duration_ms = Rc::new(RefCell::new(None::<u64>));
     // The last `Started` event's own fallback title/album and the `AudioInfo` of what is actually
     // playing, kept so a later `Scanned` record for the same path can re-project the now-playing
@@ -886,21 +893,21 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // The player-bar artwork click (`§5.6` item 1): same as `album-opened`, with the now-playing
-    // path's own album key when the library knows one (`§3.6`).
+    // A click on the player bar's now-playing zone or the panel cover (`§5.6` item 1): same as
+    // `album-opened`, with the album key of the CURRENT library record of the track the bar and panel
+    // show (`shown_now_playing_key`, which outlives `Stopped`), resolved here at click time
+    // (`now_playing_album_key`). Nothing happens when the track is not in the library;
+    // `MainWindow.now-playing-album-available` mirrors that for the pointer cursor.
     let navigation_for_now_playing_album = Rc::clone(&navigation);
     let now_playing_album_window = window.as_weak();
     let now_playing_album_app_state = Rc::clone(&app_state);
-    let now_playing_album_key = Rc::clone(&now_playing_key);
+    let now_playing_album_shown = Rc::clone(&shown_now_playing_key);
     let now_playing_album_songs_paths = Rc::clone(&songs_paths);
     let now_playing_album_recent_paths = Rc::clone(&recent_paths);
     let now_playing_album_album_paths = Rc::clone(&album_paths);
     let now_playing_album_search_paths = Rc::clone(&search_paths);
     window.on_now_playing_album_requested(move || {
-        let key = now_playing_album_key
-            .borrow()
-            .as_ref()
-            .and_then(|path| now_playing_album_app_state.borrow().library.get(path).map(library::album_key));
+        let key = now_playing_album_key(&now_playing_album_app_state.borrow().library, now_playing_album_shown.borrow().as_ref());
         let Some(key) = key else { return; };
         navigation_for_now_playing_album.borrow_mut().album_opened(&key);
         if let Some(window) = now_playing_album_window.upgrade() {
@@ -973,7 +980,8 @@ fn main() -> Result<(), slint::PlatformError> {
     window.on_remove_album_requested(move |key| {
         let Some(album) = app_state_for_remove_album.borrow().library.album(&key) else { return; };
         let title = album.title.clone();
-        let removed_keys = app_state_for_remove_album.borrow_mut().remove_album(&key);
+        let removed = app_state_for_remove_album.borrow_mut().remove_album(&key);
+        let removed_keys = removed.keys;
         if removed_keys.is_empty() {
             return;
         }
@@ -993,6 +1001,11 @@ fn main() -> Result<(), slint::PlatformError> {
         // left to show — navigate back automatically instead of leaving it stranded on an empty
         // header.
         navigation_for_remove_album.borrow_mut().remove_album(&key);
+        // The removal re-resolved the album's folder: survivors that moved off a vacated key keep their
+        // album page and back-stack entries, exactly as on the scan path.
+        for (old_key, new_key) in &removed.vacated {
+            navigation_for_remove_album.borrow_mut().rekey_album(old_key, new_key);
+        }
         if let Some(window) = remove_album_window.upgrade() {
             sync_navigation(&window, &navigation_for_remove_album.borrow());
             project_and_set_library(
@@ -1061,6 +1074,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let event_preferences = Rc::clone(&preferences);
     let event_save_error = Rc::clone(&settings_save_error);
     let event_now_playing_key = Rc::clone(&now_playing_key);
+    let event_shown_key = Rc::clone(&shown_now_playing_key);
     let event_duration = Rc::clone(&now_playing_duration_ms);
     let event_fallback = Rc::clone(&now_playing_fallback);
     let event_info = Rc::clone(&now_playing_info);
@@ -1621,6 +1635,23 @@ fn main() -> Result<(), slint::PlatformError> {
             event_library_dirty.set(false);
             event_library_last_projected.set(Some(Instant::now()));
         }
+        // The track the panel shows is the one the now-playing zones open the album of; mirrored for
+        // their click handler (only written when it changed, so a tick allocates nothing).
+        {
+            let mut shown = event_shown_key.borrow_mut();
+            let current = panel_now_playing.as_ref().map(|panel| &panel.key);
+            if shown.as_ref() != current {
+                *shown = current.cloned();
+            }
+        }
+        // Whether the now-playing zones would open an album, re-derived every tick so a scan that
+        // brings the shown track into the library, or "Remove from Library" taking it out, is
+        // reflected without a hook at every place the library changes (a hash lookup; Slint skips
+        // notifying when the value is unchanged).
+        if let Some(window) = event_window.upgrade() {
+            let available = now_playing_album_available(&event_app_state.borrow().library, event_shown_key.borrow().as_ref());
+            window.set_now_playing_album_available(available);
+        }
         // The OS Now Playing widget, once per tick from the final UI state, not per event (several
         // events of one tick — `Started`, `Playing`, a `Scanned` re-projection — describe one change).
         if event_media_dirty.replace(false) && let Some(window) = event_window.upgrade() {
@@ -1708,6 +1739,7 @@ fn apply_now_playing_projection(
 ) -> PanelNowPlaying {
     let projection = project_now_playing(app_state, key, info, fallback);
     let shown = PanelNowPlaying {
+        key: key.clone(),
         title: projection.title.clone(),
         artist: projection.artist.clone(),
         album: projection.album.clone(),
@@ -1725,6 +1757,7 @@ fn apply_now_playing_projection(
     window.set_now_playing_year(projection.year.into());
     window.set_now_playing_genre(projection.genre.into());
     window.set_now_playing_badge(projection.badge.into());
+    window.set_now_playing_badge_variant(projection.badge_variant.into());
     window.set_format_line(projection.format_line.into());
     window.set_file_size_line(projection.file_size_line.into());
     window.set_now_playing_has_art(projection.art.is_some());
@@ -1743,6 +1776,8 @@ fn apply_now_playing_projection(
 /// fall back to the file name, "Unknown Artist" and no cover and the widget would stop matching the
 /// app.
 struct PanelNowPlaying {
+    /// The track shown; the now-playing click zones open this track's album.
+    key: TrackKey,
     title: String,
     artist: String,
     album: String,

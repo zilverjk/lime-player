@@ -288,6 +288,39 @@ pub fn track_format(format: &str) -> AlbumFormat {
     aggregate_album_format(std::iter::once(format)).unwrap_or(AlbumFormat::Wav)
 }
 
+/// Minimum bit depth and sample rate for the gold "hi-res" pill color: both must hold, so 24/48 and
+/// 16/96 stay in their format's own color. 32-bit float WavPack counts by its stored depth.
+const HIRES_MIN_BITS_PER_SAMPLE: u32 = 24;
+const HIRES_MIN_SAMPLE_RATE_HZ: u32 = 96_000;
+
+/// The `FormatPill.variant` for one track: `"hires"` (gold) for a FLAC or WavPack track at
+/// `>= 24` bits and `>= 96 kHz`, otherwise the plain `track_format(format).variant()`. WAV and MP3
+/// never become hi-res, whatever their numbers. A missing depth or rate (`0`, how `AudioInfo`
+/// reports an unknown one) is never hi-res. Pure and computed here, not in Slint, so the rule is
+/// unit-tested and every surface (track rows, Format column, player bar) shares it.
+pub fn track_format_variant(format: &str, bits_per_sample: u32, sample_rate: u32) -> &'static str {
+    let family = track_format(format);
+    let hires_family = matches!(family, AlbumFormat::Flac | AlbumFormat::WavPack);
+    if hires_family && bits_per_sample >= HIRES_MIN_BITS_PER_SAMPLE && sample_rate >= HIRES_MIN_SAMPLE_RATE_HZ {
+        "hires"
+    } else {
+        family.variant()
+    }
+}
+
+/// An album's pill format and variant from its tracks' `(format, bits_per_sample, sample_rate)`:
+/// `aggregate_album_format` for the format, and the variant is `"hires"` only when the album is a
+/// single FLAC or WavPack format (never `Mix`) and EVERY track is hi-res (`track_format_variant`);
+/// otherwise the format's own variant. `None` for an empty track list.
+pub fn aggregate_album_pill<'a>(
+    tracks: impl Iterator<Item = (&'a str, u32, u32)> + Clone,
+) -> Option<(AlbumFormat, &'static str)> {
+    let format = aggregate_album_format(tracks.clone().map(|(format, _, _)| format))?;
+    let all_hires =
+        format != AlbumFormat::Mix && tracks.clone().all(|(format, bits, rate)| track_format_variant(format, bits, rate) == "hires");
+    Some((format, if all_hires { "hires" } else { format.variant() }))
+}
+
 fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -303,6 +336,46 @@ fn thousands(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn track_variant_is_gold_only_for_hires_flac_and_wavpack() {
+        // Boundary cases: both thresholds are inclusive and both must hold.
+        assert_eq!(track_format_variant("FLAC", 24, 96_000), "hires");
+        assert_eq!(track_format_variant("FLAC", 24, 192_000), "hires");
+        assert_eq!(track_format_variant("WavPack", 32, 192_000), "hires");
+        assert_eq!(track_format_variant("WavPack", 24, 96_000), "hires");
+        assert_eq!(track_format_variant("FLAC", 24, 88_200), "flac");
+        assert_eq!(track_format_variant("FLAC", 24, 48_000), "flac");
+        assert_eq!(track_format_variant("FLAC", 16, 44_100), "flac");
+        assert_eq!(track_format_variant("FLAC", 16, 96_000), "flac");
+        assert_eq!(track_format_variant("WavPack", 16, 192_000), "wavpack");
+        assert_eq!(track_format_variant("WavPack", 24, 48_000), "wavpack");
+        // WAV and MP3 never become gold, whatever their numbers.
+        assert_eq!(track_format_variant("WAV", 24, 96_000), "wav");
+        assert_eq!(track_format_variant("WAV", 32, 192_000), "wav");
+        assert_eq!(track_format_variant("MP3", 32, 192_000), "mp3");
+        // A missing depth or rate is never hi-res.
+        assert_eq!(track_format_variant("FLAC", 0, 96_000), "flac");
+        assert_eq!(track_format_variant("FLAC", 24, 0), "flac");
+        assert_eq!(track_format_variant("FLAC", 0, 0), "flac");
+    }
+
+    #[test]
+    fn album_pill_is_gold_only_when_every_track_is_hires_and_not_mixed() {
+        let pill = |tracks: &[(&'static str, u32, u32)]| {
+            aggregate_album_pill(tracks.iter().copied()).map(|(format, variant)| (format.label(), variant))
+        };
+        assert_eq!(pill(&[]), None);
+        assert_eq!(pill(&[("FLAC", 24, 96_000), ("FLAC", 24, 192_000)]), Some(("FLAC", "hires")));
+        assert_eq!(pill(&[("WavPack", 32, 192_000), ("WavPack", 24, 96_000)]), Some(("WavPack", "hires")));
+        // One non-hi-res track keeps the whole album in its format color.
+        assert_eq!(pill(&[("FLAC", 24, 96_000), ("FLAC", 16, 44_100)]), Some(("FLAC", "flac")));
+        assert_eq!(pill(&[("WavPack", 24, 96_000), ("WavPack", 24, 48_000)]), Some(("WavPack", "wavpack")));
+        // Mix keeps its own colors even when every track is hi-res.
+        assert_eq!(pill(&[("FLAC", 24, 96_000), ("WavPack", 24, 96_000)]), Some(("Mix Formats", "mix")));
+        assert_eq!(pill(&[("WAV", 24, 96_000)]), Some(("WAV", "wav")));
+        assert_eq!(pill(&[("MP3", 16, 44_100)]), Some(("MP3", "mp3")));
+    }
 
     #[test]
     fn format_khz_and_sizes() {

@@ -200,6 +200,8 @@ fn build_queue_window(volume_available: bool) -> (Rc<MinimalSoftwareWindow>, Mai
     ui.set_now_playing_year("2024".into());
     ui.set_now_playing_genre("Ambient".into());
     ui.set_now_playing_badge("FLAC 24/96".into());
+    ui.set_now_playing_badge_variant("hires".into());
+    ui.set_now_playing_album_available(true);
     // Matches `library::format::format_line` (`§7`): an explicit `\n` before the channels/kbps
     // segment is a hard line break the renderer always honors, so "2,304" and "kbps" always stay
     // on the same (second) line instead of the word-wrap-only U+00A0 approach that Slint 1.18.1's
@@ -215,12 +217,12 @@ fn build_queue_window(volume_available: bool) -> (Rc<MinimalSoftwareWindow>, Mai
     ui.set_can_seek(true);
     ui.set_duration_ms(245_000);
 
-    ui.set_queue_current(sample_row("sample-1", "1", "Sample Track One", "Sample Album One", "FLAC 24/96", "FLAC", "flac", "4:05"));
+    ui.set_queue_current(sample_row("sample-1", "1", "Sample Track One", "Sample Album One", "FLAC 24/96", "FLAC", "hires", "4:05"));
     ui.set_has_queue_current(true);
     ui.set_queue_rows(ModelRc::new(VecModel::from(vec![
         sample_row("sample-2", "2", "Sample Track Two", "Sample Album Two", "FLAC 16/44.1", "FLAC", "flac", "3:12"),
         sample_row("sample-3", "3", "Sample Track Three", "Sample Album Two", "MP3", "MP3", "mp3", "3:47"),
-        sample_row("sample-4", "4", "Sample Track Four", "Sample Album Three", "WavPack 24/96", "WavPack", "wavpack", "5:01"),
+        sample_row("sample-4", "4", "Sample Track Four", "Sample Album Three", "WavPack 24/96", "WavPack", "hires", "5:01"),
     ])));
     ui.set_queue_count(3);
 
@@ -349,6 +351,7 @@ fn render_snapshots() {
             sample_album("album-warm-colors", "Warm Colors", "Nina Path", "2021 · 12 tracks", Some((64, 64, [196, 120, 68])), "MP3", "mp3"),
             sample_album("album-cold-shapes", "Cold Shapes", "Other Artist", "2019 · 9 tracks", None, "FLAC", "flac"),
             sample_album("album-night-drive", "Night Drive", "The Collective", "2024 · 8 tracks", Some((64, 64, [80, 140, 190])), "WavPack", "wavpack"),
+            sample_album("album-gold-standard", "Gold Standard", "Nina Path", "2024 · 9 tracks", None, "FLAC", "hires"),
             sample_album("album-paper-trail", "Paper Trail", "Solo Artist", "2023 · 5 tracks", None, "Mix Formats", "mix"),
             sample_album("album-wide-open", "Wide Open", "Nina Path", "2022 · 10 tracks", Some((64, 64, [150, 90, 200])), "WAV", "wav"),
             sample_album("album-low-tide", "Low Tide", "Other Artist", "2021 · 7 tracks", None, "", ""),
@@ -433,10 +436,12 @@ fn render_snapshots() {
         ui.set_library_empty(false);
         ui.set_songs_summary("128 songs · 9 h 12 min".into());
         ui.set_songs(ModelRc::new(VecModel::from(vec![
-            sample_row("song-1", "1", "Sunrise", "Warm Colors", "FLAC 24/96", "FLAC", "flac", "4:12"),
+            sample_row("song-1", "1", "Sunrise", "Warm Colors", "FLAC 24/96", "FLAC", "hires", "4:12"),
             sample_row("song-2", "2", "Nightfall", "Cold Shapes", "MP3", "MP3", "mp3", "3:47"),
-            sample_row("song-3", "3", "Turnaround", "Night Drive", "WavPack 24/96", "WavPack", "wavpack", "5:01"),
+            sample_row("song-3", "3", "Turnaround", "Night Drive", "WavPack 24/96", "WavPack", "hires", "5:01"),
             sample_row("song-4", "4", "Outro", "Warm Colors", "WAV 16/44.1", "WAV", "wav", "2:58"),
+            sample_row("song-5", "5", "Daybreak", "Cold Shapes", "FLAC 16/44.1", "FLAC", "flac", "3:30"),
+            sample_row("song-6", "6", "Low Tide", "Night Drive", "WavPack 24/48", "WavPack", "wavpack", "4:02"),
         ])));
         ui.window().show().unwrap();
         render_scenario(&window, &dir, "songs-table");
@@ -469,8 +474,8 @@ fn render_snapshots() {
         ui.set_now_playing_key("track-3".into());
         ui.set_album_tracks(ModelRc::new(VecModel::from(vec![
             sample_row("track-1", "1-01", "Intro", "Double Feature", "MP3", "MP3", "mp3", "3:02"),
-            sample_row("track-2", "1-02", "Drifting", "Double Feature", "FLAC 24/96", "FLAC", "flac", "5:47"),
-            sample_row("track-3", "2-01", "Turnaround", "Double Feature", "WavPack 24/96", "WavPack", "wavpack", "4:18"),
+            sample_row("track-2", "1-02", "Drifting", "Double Feature", "FLAC 24/96", "FLAC", "hires", "5:47"),
+            sample_row("track-3", "2-01", "Turnaround", "Double Feature", "WavPack 24/96", "WavPack", "hires", "4:18"),
             sample_row("track-4", "2-02", "Outro", "Double Feature", "WAV 16/44.1", "WAV", "wav", "5:25"),
         ])));
         ui.window().show().unwrap();
@@ -498,16 +503,16 @@ fn render_snapshots() {
             "2018 · 6 tracks · 27:41",
             Some((200, 200, [110, 150, 95])),
             "WavPack",
-            "wavpack",
+            "hires",
         ));
         ui.set_now_playing_key("cue-track-3".into());
         ui.set_album_tracks(ModelRc::new(VecModel::from(vec![
-            sample_row("cue-track-1", "1", "Walking In", "Live at the Grotto", "WavPack 24/96", "WavPack", "wavpack", "4:12"),
-            sample_row("cue-track-2", "2", "Slow Burn", "Live at the Grotto", "WavPack 24/96", "WavPack", "wavpack", "3:58"),
-            sample_row("cue-track-3", "3", "Turnstile", "Live at the Grotto", "WavPack 24/96", "WavPack", "wavpack", "5:20"),
-            sample_row("cue-track-4", "4", "Low Light", "Live at the Grotto", "WavPack 24/96", "WavPack", "wavpack", "4:47"),
-            sample_row("cue-track-5", "5", "Undertow", "Live at the Grotto", "WavPack 24/96", "WavPack", "wavpack", "3:31"),
-            sample_row("cue-track-6", "6", "Walking Out", "Live at the Grotto", "WavPack 24/96", "WavPack", "wavpack", "5:53"),
+            sample_row("cue-track-1", "1", "Walking In", "Live at the Grotto", "WavPack 24/96", "WavPack", "hires", "4:12"),
+            sample_row("cue-track-2", "2", "Slow Burn", "Live at the Grotto", "WavPack 24/96", "WavPack", "hires", "3:58"),
+            sample_row("cue-track-3", "3", "Turnstile", "Live at the Grotto", "WavPack 24/96", "WavPack", "hires", "5:20"),
+            sample_row("cue-track-4", "4", "Low Light", "Live at the Grotto", "WavPack 24/96", "WavPack", "hires", "4:47"),
+            sample_row("cue-track-5", "5", "Undertow", "Live at the Grotto", "WavPack 24/96", "WavPack", "hires", "3:31"),
+            sample_row("cue-track-6", "6", "Walking Out", "Live at the Grotto", "WavPack 24/96", "WavPack", "hires", "5:53"),
         ])));
         ui.window().show().unwrap();
         render_scenario(&window, &dir, "cue-album");
@@ -546,7 +551,7 @@ fn render_snapshots() {
         ui.set_search_songs(ModelRc::new(VecModel::from(vec![
             sample_row("song-1", "1", "Sunrise", "Warm Colors", "FLAC 24/96", "FLAC", "flac", "4:12"),
             sample_row("song-2", "2", "Wide Open", "Wide Open", "FLAC 16/44.1", "FLAC", "flac", "3:58"),
-            sample_row("song-3", "3", "Nina's Theme", "Night Drive", "WavPack 24/96", "WavPack", "wavpack", "5:01"),
+            sample_row("song-3", "3", "Nina's Theme", "Night Drive", "WavPack 24/96", "WavPack", "hires", "5:01"),
             sample_row("song-4", "4", "Outro", "Warm Colors", "FLAC 16/44.1", "FLAC", "flac", "2:58"),
         ])));
         ui.set_search_albums_header("Albums (2)".into());
@@ -885,6 +890,94 @@ mod keyboard_tests {
         window.type_text("a");
         window.click(x, y);
         assert_eq!(window.ui.get_selected_track_key(), "row-1", "an Up Next row selects too");
+        window.press(" ");
+        assert_eq!(window.spaces(), 1);
+        assert_eq!(window.ui.get_search_query(), "a");
+    }
+
+    // -- the now-playing click zones ---------------------------------------------------------------
+
+    /// A window showing a playing track, with `now-playing-album-requested` counted.
+    fn window_with_a_playing_track(album_available: bool) -> (Window, Rc<Cell<u32>>) {
+        let window = Window::new();
+        window.ui.set_library_empty(false);
+        window.ui.set_now_playing_key("sample-1".into());
+        window.ui.set_now_playing_title("Sample Track One".into());
+        window.ui.set_now_playing_artist("Sample Artist".into());
+        window.ui.set_now_playing_badge("FLAC 24/96".into());
+        window.ui.set_now_playing_badge_variant("hires".into());
+        window.ui.set_now_playing_album_available(album_available);
+        let requested = Rc::new(Cell::new(0));
+        let counted = Rc::clone(&requested);
+        window.ui.on_now_playing_album_requested(move || counted.set(counted.get() + 1));
+        window.frame();
+        (window, requested)
+    }
+
+    /// Vertical middle of the player bar (`Theme.playerbar-h` is 72 px, docked at the bottom).
+    const BAR_Y: f32 = HEIGHT as f32 - 36.0;
+
+    #[test]
+    fn clicking_the_player_bars_now_playing_zone_requests_the_album() {
+        let (window, requested) = window_with_a_playing_track(true);
+
+        window.click(40.0, BAR_Y);
+        assert_eq!(requested.get(), 1, "the cover thumbnail is part of the zone");
+        window.click(110.0, BAR_Y - 8.0);
+        assert_eq!(requested.get(), 2, "so is the title text");
+        window.click(110.0, BAR_Y + 10.0);
+        assert_eq!(requested.get(), 3, "so is the artist/badge line");
+    }
+
+    #[test]
+    fn the_player_bars_other_controls_do_not_request_the_album() {
+        let (window, requested) = window_with_a_playing_track(true);
+
+        // Everything right of the zone (the zone ends at 16 + 48 + 12 + 240 px at most): heart,
+        // shuffle, the transport buttons, scrubber and volume. Clicking across all of it must never
+        // reach the zone's touch area.
+        let mut x = 330.0;
+        while x < WIDTH as f32 - 10.0 {
+            window.click(x, BAR_Y);
+            x += 6.0;
+        }
+        assert_eq!(requested.get(), 0, "the heart button and the rest of the bar are outside the now-playing zone");
+    }
+
+    #[test]
+    fn the_now_playing_zone_does_nothing_while_no_album_is_available() {
+        let (window, requested) = window_with_a_playing_track(false);
+
+        window.click(40.0, BAR_Y);
+        window.click(110.0, BAR_Y - 8.0);
+
+        assert_eq!(requested.get(), 0, "a track outside the library has no album page to open");
+    }
+
+    #[test]
+    fn clicking_the_panels_cover_requests_the_album_and_returns_the_keyboard() {
+        let (window, requested) = window_with_a_playing_track(true);
+        window.focus_search_with_tab();
+        window.type_text("a");
+
+        // The cover sits at the panel's top, 20 px in, `Theme.panel-content-w` (260 px) square.
+        window.click(WIDTH as f32 - 150.0, 120.0);
+
+        assert_eq!(requested.get(), 1);
+        window.press(" ");
+        assert_eq!(window.spaces(), 1, "the forwarder hands the keyboard back from the search field");
+        assert_eq!(window.ui.get_search_query(), "a");
+    }
+
+    #[test]
+    fn clicking_the_player_bar_zone_returns_the_keyboard_from_the_search_field() {
+        let (window, requested) = window_with_a_playing_track(true);
+        window.focus_search_with_tab();
+        window.type_text("a");
+
+        window.click(40.0, BAR_Y);
+
+        assert_eq!(requested.get(), 1);
         window.press(" ");
         assert_eq!(window.spaces(), 1);
         assert_eq!(window.ui.get_search_query(), "a");

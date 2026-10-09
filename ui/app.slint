@@ -231,8 +231,11 @@ component PlayerBar inherits Rectangle {
     in property <string> now-playing-title: "";
     in property <string> now-playing-artist: "";
     in property <string> now-playing-badge: "";
+    in property <string> now-playing-badge-variant: "";
     in property <image> now-playing-art;
     in property <bool> now-playing-has-art: false;
+    // Whether a click on the now-playing zone would open an album (`MainWindow.now-playing-album-available`).
+    in property <bool> now-playing-album-available: false;
     in property <int> queue-count: 0;
     in property <string> playback-elapsed: "0:00";
     in property <string> playback-duration: "—:—";
@@ -274,55 +277,64 @@ component PlayerBar inherits Rectangle {
         spacing: 12px;
         cross-axis-alignment: center;
 
-        Rectangle {
-            width: Theme.bar-art;
-            height: Theme.bar-art;
-            ArtworkView { art: root.now-playing-art; has-art: root.now-playing-has-art; size: Theme.bar-art; radius: 6px; }
-            TouchArea { clicked => { root.now-playing-album-requested(); } }
-        }
+        // Cover, title, artist and format badge are one click zone that opens the playing track's
+        // album. The heart/shuffle/transport buttons are siblings outside it, so they never reach it.
+        // The cursor only turns into a pointer while a click would act (`now-playing-album-available`).
+        TouchArea {
+            enabled: root.now-playing-album-available;
+            mouse-cursor: root.now-playing-album-available ? MouseCursor.pointer : MouseCursor.default;
+            clicked => { root.now-playing-album-requested(); }
 
-        VerticalLayout {
-            min-width: 160px;
-            preferred-width: 220px;
-            max-width: 240px;
-            horizontal-stretch: 0;
-            alignment: center;
-            spacing: 3px;
-            Text {
-                text: root.now-playing-title == "" ? "Not playing" : root.now-playing-title;
-                font-size: Theme.fs-body;
-                font-weight: 600;
-                color: Theme.text-primary;
-                overflow: elide;
-            }
-            // Rendered only when there is content: an idle bar (`Not playing`, no artist, no
-            // badge) must not reserve this row's line height, which pushed the title above the
-            // bar's centerline by about half a line (`§6` Stage 5 fix).
-            if root.now-playing-artist != "" || root.now-playing-badge != "": HorizontalLayout {
-                alignment: start;
-                spacing: 8px;
+            HorizontalLayout {
+                spacing: 12px;
                 cross-axis-alignment: center;
-                Text { text: root.now-playing-artist; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; horizontal-stretch: 1; }
-                if root.now-playing-badge != "": Badge { text: root.now-playing-badge; horizontal-stretch: 0; }
-            }
-            // The right panel's own `playback-status` (`NowPlayingPanel`) is invisible below
-            // `Theme.panel-threshold` and whenever the user hides it: without an always-visible
-            // copy, decoder errors, output-format mismatches, "Seek failed…" and buffer underruns
-            // would be reported nowhere at that width (`§1.4`/`§4.6.4`, `§6`). Always present
-            // (`visible`, never `if`): gating this row's very existence on `panel-shown` — which is
-            // itself derived from `root.width` — closed a horizontal-layoutinfo cycle back through
-            // `root.width` that Slint 1.18 only warns about today but may refuse at runtime
-            // tomorrow. Zero-height instead of merely invisible when unused, so it never grows this
-            // fixed-height bar's content past `Theme.playerbar-h`.
-            status-label := Text {
-                text: root.playback-status;
-                font-size: Theme.fs-meta;
-                color: Theme.text-secondary;
-                overflow: elide;
-                property <bool> show: !root.panel-shown && root.playback-status != "";
-                visible: self.show;
-                height: self.show ? self.preferred-height : 0px;
-                Tooltip { Text { text: root.playback-status; font-size: Theme.fs-meta; color: Theme.text-primary; wrap: word-wrap; } }
+
+                ArtworkView { art: root.now-playing-art; has-art: root.now-playing-has-art; size: Theme.bar-art; radius: 6px; }
+
+                VerticalLayout {
+                    min-width: 160px;
+                    preferred-width: 220px;
+                    max-width: 240px;
+                    horizontal-stretch: 0;
+                    alignment: center;
+                    spacing: 3px;
+                    Text {
+                        text: root.now-playing-title == "" ? "Not playing" : root.now-playing-title;
+                        font-size: Theme.fs-body;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        overflow: elide;
+                    }
+                    // Rendered only when there is content: an idle bar (`Not playing`, no artist, no
+                    // badge) must not reserve this row's line height, which pushed the title above the
+                    // bar's centerline by about half a line (`§6` Stage 5 fix).
+                    if root.now-playing-artist != "" || root.now-playing-badge != "": HorizontalLayout {
+                        alignment: start;
+                        spacing: 8px;
+                        cross-axis-alignment: center;
+                        Text { text: root.now-playing-artist; font-size: Theme.fs-meta; color: Theme.text-secondary; overflow: elide; horizontal-stretch: 1; }
+                        if root.now-playing-badge != "": FormatPill { text: root.now-playing-badge; variant: root.now-playing-badge-variant; horizontal-stretch: 0; }
+                    }
+                    // The right panel's own `playback-status` (`NowPlayingPanel`) is invisible below
+                    // `Theme.panel-threshold` and whenever the user hides it: without an always-visible
+                    // copy, decoder errors, output-format mismatches, "Seek failed…" and buffer underruns
+                    // would be reported nowhere at that width (`§1.4`/`§4.6.4`, `§6`). Always present
+                    // (`visible`, never `if`): gating this row's very existence on `panel-shown` — which is
+                    // itself derived from `root.width` — closed a horizontal-layoutinfo cycle back through
+                    // `root.width` that Slint 1.18 only warns about today but may refuse at runtime
+                    // tomorrow. Zero-height instead of merely invisible when unused, so it never grows this
+                    // fixed-height bar's content past `Theme.playerbar-h`.
+                    status-label := Text {
+                        text: root.playback-status;
+                        font-size: Theme.fs-meta;
+                        color: Theme.text-secondary;
+                        overflow: elide;
+                        property <bool> show: !root.panel-shown && root.playback-status != "";
+                        visible: self.show;
+                        height: self.show ? self.preferred-height : 0px;
+                        Tooltip { Text { text: root.playback-status; font-size: Theme.fs-meta; color: Theme.text-primary; wrap: word-wrap; } }
+                    }
+                }
             }
         }
 
@@ -499,6 +511,8 @@ component NowPlayingPanel inherits Rectangle {
     in property <string> now-playing-badge: "";
     in property <image> now-playing-art;
     in property <bool> now-playing-has-art: false;
+    // Whether a click on the cover would open the playing track's album (`MainWindow.now-playing-album-available`).
+    in property <bool> now-playing-album-available: false;
     in property <string> format-line: "";
     in property <string> file-size-line: "";
     in property <string> lyrics: "";
@@ -519,6 +533,7 @@ component NowPlayingPanel inherits Rectangle {
     out property <bool> output-focused: output-combo.has-focus;
     callback output-chosen(int);
     callback hog-mode-changed(bool);
+    callback now-playing-album-requested();
     background: Theme.bg-panel;
 
     // A subtle divider against the middle column (`§6` layout pass), now that the panel is a
@@ -546,7 +561,16 @@ component NowPlayingPanel inherits Rectangle {
             padding-top: root.unified-title-bar ? Theme.topbar-h + 20px : 20px;
             spacing: 8px;
 
-            ArtworkView { art: root.now-playing-art; has-art: root.now-playing-has-art; width: 100%; size: Theme.panel-content-w; radius: 8px; }
+            // The cover opens the playing track's album, like the player bar's now-playing zone.
+            Rectangle {
+                height: Theme.panel-content-w;
+                ArtworkView { art: root.now-playing-art; has-art: root.now-playing-has-art; width: 100%; size: Theme.panel-content-w; radius: 8px; }
+                TouchArea {
+                    enabled: root.now-playing-album-available;
+                    mouse-cursor: root.now-playing-album-available ? MouseCursor.pointer : MouseCursor.default;
+                    clicked => { root.now-playing-album-requested(); }
+                }
+            }
             Text {
                 text: root.now-playing-title == "" ? "Not playing" : root.now-playing-title;
                 font-size: Theme.fs-panel-title;
@@ -1226,10 +1250,15 @@ export component MainWindow inherits Window {
     in property <string> now-playing-year: "";
     in property <string> now-playing-genre: "";
     in property <string> now-playing-badge: "";
+    in property <string> now-playing-badge-variant: "";
     in property <string> format-line: "";
     in property <string> file-size-line: "";
     in property <image> now-playing-art;
     in property <bool> now-playing-has-art: false;
+    // True while the playing track is in the library, i.e. while a click on the player bar's
+    // now-playing zone or the panel cover would open its album. Rust resolves the album at click
+    // time (`app_state::now_playing_album_key`); this only drives the pointer cursor.
+    in property <bool> now-playing-album-available: false;
     in property <string> lyrics: "";
     in property <bool> has-lyrics: false;
 
@@ -1541,6 +1570,8 @@ export component MainWindow inherits Window {
                         now-playing-badge: root.now-playing-badge;
                         now-playing-art: root.now-playing-art;
                         now-playing-has-art: root.now-playing-has-art;
+                        now-playing-album-available: root.now-playing-album-available;
+                        now-playing-album-requested => { root.release-search-focus(); root.now-playing-album-requested(); }
                         format-line: root.format-line;
                         file-size-line: root.file-size-line;
                         lyrics: root.lyrics;
@@ -1564,8 +1595,10 @@ export component MainWindow inherits Window {
                 now-playing-title: root.now-playing-title;
                 now-playing-artist: root.now-playing-artist;
                 now-playing-badge: root.now-playing-badge;
+                now-playing-badge-variant: root.now-playing-badge-variant;
                 now-playing-art: root.now-playing-art;
                 now-playing-has-art: root.now-playing-has-art;
+                now-playing-album-available: root.now-playing-album-available;
                 queue-count: root.queue-count;
                 playback-elapsed: root.playback-elapsed;
                 playback-duration: root.playback-duration;

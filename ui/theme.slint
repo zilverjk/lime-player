@@ -52,11 +52,12 @@ export global Theme {
     // Format pill colors (`§5.5`/`§5.7`), shared by the album-level pill and each per-track pill:
     // MP3 reuses `accent-soft`/`accent-strong` above (the app's lime accent). Each pair follows
     // that same shape — a dark, low-luminance background plus a bright, readable-on-black text
-    // color.
+    // color. `flac-*` (purple) is shared by FLAC and WavPack; `hires-*` (gold) is reserved for hi-res
+    // FLAC/WavPack (`track_format_variant` in `src/library/format.rs`).
     out property <color> flac-soft: #241f33;
     out property <color> flac-strong: #b38ef5;
-    out property <color> wavpack-soft: #332c1f;
-    out property <color> wavpack-strong: #f5c15a;
+    out property <color> hires-soft: #332c1f;
+    out property <color> hires-strong: #f5c15a;
     out property <color> mix-soft: #1f2a33;
     out property <color> mix-strong: #5ab3f5;
     out property <color> wav-soft: #242524;

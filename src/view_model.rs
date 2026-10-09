@@ -8,10 +8,11 @@ use slint::Image;
 use crate::app_state::AppState;
 use crate::audio::{AudioInfo, AudioPlayer, PreparedTrack, QueueTrackSnapshot};
 use crate::library::format::{
-    format_album_card_subtitle, format_album_meta, format_badge, format_clock, format_library_summary, format_search_section_header, track_format,
+    format_album_card_subtitle, format_album_meta, format_badge, format_clock, format_library_summary, format_search_section_header, track_format, track_format_variant,
 };
 use crate::library::{
-    AlbumSummary, ArtistSummary, Library, TrackKey, TrackRecord, display_album, display_artist, display_title, shuffled, track_key_string,
+    AlbumSummary, ArtistSummary, Library, TrackKey, TrackRecord, display_album, display_artist, display_title, effective_disc_number, shuffled,
+    track_key_string,
 };
 use crate::{AlbumAction, AlbumCardData, AlbumHeaderData, ArtistRowData, TrackRowData};
 
@@ -36,6 +37,7 @@ struct RowFallback<'a> {
 fn track_row_from_record(record: &TrackRecord, number: String) -> TrackRowData {
     let info = &record.info;
     let format = track_format(&info.format);
+    let variant = track_format_variant(&info.format, info.bits_per_sample, info.sample_rate);
     TrackRowData {
         key: track_key_string(&record.key).into(),
         number: number.into(),
@@ -46,7 +48,7 @@ fn track_row_from_record(record: &TrackRecord, number: String) -> TrackRowData {
         duration: info.duration_ms.map(format_clock).unwrap_or_else(|| "\u{2014}:\u{2014}".to_owned()).into(),
         badge: format_badge(&info.format, info.bits_per_sample, info.sample_rate, info.is_float).into(),
         format_label: format.label().into(),
-        format_variant: format.variant().into(),
+        format_variant: variant.into(),
     }
 }
 
@@ -57,6 +59,7 @@ fn build_track_row(key: &TrackKey, library: &Library, number: String, fallback: 
             let key = track_key_string(key);
             let duration = fallback.duration_ms.map(format_clock).unwrap_or_else(|| "\u{2014}:\u{2014}".to_owned());
             let format = track_format(fallback.format);
+            let variant = track_format_variant(fallback.format, fallback.bits_per_sample, fallback.sample_rate);
             TrackRowData {
                 key: key.into(),
                 number: number.into(),
@@ -67,7 +70,7 @@ fn build_track_row(key: &TrackKey, library: &Library, number: String, fallback: 
                 duration: duration.into(),
                 badge: format_badge(fallback.format, fallback.bits_per_sample, fallback.sample_rate, fallback.is_float).into(),
                 format_label: format.label().into(),
-                format_variant: format.variant().into(),
+                format_variant: variant.into(),
             }
         }
     }
@@ -141,11 +144,12 @@ fn track_number_label(disc: Option<u32>, track: Option<u32>, multi_disc: bool, r
     }
 }
 
-/// An album is multi-disc once any of its tracks tags a disc past the first (`§5.5`): untagged
+/// An album is multi-disc once any of its tracks sits on a disc past the first (`§5.5`; a `DISCNUMBER`
+/// tag, else the number of its `CD2`-style subfolder): untagged
 /// tracks default to disc 1, so a lone `disc_number` of 2 or more is what flips this, not merely
 /// having more than one distinct value.
 fn album_has_multiple_discs(tracks: &[&TrackRecord]) -> bool {
-    tracks.iter().any(|track| track.tags.disc_number.unwrap_or(1) > 1)
+    tracks.iter().any(|track| effective_disc_number(track).unwrap_or(1) > 1)
 }
 
 /// The current album's tracks (`§3.3` `Library::album_tracks` order: disc, track, title, path),
@@ -157,7 +161,7 @@ fn project_album_tracks(library: &Library, key: &str) -> (Vec<TrackRowData>, Vec
     let mut rows = Vec::with_capacity(tracks.len());
     let mut paths = Vec::with_capacity(tracks.len());
     for (index, record) in tracks.iter().enumerate() {
-        let number = track_number_label(record.tags.disc_number, record.tags.track_number, multi_disc, index + 1);
+        let number = track_number_label(effective_disc_number(record), record.tags.track_number, multi_disc, index + 1);
         rows.push(track_row_from_record(record, number));
         paths.push(record.key.clone());
     }
@@ -531,7 +535,7 @@ mod tests {
         assert_eq!(rows[0].badge, "FLAC 24/96");
         assert_eq!(rows[0].duration, "1:35");
         assert_eq!(rows[0].format_label, "FLAC", "a library-backed row's format pill comes from its own AudioInfo.format");
-        assert_eq!(rows[0].format_variant, "flac");
+        assert_eq!(rows[0].format_variant, "hires", "FLAC 24/96 is hi-res, so its pill is gold");
         assert_eq!(rows[1].number, "2");
         assert_eq!(rows[1].title, "Second Track", "no library record: falls back to the snapshot title");
         assert_eq!(rows[1].album, "Album B", "no library record: falls back to the snapshot parent folder");
@@ -717,8 +721,8 @@ mod tests {
 
         assert_eq!(rows.len(), 4);
         assert_eq!((rows[0].format_label.as_str(), rows[0].format_variant.as_str()), ("MP3", "mp3"));
-        assert_eq!((rows[1].format_label.as_str(), rows[1].format_variant.as_str()), ("FLAC", "flac"));
-        assert_eq!((rows[2].format_label.as_str(), rows[2].format_variant.as_str()), ("WavPack", "wavpack"));
+        assert_eq!((rows[1].format_label.as_str(), rows[1].format_variant.as_str()), ("FLAC", "hires"));
+        assert_eq!((rows[2].format_label.as_str(), rows[2].format_variant.as_str()), ("WavPack", "hires"));
         assert_eq!(
             (rows[3].format_label.as_str(), rows[3].format_variant.as_str()),
             ("WAV", "wav"),
@@ -1006,7 +1010,7 @@ mod tests {
         b.tags.album = Some("Warm Colors".into());
         // A much longer, non-matching track: if the summary ever summed the whole library instead
         // of the filtered rows it displays, this would change the expected total below.
-        let mut excluded = tagged_track("/music/c.flac", "FLAC", 16, 44_100, false, Some(10_000_000));
+        let mut excluded = tagged_track("/music/cold/c.flac", "FLAC", 16, 44_100, false, Some(10_000_000));
         excluded.tags.title = Some("Unrelated".into());
         excluded.tags.album = Some("Cold Shapes".into());
         state.library.upsert(a);
@@ -1136,7 +1140,7 @@ mod ui_contract {
         // token, and (implicitly, by never needing a hex literal here) no hex color introduced
         // outside `theme.slint` for the pill itself.
         for token in [
-            "flac-soft", "flac-strong", "wavpack-soft", "wavpack-strong", "mix-soft", "mix-strong", "wav-soft", "wav-strong",
+            "flac-soft", "flac-strong", "hires-soft", "hires-strong", "mix-soft", "mix-strong", "wav-soft", "wav-strong",
         ] {
             let declaration_needle = format!("out property <color> {token}:");
             assert!(THEME_SLINT.contains(&declaration_needle), "theme.slint must declare `{token}`");
@@ -1384,6 +1388,52 @@ mod ui_contract {
             !without_comments(APP_SLINT).contains("capture-key-pressed") && !without_comments(WIDGETS_SLINT).contains("capture-key-pressed"),
             "a capture handler would steal Space from the search field's TextInput"
         );
+    }
+
+    /// The player bar's now-playing block and the panel's cover both open the playing track's album.
+    /// The zone is one `TouchArea` around cover, title, artist and badge (the heart/transport buttons
+    /// are siblings outside it), gated by `now-playing-album-available`, and Rust resolves the album at
+    /// click time: no album key string lives on the Slint side.
+    #[test]
+    fn now_playing_zones_open_the_playing_tracks_album() {
+        let player_bar = extract_component(APP_SLINT, "PlayerBar");
+        let zone_start = player_bar.find("clicked => { root.now-playing-album-requested(); }").expect("PlayerBar requests the album on a click");
+        let heart_start = player_bar.find("IconButton { source: Icons.heart;").expect("PlayerBar still has the heart button");
+        assert!(zone_start < heart_start, "the now-playing zone must come before, and not wrap, the heart button");
+        let zone = &player_bar[..heart_start];
+        assert!(zone.contains("enabled: root.now-playing-album-available;"), "a click only acts while an album is available");
+        assert!(zone.contains("MouseCursor.pointer"), "the pointer cursor is the affordance");
+        assert!(
+            zone.contains("ArtworkView") && zone.contains("root.now-playing-title") && zone.contains("root.now-playing-artist"),
+            "cover, title and artist are inside the one zone"
+        );
+        assert!(
+            zone.contains("FormatPill { text: root.now-playing-badge; variant: root.now-playing-badge-variant;"),
+            "the bar's format badge is a FormatPill colored by the projection's variant"
+        );
+
+        let panel = extract_component(APP_SLINT, "NowPlayingPanel");
+        assert!(panel.contains("callback now-playing-album-requested();"));
+        assert!(panel.contains("enabled: root.now-playing-album-available;"));
+        assert!(panel.contains("clicked => { root.now-playing-album-requested(); }"), "the panel cover requests the album");
+
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert!(main_window.contains("in property <bool> now-playing-album-available: false;"));
+        assert!(main_window.contains("in property <string> now-playing-badge-variant: \"\";"));
+        assert_eq!(main_window.matches("now-playing-album-available: root.now-playing-album-available;").count(), 2, "bar and panel");
+        assert!(!APP_SLINT.contains("album-key: root.now-playing"), "the album is resolved in Rust at click time");
+
+        let main_rs = include_str!("main.rs");
+        assert!(main_rs.contains("window.set_now_playing_badge_variant("), "the projection sets the badge variant");
+        assert!(main_rs.contains("window.set_now_playing_album_available("), "the availability is kept in sync");
+        assert!(main_rs.contains("now_playing_album_key("), "the click resolves the album key through the library");
+        // The bar and panel keep showing the last track after `Stopped`/`Inactive`, so the zones resolve
+        // from the track the panel shows (`PanelNowPlaying`), never from the live now-playing key, which
+        // those events clear.
+        assert!(main_rs.contains("now_playing_album_available("), "the availability asks the library without building a key");
+        assert!(main_rs.contains("shown_now_playing_key"), "the zones resolve from the track the panel shows");
+        assert!(!main_rs.contains("now_playing_album_playing"), "the click must not read the live key that Stopped clears");
+        assert!(!main_rs.contains("now_playing_album_key(&event_app_state"), "the per-tick availability must not read the live key either");
     }
 
     /// The search field keeps the keyboard after a click elsewhere (Slint never clears focus on an
