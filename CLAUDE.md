@@ -33,6 +33,7 @@ LIME_LIBRARY_DUMP=<library.json> LIME_LIBRARY_DUMP_OUT=<dir> cargo test --bin li
                                              # repairs or writes a file, no AudioPlayer/MediaSession); ~1 min over a NAS
                                              # share; skipped with a message when LIME_LIBRARY_DUMP is unset
 ./scripts/package-macos-app.sh [dest.app]   # release build → ad-hoc-signed bundle, default dist/Lime Player.app
+./scripts/package-macos-dmg.sh              # app bundle → dist/Lime-Player-<version>-<arch>.dmg (+ .zip); CI: .github/workflows/release.yml on v* tags
 ```
 
 There is no rustfmt/clippy config; defaults apply. Tests are `#[cfg(test)]` modules inside `src/` files (`tests/` only holds decoder fixtures). No test touches real audio hardware or CoreAudio devices, and none registers a live OS media session (`MediaSession`, see "Media controls"): that would take over the developer's real media keys and Now Playing. `view_model::ui_contract` tests do string checks against `ui/*.slint` via `include_str!`, `main.rs` tests cover the pending-seek/timeline and Space-decision helpers, and `ui_snapshot::keyboard_tests` drive `MainWindow` offscreen with real Slint key/pointer events (Space, focus return, table selection) on every plain `cargo test`.
