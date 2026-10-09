@@ -2,6 +2,21 @@
 
 Lime Player is an early Rust + Slint desktop player. The UI keeps the dense, dark three-column library layout of the reference while using Lime branding and neutral artwork. Opening files, or whole folders via **Open Folder…** (both pickers accept several items at once), builds a library (Home, Albums, Artists, Songs, Recently Added, album detail, and the queue) from the files' own tags; the set of opened files and added folders is persisted (`library.json`) and re-scanned at the next startup, off the UI thread, without enqueuing or playing anything; the scanned library (tags and cover art) is also cached on disk and shown immediately at launch, even when a NAS share is not mounted yet, then refreshed by that rescan. Playback routes decoded audio to an explicitly selected output device; a click-drag seek restarts the decoder at the target position on the same device, at the same rate — a successful seek reuses the existing Hog lease, while a failed seek releases it and leaves the track blocked at the queue head; the volume slider sets the selected output device's own CoreAudio volume control (`kAudioDevicePropertyVolumeScalar`) when the device exposes a settable one, with no internal software gain, though whether the device applies it in the analog or digital domain is not verified; and Lime does not read cover art embedded in WAV files (only RIFF INFO tags are read there), while FLAC, MP3, and WavPack tags can carry it and a folder cover image still applies to any format — an image named `cover`, `art`, `album art`, `album`, or `front` (`.jpg`, `.jpeg`, or `.png`) beside the tracks, or in the release folder above a `CD1`/`Disc 1` subfolder, is preferred over the embedded picture, which in turn is preferred over a legacy `folder.jpg`.
 
+## Install
+
+1. Download `Lime-Player-<version>-arm64.dmg` from the [GitHub Releases](https://github.com/zilverjk/lime-player/releases) page (a `.zip` of the app is attached as well).
+2. Open the DMG and drag **Lime Player** to **Applications**.
+
+Only Apple Silicon (arm64) builds are published for now. The app is ad-hoc signed and **not notarized** (there is no Apple Developer ID), so macOS blocks the first launch. Open **System Settings → Privacy & Security** and click **Open Anyway**, or run:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Lime Player.app"
+```
+
+**Building the installer locally:** `./scripts/package-macos-dmg.sh` runs a release build and writes `dist/Lime-Player-<version>-<arch>.dmg` and `.zip`.
+
+**Publishing a release:** bump `version` in `Cargo.toml`, then `git tag v<version> && git push origin v<version>`. The tag must match the Cargo.toml version; the `Release` workflow (`.github/workflows/release.yml`) builds the DMG and ZIP and attaches them to a GitHub Release. It can also be run manually (`workflow_dispatch`) to get the files as a build artifact without a release.
+
 ## Playback scope
 
 - Decodes FLAC, WavPack (`.wv` / `.wavpack`), WAV, and MP3. WavPack is a required format and uses the `wavpack` crate's bundled libwavpack. WavPack hybrid tracks and correction files (`.wvc`) are unsupported: the player detects hybrid mode or a matching `.wvc` sidecar and refuses playback instead of silently decoding the incomplete lossy `.wv` stream.
