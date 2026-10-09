@@ -23,6 +23,7 @@ use audio::{AudioInfo, AudioPlayer, OutputDevice, PlaybackEvent, PlayerSettings,
 use library::{TrackKey, TrackRecord};
 use library::format::{format_clock, format_scan_failures_summary, playback_progress};
 use library::repair::{RateRepairConfig, RepairNotes};
+use library::cache::CacheRuntime;
 use library::scanner::{LibraryEvent, LibraryScanner, ScanFailurePhase};
 use library::store::LibrarySources;
 use library::walker::AUDIO_EXTENSIONS;
@@ -348,6 +349,12 @@ fn main() -> Result<(), slint::PlatformError> {
         None => LibraryScanner::new(),
     });
     let app_state = Rc::new(RefCell::new(AppState::new()));
+    // The persistent library cache (`library::cache`, `CLAUDE.md` "Persistent library"): loaded now,
+    // before the startup restore below is even dispatched, so the library on screen at launch is the
+    // one saved last time (minus "Remove from Library" exclusions) even when the NAS is not mounted.
+    // Reads only the cache's own files, never a track path. The restore then refreshes it.
+    let cache_runtime = Rc::new(RefCell::new(CacheRuntime::new(library::cache::cache_dir())));
+    cache_runtime.borrow_mut().load_into(&mut app_state.borrow_mut(), &library_sources.borrow().excluded_tracks);
     // Rust-owned navigation (`§3.6`, Stage 5): current view, sidebar highlight and back stack.
     let navigation = Rc::new(RefCell::new(Navigation::new()));
     // The now-playing path/duration come from the last `Started`/`Timeline` events (`§6` Stage 2);
@@ -956,6 +963,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let navigation_for_remove_album = Rc::clone(&navigation);
     let remove_album_window = window.as_weak();
     let app_state_for_remove_album = Rc::clone(&app_state);
+    let cache_for_remove_album = Rc::clone(&cache_runtime);
     let library_sources_for_remove_album = Rc::clone(&library_sources);
     let save_error_for_remove_album = Rc::clone(&settings_save_error);
     let remove_album_songs_paths = Rc::clone(&songs_paths);
@@ -968,6 +976,11 @@ fn main() -> Result<(), slint::PlatformError> {
         let removed_keys = app_state_for_remove_album.borrow_mut().remove_album(&key);
         if removed_keys.is_empty() {
             return;
+        }
+        {
+            let mut cache = cache_for_remove_album.borrow_mut();
+            cache.tracker.forget(&removed_keys);
+            cache.mark_dirty();
         }
         {
             let mut sources = library_sources_for_remove_album.borrow_mut();
@@ -1063,6 +1076,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let event_scanning_batches = Rc::clone(&scanning_batches);
     let event_library_last_projected = Rc::clone(&library_last_projected_at);
     let event_app_state = Rc::clone(&app_state);
+    let event_cache = Rc::clone(&cache_runtime);
     let event_player_for_library = Arc::clone(&audio_player);
     let event_queue_pending = Rc::clone(&queue_pending);
     let event_queue_paths = Rc::clone(&queue_paths);
@@ -1331,6 +1345,15 @@ fn main() -> Result<(), slint::PlatformError> {
                     // "Open Files…"/"Open Folder…" batch never actually contains an excluded track
                     // in the first place, since re-opening a path lifts its exclusion synchronously
                     // before `scan()`/`scan_folder()` is even dispatched (see the callbacks above).
+                    // Every track the rescan found, excluded or not, exists on disk: it confirms its
+                    // cached copy (`library::cache::RefreshTracker`).
+                    {
+                        let mut cache = event_cache.borrow_mut();
+                        cache.tracker.note_probed(batch, tracks.iter().map(|track| &track.key));
+                        if !tracks.is_empty() {
+                            cache.mark_dirty();
+                        }
+                    }
                     let tracks = exclude_removed_tracks(tracks, &event_library_sources.borrow());
                     if batch_should_enqueue(kind) {
                         event_player_for_library.enqueue(tracks.clone());
@@ -1372,6 +1395,11 @@ fn main() -> Result<(), slint::PlatformError> {
                         continue;
                     }
                     let key = record.key.clone();
+                    {
+                        let mut cache = event_cache.borrow_mut();
+                        cache.tracker.note_scanned(&key);
+                        cache.mark_dirty();
+                    }
                     // The playing track's album picture as it is before this record lands, to tell
                     // below whether this scan replaced it (`AppState::artwork_revision_of`).
                     let now_playing_key = event_now_playing_key.borrow().clone();
@@ -1442,6 +1470,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         // have claimed ever reached the queue or the library — its files fall
                         // through to ordinary whole-file scanning instead (`library::scanner`).
                         ScanFailurePhase::Cue => {
+                            event_cache.borrow_mut().tracker.note_cue_failure(batch);
                             if show_inline {
                                 set_playback_status(&window, format!("Could not read cue sheet {name}: {error}"), &event_save_error);
                             }
@@ -1455,6 +1484,19 @@ fn main() -> Result<(), slint::PlatformError> {
                     // after a scan finishes instead of waiting out the rest of the interval.
                     event_scanning_batches.set(event_scanning_batches.get().saturating_sub(1));
                     let kind = event_batch_kinds.borrow_mut().remove(&batch).unwrap_or(BatchKind::OpenFiles);
+                    // A folder walk that listed everything proves which cached tracks of that folder
+                    // are gone (`library::cache::RefreshTracker`); a batch with no reliable walk
+                    // prunes nothing.
+                    let walked_away = event_cache.borrow_mut().tracker.finish_batch(batch);
+                    apply_cache_prune(
+                        &window,
+                        &event_app_state,
+                        &event_navigation,
+                        &event_cache,
+                        &event_library_dirty,
+                        walked_away,
+                        "a completed folder scan did not find them",
+                    );
                     let had_scan_failures = event_batch_failures.borrow().get(&batch).is_some_and(|failures| !failures.is_empty());
                     match event_batch_failures.borrow_mut().remove(&batch) {
                         Some(failures) if !failures.is_empty() => {
@@ -1501,6 +1543,9 @@ fn main() -> Result<(), slint::PlatformError> {
                         set_playback_status(&window, message, &event_save_error);
                     }
                 }
+                LibraryEvent::FolderWalked { batch, root, files, empty_dirs } => {
+                    event_cache.borrow_mut().tracker.note_walk(batch, root, files, empty_dirs);
+                }
                 LibraryEvent::FolderScanProgress { root, found } => {
                     set_playback_status(&window, format!("Scanning {}: {found} tracks found", root.display()), &event_save_error);
                 }
@@ -1517,6 +1562,29 @@ fn main() -> Result<(), slint::PlatformError> {
                     event_batch_repairs.borrow_mut().entry(batch).or_default().record_failed(file_name_of(&path), error);
                 }
             }
+        }
+        // The persistent library cache: once the startup rescan is over, check the cached tracks no
+        // folder walk covered (on a worker thread; it may touch a slow share), prune the ones whose
+        // directory lists fine without them, and write the cache when it changed and the scans have
+        // settled (or a long scan has gone 30 s without a write).
+        {
+            let scanning = event_scanning_batches.get() > 0;
+            event_cache.borrow_mut().start_sweep_if_ready(scanning);
+            let swept = event_cache.borrow_mut().take_sweep_result();
+            if let Some(missing) = swept
+                && let Some(window) = event_window.upgrade()
+            {
+                apply_cache_prune(
+                    &window,
+                    &event_app_state,
+                    &event_navigation,
+                    &event_cache,
+                    &event_library_dirty,
+                    missing,
+                    "their files are no longer in a readable folder",
+                );
+            }
+            event_cache.borrow_mut().flush_if_due(&event_app_state.borrow(), scanning);
         }
         // One projection per tick, however many events marked it dirty above (`§3.4`).
         if queue_dirty && let Some(window) = event_window.upgrade() {
@@ -1581,7 +1649,42 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    window.run()
+    let result = window.run();
+    // Clean exit: write whatever the debounce still holds (and wait for a write in flight).
+    cache_runtime.borrow_mut().flush_blocking(&app_state.borrow());
+    result
+}
+
+/// Removes cached tracks a rescan proved gone from the library (`AppState::prune_tracks`) and keeps
+/// `Navigation` resolvable: an album page whose album vanished navigates back, a moved key is
+/// rewritten. Does nothing for an empty list.
+fn apply_cache_prune(
+    window: &MainWindow,
+    app_state: &RefCell<AppState>,
+    navigation: &RefCell<Navigation>,
+    cache: &RefCell<CacheRuntime>,
+    library_dirty: &Cell<bool>,
+    gone: Vec<TrackKey>,
+    reason: &str,
+) {
+    if gone.is_empty() {
+        return;
+    }
+    let keys: std::collections::HashSet<TrackKey> = gone.into_iter().collect();
+    let (moved, vanished) = app_state.borrow_mut().prune_tracks(&keys);
+    {
+        let mut navigation = navigation.borrow_mut();
+        for (old_key, new_key) in &moved {
+            navigation.rekey_album(old_key, new_key);
+        }
+        for album in &vanished {
+            navigation.remove_album(album);
+        }
+    }
+    sync_navigation(window, &navigation.borrow());
+    cache.borrow_mut().mark_dirty();
+    library_dirty.set(true);
+    write_diagnostic(&format!("library cache: dropped {} cached track(s): {reason}", keys.len()));
 }
 
 /// Sets every now-playing property from `app_state::project_now_playing` (`§5.8`, `§5.10`

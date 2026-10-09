@@ -2,7 +2,7 @@
 //! `Navigation` (`§3.6`, Stage 5), and the now-playing/pending-volume pure helpers `§5.10`
 //! describes. Pending seek stays in `main.rs`, since nothing outside `main.rs` needs it yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,7 @@ use slint::{Image, Rgb8Pixel, SharedPixelBuffer};
 
 use crate::View;
 use crate::audio::{AudioInfo, PreparedTrack};
+use crate::library::cache::{ArtHash, CachedAlbumArt, CachedPicture, LoadedCache};
 use crate::library::format::{format_badge, format_file_size, format_line};
 use crate::library::{
     ArtworkPixels, ArtworkSource, Library, TrackKey, TrackRecord, album_key, display_album, display_artist, display_title, normalize_for_search,
@@ -25,7 +26,7 @@ const MAX_RECENT_ALBUMS: usize = 12;
 /// track whose scan carried it, `None` for a track without an album tag. Re-resolving a group's album
 /// artist moves all of its tracks to another album key together, so the group is the unit its
 /// pictures follow (`AppState::apply_scanned`).
-type Contributor = (String, PathBuf);
+pub type Contributor = (String, PathBuf);
 
 /// One picture cached for an album key, plus the precedence tier it came from and who contributed
 /// it, so a better picture can replace it (`AppState::cache_artwork`) and it can follow its
@@ -39,6 +40,9 @@ struct CachedArtwork {
     /// Identifies this picture (`AppState::art_revision` at the time it was cached); it travels with
     /// the picture when `apply_scanned` moves it to another album key.
     revision: u64,
+    /// Content hash of the pixels, the name of the picture's file in the persistent library cache
+    /// (`library::cache`). Computed once, when the picture is cached.
+    hash: ArtHash,
 }
 
 #[derive(Default)]
@@ -78,8 +82,127 @@ impl AppState {
     pub fn cache_artwork(&mut self, key: &str, pixels: &ArtworkPixels, source: ArtworkSource, contributor: Option<&Contributor>) {
         let buffer = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(&pixels.rgb, pixels.width, pixels.height);
         self.art_revision += 1;
-        let picture = CachedArtwork { image: Image::from_rgb8(buffer), source, contributor: contributor.cloned(), revision: self.art_revision };
+        let hash = ArtHash::of(pixels.width, pixels.height, &pixels.rgb);
+        let picture =
+            CachedArtwork { image: Image::from_rgb8(buffer), source, contributor: contributor.cloned(), revision: self.art_revision, hash };
         self.place_artwork(key, picture, true);
+    }
+
+    /// Fills the library and the artwork cache from the persistent library cache at startup
+    /// (`library::cache`), before any rescan. Each picture goes through the ordinary `place_artwork`,
+    /// so tiers, contributors and shared buffers behave as if the scanner had just delivered it; a
+    /// picture whose album is not in the library (a stale key) is dropped. The records are
+    /// `Unresolved` until `Library::load_records` resolves every album-artist group.
+    pub fn restore_cache(&mut self, loaded: LoadedCache) {
+        self.library.load_records(loaded.tracks);
+        let albums: HashSet<String> = self.library.records().iter().map(album_key).collect();
+        for picture in loaded.artwork {
+            if !albums.contains(&picture.album_key) {
+                continue;
+            }
+            self.art_revision += 1;
+            let restored = CachedArtwork {
+                image: Image::from_rgb8(picture.pixels),
+                source: picture.source,
+                contributor: picture.contributor,
+                revision: self.art_revision,
+                hash: picture.hash,
+            };
+            self.place_artwork(&picture.album_key, restored, true);
+        }
+    }
+
+    /// The artwork half of a cache snapshot (`cache::CacheSnapshot`): every album key's pictures in
+    /// the art cache's order (sorted by key so the file is stable), plus the pixel buffers of the
+    /// pictures not in `on_disk` yet, one per distinct hash. The buffers are the cache's own
+    /// reference-counted ones, not copies.
+    pub fn artwork_snapshot(&self, on_disk: &HashSet<ArtHash>) -> (Vec<CachedAlbumArt>, Vec<(ArtHash, SharedPixelBuffer<Rgb8Pixel>)>) {
+        let mut albums = Vec::new();
+        let mut new_pixels: Vec<(ArtHash, SharedPixelBuffer<Rgb8Pixel>)> = Vec::new();
+        let mut queued: HashSet<ArtHash> = HashSet::new();
+        for (key, held) in &self.art_cache {
+            if held.is_empty() {
+                continue;
+            }
+            // A contributor path that is not valid UTF-8 cannot be written as JSON, and one such
+            // picture would fail every write of the whole cache: leave it out (the rescan re-adds it).
+            let held: Vec<&CachedArtwork> =
+                held.iter().filter(|picture| picture.contributor.as_ref().is_none_or(|(_, path)| path.to_str().is_some())).collect();
+            if held.is_empty() {
+                continue;
+            }
+            for picture in &held {
+                if !on_disk.contains(&picture.hash)
+                    && queued.insert(picture.hash)
+                    && let Some(buffer) = picture.image.to_rgb8()
+                {
+                    new_pixels.push((picture.hash, buffer));
+                }
+            }
+            albums.push(CachedAlbumArt {
+                album_key: key.clone(),
+                pictures: held
+                    .into_iter()
+                    .map(|picture| CachedPicture { hash: picture.hash, source: picture.source, contributor: picture.contributor.clone() })
+                    .collect(),
+            });
+        }
+        albums.sort_by(|a, b| a.album_key.cmp(&b.album_key));
+        (albums, new_pixels)
+    }
+
+    /// Drops cached tracks the rescan proved gone (`cache::RefreshTracker`, `cache::find_missing`).
+    /// Re-resolving an album-artist group can move the remaining tracks to another album key; their
+    /// pictures follow (`move_artwork`) exactly as in `apply_scanned`, an album left empty forgets its
+    /// pictures. Returns the vacated `(old_key, new_key)` transitions and the album keys that vanished
+    /// outright, so the caller rewires `Navigation` for both.
+    pub fn prune_tracks(&mut self, keys: &HashSet<TrackKey>) -> (Vec<(String, String)>, Vec<String>) {
+        if keys.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let affected: HashSet<String> = keys.iter().filter_map(|key| self.library.get(key).map(album_key)).collect();
+        let transitions = self.library.remove_tracks(keys);
+        let mut applied: Vec<(String, String)> = Vec::new();
+        for (old_key, moved_to) in transitions {
+            if old_key == moved_to {
+                continue;
+            }
+            let vacated = self.library.album(&old_key).is_none();
+            self.move_artwork(&old_key, &moved_to, None, vacated);
+            if vacated {
+                applied.push((old_key, moved_to));
+            }
+        }
+        let mut vanished = Vec::new();
+        for album in affected {
+            if self.library.album(&album).is_none() {
+                self.art_cache.remove(&album);
+                if !applied.iter().any(|(old_key, _)| *old_key == album) {
+                    vanished.push(album);
+                }
+            }
+        }
+        self.rekey_recent_albums(&applied);
+        let library = &self.library;
+        self.recent_album_keys.retain(|key| library.album(key).is_some());
+        (applied, vanished)
+    }
+
+    /// Rewrites `recent_album_keys` entries that went from an old album key to a new one, keeping
+    /// only the first of any two that now collide.
+    fn rekey_recent_albums(&mut self, applied: &[(String, String)]) {
+        if applied.is_empty() {
+            return;
+        }
+        for (old_key, new_key) in applied {
+            for existing in &mut self.recent_album_keys {
+                if existing == old_key {
+                    *existing = new_key.clone();
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        self.recent_album_keys.retain(|key| seen.insert(key.clone()));
     }
 
     /// Files `incoming` under `key`, next to the other contributors' pictures. Its own contributor's
@@ -230,19 +353,9 @@ impl AppState {
         if let Some(pixels) = pixels {
             self.cache_artwork(&new_key, &pixels, source, group.as_ref());
         }
-        for (old_key, new_key) in &applied {
-            for existing in &mut self.recent_album_keys {
-                if existing == old_key {
-                    *existing = new_key.clone();
-                }
-            }
-        }
-        if !applied.is_empty() {
-            // Rewriting can make two entries collide (the old and new key both already present);
-            // keep only the first occurrence so "Jump back in" never shows the same album twice.
-            let mut seen = std::collections::HashSet::new();
-            self.recent_album_keys.retain(|key| seen.insert(key.clone()));
-        }
+        // Rewriting can make two entries collide (the old and new key both already present); only
+        // the first occurrence is kept so "Jump back in" never shows the same album twice.
+        self.rekey_recent_albums(&applied);
         applied
     }
 

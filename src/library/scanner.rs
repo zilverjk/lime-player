@@ -76,6 +76,15 @@ pub enum LibraryEvent {
     /// files, before any of them enter the ordinary probe/tag pipeline above. `main.rs` uses
     /// `root` to build a "Scanning {root}: {found} tracks found" status line.
     FolderScanProgress { root: PathBuf, found: usize },
+    /// A folder walk (`scan_folder`) finished and its listing can be trusted as the folder's
+    /// complete contents: every directory listed without an I/O error, and `root` itself is a
+    /// readable, non-empty directory (an empty mount point left behind by an unmounted share is not
+    /// evidence that its files are gone). Sent before the walk's own `Probed`/`BatchDone`, and never
+    /// for a walk that was cancelled, incomplete or whose root was unreadable. `files` are the audio
+    /// files found (cue sheets are not listed); `empty_dirs` are directories that listed with no
+    /// entries at all, whose cached tracks the cache must not judge by that listing. `main.rs` feeds it to the persistent library cache
+    /// (`cache::RefreshTracker`), which prunes cached tracks the walk did not find.
+    FolderWalked { batch: u64, root: PathBuf, files: Vec<PathBuf>, empty_dirs: Vec<PathBuf> },
     /// A FLAC at a non-standard sample rate was converted in place (`audio::rate_repair`). Its
     /// original is kept at `backup`. The track's own `Probed` follows and carries the new rate.
     RateRepaired { batch: u64, path: PathBuf, from_rate: u32, to_rate: u32, backup: PathBuf },
@@ -190,12 +199,15 @@ impl LibraryScanner {
             .name("lime-library-folder-walk".into())
             .spawn(move || {
                 let mut last_reported = 0usize;
-                let files = walker::walk_folder(&root, &cancel, |found| {
+                let outcome = walker::walk_folder_checked(&root, &cancel, |found| {
                     if found == 1 || found - last_reported >= 20 {
                         last_reported = found;
                         let _ = events.send(LibraryEvent::FolderScanProgress { root: root.clone(), found });
                     }
                 });
+                let walk_is_reliable = outcome.complete && std::fs::read_dir(&root).is_ok_and(|mut entries| entries.next().is_some());
+                let files = outcome.files;
+                let empty_dirs = outcome.empty_dirs;
                 if cancel.load(Ordering::Acquire) {
                     return;
                 }
@@ -209,6 +221,9 @@ impl LibraryScanner {
                         error: "not found (is it mounted?)".to_owned(),
                         phase: ScanFailurePhase::Probe,
                     });
+                }
+                if walk_is_reliable {
+                    let _ = events.send(LibraryEvent::FolderWalked { batch, root: root.clone(), files: files.clone(), empty_dirs });
                 }
                 // A folder walk's own files are never an "explicit selection" (`CLAUDE.md` "Over-
                 // broad CUE claim on Open Files"): every file the walk found was already implicitly
@@ -2333,6 +2348,41 @@ FILE \"b.flac\" WAVE\r\n  TRACK 02 AUDIO\r\n    INDEX 01 00:00:00\r\n",
         probed.sort();
         assert_eq!(probed, vec![dir.join("Album/a.flac"), dir.join("Album/b.wav")]);
         assert!(batch_done, "expected BatchDone for the folder scan");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The walk's listing reaches the persistent library cache only when it can be trusted: a
+    /// readable folder reports `FolderWalked` (before its `Probed`/`BatchDone`), a missing root and an
+    /// empty directory (a stale mount point) do not.
+    #[test]
+    fn scan_folder_reports_its_listing_only_when_it_is_reliable() {
+        let walked = |root: PathBuf| -> Option<Vec<PathBuf>> {
+            let scanner = LibraryScanner::new();
+            let events = scanner.events();
+            let batch = scanner.scan_folder(root, HashSet::new());
+            let mut listing = None;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match events.recv_timeout(Duration::from_millis(200)) {
+                    Ok(LibraryEvent::FolderWalked { batch: walked_batch, files, .. }) => {
+                        assert_eq!(walked_batch, batch);
+                        listing = Some(files);
+                    }
+                    Ok(LibraryEvent::BatchDone { .. }) => break,
+                    _ => {}
+                }
+            }
+            listing
+        };
+
+        let dir = temp_dir("scan-folder-walked");
+        std::fs::copy(fixture_path("decoder-tone.flac"), dir.join("a.flac")).unwrap();
+        assert_eq!(walked(dir.clone()), Some(vec![dir.join("a.flac")]));
+
+        let empty = temp_dir("scan-folder-walked-empty");
+        assert_eq!(walked(empty), None, "an empty directory proves nothing about its files");
+        assert_eq!(walked(dir.join("does-not-exist")), None);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

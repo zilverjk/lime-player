@@ -15,7 +15,7 @@ const WAVPACK_MODE_FLOAT: i32 = 0x8;
 const WAVPACK_MODE_HYBRID: i32 = 0x4;
 const DECODE_CHUNK_FRAMES: usize = 4096;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AudioInfo {
     pub sample_rate: u32,
     pub duration_ms: Option<u64>,

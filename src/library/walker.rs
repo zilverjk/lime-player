@@ -55,12 +55,57 @@ fn is_skipped_dir_name(name: &str) -> bool {
 /// is called with the running total every time a file is added, so the caller can report live
 /// progress without waiting for the whole walk to finish. A missing or unreadable `root` simply
 /// yields an empty result rather than an error or a panic.
-pub fn walk_folder(root: &Path, cancel: &AtomicBool, mut on_progress: impl FnMut(usize)) -> Vec<PathBuf> {
+#[cfg(test)]
+pub fn walk_folder(root: &Path, cancel: &AtomicBool, on_progress: impl FnMut(usize)) -> Vec<PathBuf> {
+    walk_folder_checked(root, cancel, on_progress).files
+}
+
+/// What a walk found, and whether it can be trusted to be the folder's COMPLETE contents.
+pub struct WalkOutcome {
+    pub files: Vec<PathBuf>,
+    /// `true` only when every directory was listed without an I/O error and the walk was not
+    /// cancelled. A missing file may be treated as deleted (`cache` pruning) only if this holds: a
+    /// directory that failed to list (a NAS share timing out or reconnecting mid-walk) silently
+    /// drops its whole subtree from `files`.
+    pub complete: bool,
+    /// Directories whose listing came back with no entries at all and no error. A flaky share can
+    /// answer a directory it cannot serve with an empty listing, so the library cache never treats
+    /// the files it holds below such a directory as proven gone.
+    pub empty_dirs: Vec<PathBuf>,
+}
+
+/// `walk_folder` plus the completeness flag the persistent library cache needs.
+pub fn walk_folder_checked(root: &Path, cancel: &AtomicBool, mut on_progress: impl FnMut(usize)) -> WalkOutcome {
     let mut found = Vec::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
     visited.insert(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
-    walk_dir(root, &mut visited, cancel, &mut found, &mut on_progress);
-    found
+    let mut complete = true;
+    let mut empty_dirs = Vec::new();
+    walk_dir(root, &mut visited, cancel, &mut found, &mut on_progress, &mut complete, &mut empty_dirs);
+    WalkOutcome { files: found, complete: complete && !cancel.load(Ordering::Acquire), empty_dirs }
+}
+
+/// Whether `walk_folder(root)` would have visited `path` had it existed: an audio-extension file
+/// below `root` with no hidden component and no directory named `*.wv` on the way. A cached track
+/// outside this set (a hidden file opened individually, a file inside a `*.wv` directory reached
+/// through a cue sheet) must never be judged missing because a walk did not list it.
+pub fn is_reachable_by_walk(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else { return false };
+    if !has_audio_extension(path) {
+        return false;
+    }
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Some(name) = component.as_os_str().to_str() else { return false };
+        if is_hidden_or_appledouble(name) {
+            return false;
+        }
+        let is_directory = components.peek().is_some();
+        if is_directory && is_skipped_dir_name(name) {
+            return false;
+        }
+    }
+    true
 }
 
 fn walk_dir(
@@ -69,12 +114,28 @@ fn walk_dir(
     cancel: &AtomicBool,
     found: &mut Vec<PathBuf>,
     on_progress: &mut impl FnMut(usize),
+    complete: &mut bool,
+    empty_dirs: &mut Vec<PathBuf>,
 ) {
     if cancel.load(Ordering::Acquire) {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    let mut entries: Vec<_> = entries.flatten().collect();
+    let Ok(entries) = fs::read_dir(dir) else {
+        *complete = false;
+        return;
+    };
+    let mut entries: Vec<_> = entries
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(_) => {
+                *complete = false;
+                None
+            }
+        })
+        .collect();
+    if entries.is_empty() && *complete {
+        empty_dirs.push(dir.to_path_buf());
+    }
     // Deterministic order: reproducible tests and a stable-looking progress count, not a
     // correctness requirement.
     entries.sort_by_key(|entry| entry.file_name());
@@ -92,7 +153,17 @@ fn walk_dir(
         // itself), so a symlinked file or directory is classified by what it actually points to.
         // An unreadable or broken entry (a dangling symlink, a permission error) is skipped rather
         // than failing the whole walk.
-        let Ok(metadata) = fs::metadata(&path) else { continue };
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                // A dangling symlink is just not there; anything else (a timeout, a permission
+                // error) means this entry's presence is unknown.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    *complete = false;
+                }
+                continue;
+            }
+        };
         if metadata.is_dir() {
             if is_skipped_dir_name(name_str) {
                 continue;
@@ -103,7 +174,7 @@ fn walk_dir(
             if !visited.insert(real_path) {
                 continue;
             }
-            walk_dir(&path, visited, cancel, found, on_progress);
+            walk_dir(&path, visited, cancel, found, on_progress, complete, empty_dirs);
         } else if metadata.is_file() && has_audio_extension(&path) {
             found.push(path);
             on_progress(found.len());
@@ -240,5 +311,43 @@ mod tests {
         let dir = temp_dir("missing").join("does-not-exist");
         let found = walk(&dir);
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn a_complete_walk_is_flagged_complete_and_an_unreadable_root_is_not() {
+        let dir = temp_dir("complete");
+        touch(&dir.join("a.flac"));
+        let cancel = AtomicBool::new(false);
+        let outcome = walk_folder_checked(&dir, &cancel, |_| {});
+        assert!(outcome.complete);
+        assert_eq!(outcome.files.len(), 1);
+
+        let missing = walk_folder_checked(&dir.join("not-there"), &cancel, |_| {});
+        assert!(!missing.complete, "a root that cannot be listed must not count as an empty folder");
+
+        cancel.store(true, Ordering::Release);
+        assert!(!walk_folder_checked(&dir, &cancel, |_| {}).complete, "a cancelled walk is never complete");
+    }
+
+    #[test]
+    fn reachability_matches_what_the_walk_would_visit() {
+        let root = Path::new("/m");
+        assert!(is_reachable_by_walk(root, Path::new("/m/Artist/Album/01.FLAC")));
+        assert!(!is_reachable_by_walk(root, Path::new("/m/Artist/.hidden/01.flac")));
+        assert!(!is_reachable_by_walk(root, Path::new("/m/Artist/._01.flac")));
+        assert!(!is_reachable_by_walk(root, Path::new("/m/Disc.wv/01.flac")));
+        assert!(is_reachable_by_walk(root, Path::new("/m/Artist/track.wv")), "a .wv FILE is walked");
+        assert!(!is_reachable_by_walk(root, Path::new("/m/Artist/notes.txt")));
+        assert!(!is_reachable_by_walk(root, Path::new("/elsewhere/01.flac")));
+    }
+
+    #[test]
+    fn directories_that_list_empty_are_reported() {
+        let dir = temp_dir("empty-dirs");
+        std::fs::create_dir_all(dir.join("Empty")).unwrap();
+        std::fs::create_dir_all(dir.join("Full")).unwrap();
+        touch(&dir.join("Full/a.flac"));
+        let outcome = walk_folder_checked(&dir, &AtomicBool::new(false), |_| {});
+        assert_eq!(outcome.empty_dirs, vec![dir.join("Empty")]);
     }
 }
