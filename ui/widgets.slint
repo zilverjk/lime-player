@@ -230,22 +230,23 @@ export component Badge inherits Rectangle {
 // and on each `TrackRow` (one per track, `§5.5`): same shape/padding/font as `Badge` above, but its
 // background/text color is picked from `variant` instead of always the accent pair, so the format
 // families can be told apart at a glance. `variant` is one of `"mp3"`, `"flac"`, `"wavpack"`,
-// `"mix"`, `"wav"` — the exact strings `AlbumFormat::variant` in `src/library/format.rs` produces
-// (a per-track pill only ever uses `"mp3"`/`"flac"`/`"wavpack"`/`"wav"`, never `"mix"`, since a
-// single track always has exactly one format); an unrecognized variant (there should never be one)
+// `"mix"`, `"wav"` (`AlbumFormat::variant` in `src/library/format.rs`) or `"hires"`, which Rust
+// picks for hi-res FLAC/WavPack (`track_format_variant`/`aggregate_album_pill`); FLAC and WavPack
+// share the purple pair and `"hires"` is the gold one. A per-track pill never uses `"mix"`, since a
+// single track always has exactly one format; an unrecognized variant (there should never be one)
 // falls back to the neutral WAV colors rather than an undefined brush. `"mp3"` reuses
 // `Theme.accent-soft`/`Theme.accent-strong` (the app's lime accent) so no separate MP3 token exists
 // in `theme.slint`.
 export component FormatPill inherits Rectangle {
     in property <string> text;
     in property <string> variant;
-    property <color> pill-bg: root.variant == "flac" ? Theme.flac-soft
-        : root.variant == "wavpack" ? Theme.wavpack-soft
+    property <color> pill-bg: (root.variant == "flac" || root.variant == "wavpack") ? Theme.flac-soft
+        : root.variant == "hires" ? Theme.hires-soft
         : root.variant == "mix" ? Theme.mix-soft
         : root.variant == "mp3" ? Theme.accent-soft
         : Theme.wav-soft;
-    property <color> pill-text: root.variant == "flac" ? Theme.flac-strong
-        : root.variant == "wavpack" ? Theme.wavpack-strong
+    property <color> pill-text: (root.variant == "flac" || root.variant == "wavpack") ? Theme.flac-strong
+        : root.variant == "hires" ? Theme.hires-strong
         : root.variant == "mix" ? Theme.mix-strong
         : root.variant == "mp3" ? Theme.accent-strong
         : Theme.wav-strong;

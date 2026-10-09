@@ -35,9 +35,11 @@ use super::{ArtworkSource, EffectiveAlbumArtist, TrackKey, TrackRecord};
 use crate::app_state::{AppState, Contributor};
 use crate::audio::{AudioInfo, TrackTags};
 
-/// Bump when `IndexFile` (or the art file format) changes incompatibly: an index with another
-/// version is ignored and rebuilt.
-pub const CACHE_VERSION: u32 = 1;
+/// Bump when `IndexFile` (or the art file format) changes incompatibly, or when the way scanned
+/// values are read changes so that saved ones are wrong: an index with another version is ignored and
+/// rebuilt. Version 2: tag precedence is now container-native > ID3v2 > ID3v1 (version 1 could have
+/// saved a truncated ID3v1 album title instead of the real one).
+pub const CACHE_VERSION: u32 = 2;
 
 const INDEX_FILE: &str = "index.json";
 const ART_DIR: &str = "art";
@@ -102,8 +104,10 @@ impl<'de> Deserialize<'de> for ArtHash {
     }
 }
 
-/// What the library keeps of one track. The album-artist resolution and `added_seq` are not stored:
-/// both are recomputed from the records themselves (`Library::load_records`), in saved order.
+/// What the library keeps of one track. Only raw scan results are stored: `added_seq` and every piece
+/// of grouping state derived from them (the effective album and album artist, hidden duplicate
+/// copies) are recomputed from the records themselves (`Library::load_records`), in saved order, so
+/// a change to the grouping rules never leaves stale derived state in the file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CachedTrack {
     pub key: TrackKey,
@@ -134,6 +138,8 @@ impl CachedTrack {
             artwork_source: self.artwork_source,
             added_seq: 0,
             effective_album_artist: EffectiveAlbumArtist::Unresolved,
+            effective_album: None,
+            hidden_copy_of: None,
         }
     }
 }
@@ -917,6 +923,16 @@ mod tests {
         }
     }
 
+    /// Version 1 saved tags read with the old precedence (a truncated ID3v1 album could win), so such a
+    /// cache is discarded and rebuilt by the rescan.
+    #[test]
+    fn a_version_1_cache_is_discarded() {
+        let dir = TempDir::new("version-1");
+        fs::write(dir.path().join(INDEX_FILE), br#"{"version":1,"tracks":[],"artwork":[]}"#).unwrap();
+        assert!(matches!(load(dir.path(), &HashSet::new()), LoadOutcome::Ignored(_)));
+        assert_eq!(CACHE_VERSION, 2);
+    }
+
     #[test]
     fn an_ignored_cache_is_replaced_by_the_next_write() {
         let dir = TempDir::new("replace");
@@ -1042,6 +1058,85 @@ mod tests {
         let keys = |state: &AppState| state.library.records().iter().map(crate::library::album_key).collect::<Vec<_>>();
         assert_eq!(keys(&restored), keys(&state));
         assert_eq!(restored.library.albums("", None).len(), 1);
+    }
+
+    /// Two folders holding the same album as FLAC 16/44.1 and as WavPack 24/96 (the better copy), plus
+    /// a stray track the folder-majority rule folds in: scanned, saved and restored, the cache must
+    /// give back the same albums, the same visible tracks and the same hidden copies, because only raw
+    /// records are written and the grouping is recomputed on load.
+    #[test]
+    fn loading_restores_folder_folds_and_hidden_copies_like_scanning() {
+        let dir = TempDir::new("dedupe");
+        let mut state = AppState::new();
+        let mut scan = |path: &str, title: &str, album: &str, wavpack: bool| {
+            let mut track = record(path, album, "Alpha");
+            track.tags.album_artist = None;
+            track.tags.title = Some(title.into());
+            if wavpack {
+                track.info.format = "WavPack".into();
+                track.info.bits_per_sample = 24;
+                track.info.sample_rate = 96_000;
+            }
+            track.artwork = Some(pixels(4, path.len() as u8));
+            track.artwork_source = ArtworkSource::Embedded;
+            state.apply_scanned(track);
+        };
+        for title in ["One", "Two", "Three", "Four"] {
+            scan(&format!("/m/Alpha/{title}.flac"), title, "Alpha Album", false);
+            scan(&format!("/m/Alpha WV/{title}.wv"), title, "Alpha Album", true);
+        }
+        scan("/m/Alpha/Extra.flac", "Extra", "Alpha Album Extra", false);
+        assert!(state.library.records().iter().any(|record| !record.is_visible()), "the FLAC copies are hidden behind the WavPack ones");
+        write_state(dir.path(), &state);
+
+        let mut restored = AppState::new();
+        restored.restore_cache(loaded(load(dir.path(), &HashSet::new())));
+
+        let shape = |state: &AppState| {
+            let mut records: Vec<_> = state.library.records().iter().map(|r| (r.key.clone(), crate::library::album_key(r), r.hidden_copy_of.clone())).collect();
+            records.sort();
+            let mut albums: Vec<_> = state
+                .library
+                .albums("", None)
+                .into_iter()
+                .map(|a| (a.key.clone(), a.title, a.artist, a.track_count, state.artwork_for_key(&a.key).is_some()))
+                .collect();
+            albums.sort();
+            (records, albums)
+        };
+        assert_eq!(shape(&restored), shape(&state));
+        assert_eq!(restored.library.albums("", None).len(), 1, "the stray track folded into the album, the copies share it");
+        assert_eq!(restored.library.songs("").len(), 5, "four songs (best copy) plus the folded extra");
+    }
+
+    /// Pruning the visible copy of a song (its file is gone) promotes the hidden one, and the album
+    /// keeps its picture: the removal re-plans the copies of the album it touched.
+    #[test]
+    fn pruning_a_visible_copy_promotes_the_hidden_one() {
+        let mut state = AppState::new();
+        for (path, wavpack) in [("/m/A/01.flac", false), ("/m/A/02.flac", false), ("/m/A WV/01.wv", true), ("/m/A WV/02.wv", true)] {
+            let mut track = record(path, "A", "X");
+            track.tags.title = Some(format!("Song {}", Path::new(path).file_stem().unwrap().to_string_lossy()));
+            if wavpack {
+                track.info.format = "WavPack".into();
+                track.info.bits_per_sample = 24;
+                track.info.sample_rate = 96_000;
+            }
+            track.artwork = Some(pixels(4, 9));
+            track.artwork_source = ArtworkSource::Embedded;
+            state.apply_scanned(track);
+        }
+        let album = crate::library::album_key(state.library.get(&key("/m/A WV/01.wv")).unwrap());
+        assert!(!state.library.get(&key("/m/A/01.flac")).unwrap().is_visible(), "the FLAC copy starts hidden");
+
+        let gone: HashSet<TrackKey> = [key("/m/A WV/01.wv")].into_iter().collect();
+        let (moved, vanished) = state.prune_tracks(&gone);
+
+        assert!(moved.is_empty() && vanished.is_empty());
+        assert!(state.library.get(&key("/m/A/01.flac")).unwrap().is_visible(), "the surviving copy is promoted");
+        assert!(!state.library.get(&key("/m/A/02.flac")).unwrap().is_visible(), "an untouched song keeps its hidden copy");
+        assert_eq!(state.library.album(&album).map(|a| a.track_count), Some(2));
+        assert!(state.artwork_for_key(&album).is_some());
     }
 
     // ----- pruning ---------------------------------------------------------------------------

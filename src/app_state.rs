@@ -11,9 +11,9 @@ use slint::{Image, Rgb8Pixel, SharedPixelBuffer};
 use crate::View;
 use crate::audio::{AudioInfo, PreparedTrack};
 use crate::library::cache::{ArtHash, CachedAlbumArt, CachedPicture, LoadedCache};
-use crate::library::format::{format_badge, format_file_size, format_line};
+use crate::library::format::{format_badge, format_file_size, format_line, track_format_variant};
 use crate::library::{
-    ArtworkPixels, ArtworkSource, Library, TrackKey, TrackRecord, album_key, display_album, display_artist, display_title, normalize_for_search,
+    ArtworkPixels, ArtworkSource, KeyTransition, Library, TrackKey, TrackRecord, album_key, display_album, display_artist, display_title, normalize_for_search,
     resolution_group_key, track_key_string,
 };
 
@@ -21,6 +21,15 @@ use crate::library::{
 const MAX_BACK_STACK: usize = 16;
 /// "Jump back in" keeps at most this many recently played albums (`§5.10` "Recently played").
 const MAX_RECENT_ALBUMS: usize = 12;
+
+/// What "Remove from Library" took out (`AppState::remove_album`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct RemovedAlbum {
+    /// Every removed track, hidden copies included: the exclusions to persist.
+    pub keys: Vec<TrackKey>,
+    /// `(old_key, new_key)` of the surviving albums whose key the removal vacated, for `Navigation`.
+    pub vacated: Vec<(String, String)>,
+}
 
 /// Who contributed a cached picture: the resolution group (`library::resolution_group_key`) of the
 /// track whose scan carried it, `None` for a track without an album tag. Re-resolving a group's album
@@ -162,17 +171,9 @@ impl AppState {
         }
         let affected: HashSet<String> = keys.iter().filter_map(|key| self.library.get(key).map(album_key)).collect();
         let transitions = self.library.remove_tracks(keys);
-        let mut applied: Vec<(String, String)> = Vec::new();
-        for (old_key, moved_to) in transitions {
-            if old_key == moved_to {
-                continue;
-            }
-            let vacated = self.library.album(&old_key).is_none();
-            self.move_artwork(&old_key, &moved_to, None, vacated);
-            if vacated {
-                applied.push((old_key, moved_to));
-            }
-        }
+        // The same migration a scan or "Remove from Library" does: pictures follow their group (or all
+        // of them once the old key is vacated), recently played entries are rewritten.
+        let applied = self.migrate_transitions(transitions);
         let mut vanished = Vec::new();
         for album in affected {
             if self.library.album(&album).is_none() {
@@ -182,7 +183,6 @@ impl AppState {
                 }
             }
         }
-        self.rekey_recent_albums(&applied);
         let library = &self.library;
         self.recent_album_keys.retain(|key| library.album(key).is_some());
         (applied, vanished)
@@ -259,9 +259,16 @@ impl AppState {
     /// the session library (`Library::remove_album`, returning their keys) and forgets its pictures
     /// too, so re-opening the album starts from what is on disc by then — a cover deleted in the
     /// meantime no longer outranks the embedded picture.
-    pub fn remove_album(&mut self, key: &str) -> Vec<TrackKey> {
+    ///
+    /// Removing the album re-resolves its folder, which can move SURVIVORS onto other keys (the
+    /// dominant title's share grows, the fold cap shrinks): their pictures and recently-played entries
+    /// are migrated exactly like on the scan path (`apply_scanned`), and the vacated moves are returned
+    /// so the caller rewires `Navigation` (`Navigation::rekey_album`).
+    pub fn remove_album(&mut self, key: &str) -> RemovedAlbum {
         self.art_cache.remove(key);
-        self.library.remove_album(key)
+        let (keys, transitions) = self.library.remove_album_detailed(key);
+        let vacated = self.migrate_transitions(transitions);
+        RemovedAlbum { keys, vacated }
     }
 
     /// Pushes `key` to the front of the recently played list, removing any earlier occurrence and
@@ -334,24 +341,33 @@ impl AppState {
         let source = record.artwork_source;
         let path_key = record.key.clone();
         let group = resolution_group_key(&record);
-        let transitions = self.library.upsert(record);
+        let transitions = self.library.upsert_detailed(record);
         let new_key = self.library.get(&path_key).map(album_key).unwrap_or_default();
 
-        let mut applied: Vec<(String, String)> = Vec::new();
-        for (old_key, moved_to) in transitions {
-            if old_key == moved_to {
-                continue;
-            }
-            let vacated = self.library.album(&old_key).is_none();
-            self.move_artwork(&old_key, &moved_to, group.as_ref(), vacated);
-            if vacated {
-                applied.push((old_key, moved_to));
-            }
-        }
+        let applied = self.migrate_transitions(transitions);
         // After the moves, so this record's own group has its earlier picture on `new_key` already
         // and the new one supersedes it.
         if let Some(pixels) = pixels {
             self.cache_artwork(&new_key, &pixels, source, group.as_ref());
+        }
+        applied
+    }
+
+    /// Follows the album-key moves a `Library` mutation reported (`KeyTransition`): the pictures
+    /// travel with their tracks (`move_artwork`), and a vacated old key's `recent_album_keys` entry is
+    /// rewritten to the new one. Returns the vacated `(old_key, new_key)` pairs, which the caller
+    /// applies to `Navigation`.
+    fn migrate_transitions(&mut self, transitions: Vec<KeyTransition>) -> Vec<(String, String)> {
+        let mut applied: Vec<(String, String)> = Vec::new();
+        for transition in transitions {
+            if transition.old_key == transition.new_key {
+                continue;
+            }
+            let vacated = self.library.album(&transition.old_key).is_none();
+            self.move_artwork(&transition.old_key, &transition.new_key, &transition.groups, vacated);
+            if vacated {
+                applied.push((transition.old_key, transition.new_key));
+            }
         }
         // Rewriting can make two entries collide (the old and new key both already present); only
         // the first occurrence is kept so "Jump back in" never shows the same album twice.
@@ -360,15 +376,15 @@ impl AppState {
     }
 
     /// Moves the pictures that follow the tracks which just went from `old_key` to `new_key`: those
-    /// `group` (the group `apply_scanned` just re-resolved) contributed, and, when `old_key` is now
-    /// `vacated`, every one — nothing is left there to own a picture, whoever brought it. Whatever
+    /// the moved tracks' resolution `groups` (`KeyTransition::groups`) contributed, and, when `old_key`
+    /// is now `vacated`, every one — nothing is left there to own a picture, whoever brought it. Whatever
     /// else `old_key` holds stays: another album's own picture must neither travel with the moved
     /// tracks nor stay displaced by theirs. A picture only moving in never overrides its
     /// contributor's own picture already on `new_key`, at the same tier.
-    fn move_artwork(&mut self, old_key: &str, new_key: &str, group: Option<&Contributor>, vacated: bool) {
+    fn move_artwork(&mut self, old_key: &str, new_key: &str, groups: &[Contributor], vacated: bool) {
         let Some(held) = self.art_cache.remove(old_key) else { return };
         let (moving, staying): (Vec<CachedArtwork>, Vec<CachedArtwork>) =
-            held.into_iter().partition(|picture| vacated || (group.is_some() && picture.contributor.as_ref() == group));
+            held.into_iter().partition(|picture| vacated || picture.contributor.as_ref().is_some_and(|contributor| groups.contains(contributor)));
         if !staying.is_empty() {
             self.art_cache.insert(old_key.to_owned(), staying);
         }
@@ -501,7 +517,15 @@ impl Navigation {
     /// the search query (`§3.4` "Search"): opening an album from the Search view's results must
     /// actually navigate there, not leave the Search view covering it because a non-empty query is
     /// still active.
+    ///
+    /// Opening the album that is already the current page only clears the query: pushing it would
+    /// stack a duplicate entry that Back then lands on as a no-op (the now-playing zones can ask
+    /// for the album page they are already on).
     pub fn album_opened(&mut self, key: &str) {
+        if self.current.view == View::AlbumDetail && self.current.album_key.as_deref() == Some(key) {
+            self.search_query.clear();
+            return;
+        }
         let nav_view = self.current.nav_view;
         self.push_current();
         self.current = NavEntry { view: View::AlbumDetail, nav_view, artist_filter: None, album_key: Some(key.to_owned()) };
@@ -618,6 +642,8 @@ pub struct NowPlayingProjection {
     pub year: String,
     pub genre: String,
     pub badge: String,
+    /// `FormatPill.variant` for `badge` (`track_format_variant`): the format family, or gold for hi-res.
+    pub badge_variant: String,
     pub format_line: String,
     pub file_size_line: String,
     pub art: Option<Image>,
@@ -631,6 +657,7 @@ pub fn project_now_playing(state: &AppState, key: &TrackKey, info: &AudioInfo, f
     let year = record.and_then(|r| r.tags.year).map(|year| year.to_string()).unwrap_or_default();
     let genre = record.and_then(|r| r.tags.genre.clone()).unwrap_or_default();
     let badge = format_badge(&info.format, info.bits_per_sample, info.sample_rate, info.is_float);
+    let badge_variant = track_format_variant(&info.format, info.bits_per_sample, info.sample_rate).to_owned();
     let format_line = now_playing_format_line(&state.library, key, info);
     let file_size_line = record.and_then(|r| r.file_size).map(format_file_size).unwrap_or_default();
     let art = record.map(album_key).and_then(|key| state.artwork_for_key(&key));
@@ -644,12 +671,29 @@ pub fn project_now_playing(state: &AppState, key: &TrackKey, info: &AudioInfo, f
         year,
         genre,
         badge,
+        badge_variant,
         format_line,
         file_size_line,
         art,
         lyrics,
         has_lyrics,
     }
+}
+
+/// The album page a click on the now-playing zones opens: the album key of the CURRENT library record
+/// of the track the player bar and panel show (`main.rs`'s `PanelNowPlaying`, which outlives
+/// `Stopped`/`Inactive`: the bar keeps the last track so Play can replay it), resolved at click time
+/// (the key can change while a scan re-resolves the album's group, so it is never cached on the Slint
+/// side). `None` when nothing was ever shown or the track is not in the library (e.g. "Remove from
+/// Library"), which is also what `MainWindow.now-playing-album-available` mirrors.
+pub fn now_playing_album_key(library: &Library, shown: Option<&TrackKey>) -> Option<String> {
+    shown.and_then(|key| library.get(key)).map(album_key)
+}
+
+/// Whether `now_playing_album_key` would resolve, for the 40 ms availability check: a library record
+/// always has an album key, so asking for the record is enough and no key string is built per tick.
+pub fn now_playing_album_available(library: &Library, shown: Option<&TrackKey>) -> bool {
+    shown.is_some_and(|key| library.get(key).is_some())
 }
 
 /// Optimistic UI state for an in-flight volume change (`§5.10` "Pending volume"). Set on every
@@ -860,7 +904,7 @@ mod tests {
         assert!(held[2] != held[0] && held[3] != held[0] && held[2] != held[3], "other bytes or other dimensions never share a buffer");
 
         state.cache_artwork("album-2", &cover, ArtworkSource::Embedded, Some(&ogg));
-        state.move_artwork("album-2", "album-1", Some(&ogg), true);
+        state.move_artwork("album-2", "album-1", std::slice::from_ref(&ogg), true);
         let held = buffer_addresses(&state, "album-1");
         assert_eq!(held.len(), 5, "the moved picture is filed next to the others");
         assert_eq!(held[4], held[0], "a picture moving in shares the buffer of an identical one already there");
@@ -1303,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_scanned_does_not_rekey_while_sibling_tracks_still_hold_the_old_key() {
+    fn apply_scanned_moves_untagged_siblings_with_the_album_and_rekeys_recent_album() {
         let mut state = AppState::new();
         let path_a = TrackKey::whole_file(PathBuf::from("/nas/album/a.flac"));
         let path_b = TrackKey::whole_file(PathBuf::from("/nas/album/b.flac"));
@@ -1314,15 +1358,18 @@ mod tests {
         let old_key = album_key(state.library.get(&path_a).unwrap());
         state.note_played_key(&path_a);
 
-        // Only `a.flac` gets scanned; `b.flac` still holds the old `dir:` key, so the group is not
-        // empty yet and the recent-album entry must not be rewritten out from under it.
+        // Only `a.flac` gets scanned, but the untagged `b.flac` beside it joins the folder's album
+        // (folder-majority title), so nothing holds the old `dir:` key any more and the recent-album
+        // entry must follow the album instead of dangling.
         let mut scanned = TrackRecord::minimal(path_a.clone(), info("FLAC", 24, 44_100, false, 2, Some(10_000)));
         scanned.tags.album = Some("Real Album".into());
 
         let rekey = state.apply_scanned(scanned);
 
-        assert!(rekey.is_empty());
-        assert_eq!(state.recent_album_keys(), [old_key]);
+        let new_key = album_key(state.library.get(&path_a).unwrap());
+        assert_eq!(album_key(state.library.get(&path_b).unwrap()), new_key, "the untagged sibling joins the album");
+        assert_eq!(rekey, vec![(old_key, new_key.clone())]);
+        assert_eq!(state.recent_album_keys(), [new_key]);
     }
 
     /// Reproduces the real "a correctly-tagged, artwork-bearing disc shows the placeholder disc"
@@ -1364,6 +1411,69 @@ mod tests {
 
         assert!(state.artwork_for_key(&key_a).is_none(), "the abandoned key must no longer serve stale art");
         assert!(state.artwork_for_key(&final_key_a).is_some(), "the cached image must follow track A onto its final, correct key");
+    }
+
+    fn picture(side: u32) -> ArtworkPixels {
+        ArtworkPixels { width: side, height: side, rgb: vec![128; (side * side * 3) as usize] }
+    }
+
+    /// The folder-majority fold moves a minority-titled track onto the dominant album's key; its
+    /// cached picture, the recent-albums entry and the reported (vacated) transition must follow, or
+    /// the album would show a placeholder and "Jump back in" would dangle.
+    #[test]
+    fn apply_scanned_migrates_artwork_and_recent_albums_when_the_folder_majority_folds_a_minority_title() {
+        let mut state = AppState::new();
+        let minority_key = TrackKey::whole_file(PathBuf::from("/nas/folder/z.flac"));
+        let mut minority = TrackRecord::minimal(minority_key.clone(), info("FLAC", 24, 44_100, false, 2, Some(10_000)));
+        minority.tags.artist = Some("Band".into());
+        minority.tags.album = Some("Odd Title".into());
+        minority.artwork = Some(picture(3));
+        minority.artwork_source = ArtworkSource::Embedded;
+        state.apply_scanned(minority);
+        let old_key = album_key(state.library.get(&minority_key).unwrap());
+        state.note_played_key(&minority_key);
+        assert!(state.artwork_for_key(&old_key).is_some());
+
+        let mut rekeys = Vec::new();
+        for n in 0..4 {
+            let mut record = TrackRecord::minimal(TrackKey::whole_file(PathBuf::from(format!("/nas/folder/{n}.flac"))), info("FLAC", 24, 44_100, false, 2, Some(10_000)));
+            record.tags.artist = Some("Band".into());
+            record.tags.album = Some("Main Title".into());
+            rekeys.extend(state.apply_scanned(record));
+        }
+
+        let new_key = album_key(state.library.get(&minority_key).unwrap());
+        assert_ne!(new_key, old_key);
+        assert!(rekeys.contains(&(old_key.clone(), new_key.clone())), "{rekeys:?}");
+        assert!(state.artwork_for_key(&old_key).is_none(), "the vacated key serves no stale picture");
+        assert_eq!(state.artwork_for_key(&new_key).map(|image| image.size().width), Some(3), "the picture follows the folded track");
+        assert_eq!(state.recent_album_keys(), [new_key]);
+    }
+
+    /// A hidden duplicate copy still contributes its picture to the album's key (the cover often lives
+    /// only in the lower-quality folder), and hiding never orphans it.
+    #[test]
+    fn a_hidden_copys_picture_is_still_shown_for_the_album() {
+        let mut state = AppState::new();
+        let mut best = TrackRecord::minimal(TrackKey::whole_file(PathBuf::from("/nas/flac/01.flac")), info("FLAC", 24, 96_000, false, 2, Some(200_000)));
+        best.tags.title = Some("Song".into());
+        best.tags.artist = Some("Band".into());
+        best.tags.album = Some("Album".into());
+        state.apply_scanned(best);
+        let copy_key = TrackKey::whole_file(PathBuf::from("/nas/mp3/01.mp3"));
+        let mut copy = TrackRecord::minimal(copy_key.clone(), info("MP3", 16, 44_100, false, 2, Some(200_000)));
+        copy.tags.title = Some("Song".into());
+        copy.tags.artist = Some("Band".into());
+        copy.tags.album = Some("Album".into());
+        copy.artwork = Some(picture(5));
+        copy.artwork_source = ArtworkSource::Embedded;
+        state.apply_scanned(copy);
+
+        assert!(!state.library.get(&copy_key).unwrap().is_visible(), "the MP3 is the hidden copy");
+        let key = album_key(state.library.get(&copy_key).unwrap());
+        assert_eq!(state.artwork_for_key(&key).map(|image| image.size().width), Some(5));
+        assert_eq!(state.library.album(&key).map(|album| album.track_count), Some(1));
+        assert_eq!(now_playing_album_key(&state.library, Some(&copy_key)), Some(key), "a playing hidden copy still resolves its album");
     }
 
     /// The same sibling-key migration, but with a picture already cached under the destination key:
@@ -1622,11 +1732,45 @@ mod tests {
         state.apply_scanned(greatest_hits("/m/Album", "01.flac", "Queen", Some("Queen"), Some((ArtworkSource::Folder, 6))));
         let key = album_key(state.library.get(&track).unwrap());
 
-        assert_eq!(state.remove_album(&key), [track.clone()]);
+        assert_eq!(state.remove_album(&key).keys, [track.clone()]);
         assert!(state.artwork_for_key(&key).is_none());
 
         state.apply_scanned(greatest_hits("/m/Album", "01.flac", "Queen", Some("Queen"), Some((ArtworkSource::Embedded, 2))));
         assert_eq!(cached_side(&state, &key), 2, "the deleted cover no longer outranks the embedded picture");
+    }
+
+    /// Removing an album re-resolves its folder, and a survivor can move to another key as a side
+    /// effect (here "Bonus" folds into "Main" once "Other" is gone and Main covers 5 of 7 titles).
+    /// Its picture and its recently-played entry must follow it, exactly as on the scan path.
+    #[test]
+    fn removing_an_album_migrates_the_artwork_and_recent_entry_of_survivors_that_changed_key() {
+        let mut state = AppState::new();
+        let song = |folder_file: &str, album: &str, art: Option<(ArtworkSource, u32)>| {
+            let mut record = greatest_hits("/m/F", folder_file, "Band", Some("Band"), art);
+            record.tags.album = Some(album.into());
+            record
+        };
+        for n in 1..=5 {
+            state.apply_scanned(song(&format!("main{n}.flac"), "Main", None));
+        }
+        state.apply_scanned(song("bonus1.flac", "Bonus", Some((ArtworkSource::Embedded, 6))));
+        state.apply_scanned(song("bonus2.flac", "Bonus", None));
+        state.apply_scanned(song("other1.flac", "Other", None));
+        state.apply_scanned(song("other2.flac", "Other", None));
+        let key_of = |state: &AppState, file: &str| album_key(state.library.get(&TrackKey::whole_file(PathBuf::from(format!("/m/F/{file}")))).unwrap());
+        let (main_key, bonus_key, other_key) = (key_of(&state, "main1.flac"), key_of(&state, "bonus1.flac"), key_of(&state, "other1.flac"));
+        assert!(main_key != bonus_key && bonus_key != other_key, "three albums before the removal");
+        state.note_played_album(&bonus_key);
+        assert_eq!(cached_side(&state, &bonus_key), 6);
+
+        let removed = state.remove_album(&other_key);
+
+        assert_eq!(removed.keys.len(), 2);
+        assert_eq!(removed.vacated, [(bonus_key.clone(), main_key.clone())], "Navigation is told which key was vacated");
+        assert_eq!(key_of(&state, "bonus1.flac"), main_key, "Bonus folded into Main");
+        assert_eq!(cached_side(&state, &main_key), 6, "the picture follows its tracks onto the surviving key");
+        assert!(state.artwork_for_key(&bonus_key).is_none());
+        assert_eq!(state.recent_album_keys(), [main_key], "the recent entry follows too");
     }
 
     #[test]
@@ -1692,6 +1836,70 @@ mod tests {
         assert_eq!(projection.file_size_line, "");
         assert!(projection.art.is_none());
         assert!(!projection.has_lyrics);
+    }
+
+    #[test]
+    fn now_playing_projection_badge_variant_is_gold_only_for_hires() {
+        let state = AppState::new();
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
+        let none = (String::new(), String::new());
+        let variant = |format: &str, bits, rate| project_now_playing(&state, &path, &info(format, bits, rate, false, 2, None), &none).badge_variant;
+
+        assert_eq!(variant("FLAC", 24, 96_000), "hires");
+        assert_eq!(variant("FLAC", 16, 44_100), "flac");
+        assert_eq!(variant("WavPack", 24, 88_200), "wavpack");
+        assert_eq!(variant("MP3", 16, 44_100), "mp3");
+        assert_eq!(variant("WAV", 24, 192_000), "wav");
+    }
+
+    #[test]
+    fn now_playing_album_availability_matches_the_resolved_key_without_building_it() {
+        let mut state = AppState::new();
+        let shown = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
+        state.library.upsert(TrackRecord::minimal(shown.clone(), info("FLAC", 16, 44_100, false, 2, Some(5_000))));
+        let elsewhere = TrackKey::whole_file(PathBuf::from("/nas/elsewhere/other.flac"));
+        for key in [Some(&shown), Some(&elsewhere), None] {
+            assert_eq!(now_playing_album_available(&state.library, key), now_playing_album_key(&state.library, key).is_some(), "{key:?}");
+        }
+        assert!(now_playing_album_available(&state.library, Some(&shown)));
+        assert!(!now_playing_album_available(&state.library, Some(&elsewhere)));
+    }
+
+    #[test]
+    fn now_playing_album_key_resolves_from_the_current_record() {
+        let mut state = AppState::new();
+        let path = TrackKey::whole_file(PathBuf::from("/nas/album/track.flac"));
+        let mut record = TrackRecord::minimal(path.clone(), info("FLAC", 16, 44_100, false, 2, Some(5_000)));
+        record.tags.album = Some("Real Album".into());
+        record.tags.artist = Some("Real Artist".into());
+        state.library.upsert(record);
+        let other = TrackKey::whole_file(PathBuf::from("/nas/elsewhere/other.flac"));
+
+        let expected = album_key(state.library.get(&path).unwrap());
+        assert_eq!(now_playing_album_key(&state.library, Some(&path)), Some(expected), "in the library: the record's own album key");
+        assert_eq!(now_playing_album_key(&state.library, Some(&other)), None, "not in the library (removed): nothing to open");
+        assert_eq!(now_playing_album_key(&state.library, None), None, "nothing playing: nothing to open");
+    }
+
+    #[test]
+    fn album_opened_for_the_current_album_page_does_not_push_a_duplicate() {
+        let mut nav = Navigation::new();
+        nav.album_opened("aa:band\u{1f}album");
+        assert!(nav.can_go_back());
+
+        nav.set_search_query("blue".to_owned());
+        nav.album_opened("aa:band\u{1f}album");
+
+        assert!(!nav.search_active(), "the query is still cleared");
+        nav.back_requested();
+        assert!(!nav.can_go_back(), "a single Back must leave the album page: no duplicate entry was pushed");
+        assert_ne!(nav.view(), View::AlbumDetail);
+
+        // A different album does push.
+        nav.album_opened("aa:band\u{1f}album");
+        nav.album_opened("aa:band\u{1f}other");
+        nav.back_requested();
+        assert_eq!(nav.album_key(), Some("aa:band\u{1f}album"));
     }
 
     #[test]
