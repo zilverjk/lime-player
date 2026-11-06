@@ -389,6 +389,10 @@ struct ActivePlayback {
     /// The Hog preference used at this start. A seek pins to it too, so it never re-acquires,
     /// releases or steals Hog (`§1.4`).
     hog_mode: bool,
+    /// One-shot deadline for the "DAC refresh restart" (`restart_for_dac_refresh_if_due`): set only
+    /// by a playing `NewTrack` start that primed the DAC, taken (cleared) the first time it is
+    /// examined, and never carried over: a restart builds a fresh `ActivePlayback` with `None`.
+    dac_refresh_at: Option<Instant>,
 }
 
 /// Why a track is being (re)started: a normal queue advance, or a seek within the same track.
@@ -846,6 +850,42 @@ fn dac_preroll_ms() -> u64 {
     })
 }
 
+/// Pure: clamps a raw parsed LIME_DAC_REFRESH_RESTART_MS value into the supported range
+/// (default 500 ms, ceiling 3000 ms; `0` disables the refresh restart).
+fn clamp_refresh_restart_ms(raw: Option<u64>) -> u64 {
+    raw.unwrap_or(500).min(3000)
+}
+
+/// The DAC refresh restart is skipped when less than this is left of the track (or it already
+/// drained): restarting there would replay the tail or restart a very short track from 0.
+const DAC_REFRESH_MIN_REMAINING_MS: u64 = 1_000;
+
+/// Reads `LIME_DAC_REFRESH_RESTART_MS` once and caches it for the process lifetime: how long after
+/// a start that primed the DAC the controller restarts the real stream once at the already-set
+/// rate (`restart_for_dac_refresh_if_due`). Defensive parse, never a hard failure.
+fn dac_refresh_restart_ms() -> u64 {
+    static REFRESH_MS: OnceLock<u64> = OnceLock::new();
+    *REFRESH_MS.get_or_init(|| {
+        clamp_refresh_restart_ms(
+            std::env::var("LIME_DAC_REFRESH_RESTART_MS").ok().and_then(|value| value.parse::<u64>().ok()),
+        )
+    })
+}
+
+/// Pure: the deadline of the one-shot DAC refresh restart for a start, if it gets one. Only a
+/// playing `NewTrack` start that primed the DAC is scheduled (a seek restart, which also reaches
+/// here, is a `Seek` and so can never schedule another one), and `delay_ms == 0` disables it.
+fn dac_refresh_deadline(
+    did_dac_prime: bool,
+    reason: StartReason,
+    start_playing: bool,
+    delay_ms: u64,
+    now: Instant,
+) -> Option<Instant> {
+    (did_dac_prime && reason == StartReason::NewTrack && start_playing && delay_ms > 0)
+        .then(|| now + Duration::from_millis(delay_ms))
+}
+
 /// Pure: converts a pre-roll duration in milliseconds to a frame count at `sample_rate`, using
 /// the same u128 rounding pattern as `seek_target_frame`/`audible_position_millis` to avoid
 /// overflow.
@@ -1182,6 +1222,7 @@ impl PlaybackWorker {
         self.refresh_volume(true);
         while !self.shutdown {
             self.advance_if_drained();
+            self.restart_for_dac_refresh_if_due();
             self.emit_first_output_pcm_callback_timing();
             self.emit_playback_timeline_if_due();
             self.emit_volume_if_due();
@@ -1526,7 +1567,9 @@ impl PlaybackWorker {
 
     /// A seek's guards were satisfied but the restart itself failed: puts the track back at the
     /// queue head, blocked, and reports it as a refusal, never a silent fallback (`§1.4`, `§4.2`).
-    fn fail_seek(&mut self, prepared: PreparedTrack, error: String, prep: Option<TrackPreparation>) {
+    /// `failure_label` leads the status line ("Seek failed", or "DAC refresh restart failed" for
+    /// the automatic restart, which the user never asked for).
+    fn fail_seek(&mut self, prepared: PreparedTrack, error: String, prep: Option<TrackPreparation>, failure_label: &str) {
         let duration_ms = prepared.info.duration_ms;
         if let Some(prep) = prep {
             self.retire_preparation(prep);
@@ -1548,7 +1591,7 @@ impl PlaybackWorker {
         self.emit(PlaybackEvent::Inactive);
         self.emit_queue_snapshot();
         self.emit(PlaybackEvent::Status(format!(
-            "Seek failed: {}. Press Play to retry from the start.",
+            "{failure_label}: {}. Press Play to retry from the start.",
             error.trim_end_matches('.')
         )));
     }
@@ -1594,6 +1637,15 @@ impl PlaybackWorker {
             return;
         }
 
+        self.restart_active_at(position_ms, "Seek failed");
+    }
+
+    /// The restart half of a seek, after the guards: stops the active stream and rebuilds it at
+    /// the track-relative `position_ms`, pinned to the same output device, Hog lease and nominal
+    /// rate, keeping the play/pause state. Shared by `seek_to` and the DAC refresh restart. A
+    /// failed restart goes through `fail_seek`.
+    fn restart_active_at(&mut self, position_ms: u64, failure_label: &str) {
+        let Some(active) = self.active.as_ref() else { return };
         // `info.duration_ms` is already the *sub-range* duration for a CUE track (overridden by
         // the scanner at expansion time), so `seek_target_frame`'s clamp is against the sub-range's
         // own length, and its result is already track-relative (0 at this track's own start) —
@@ -1608,7 +1660,6 @@ impl PlaybackWorker {
         let was_playing = active.playing;
         let pinned = pinned_output(active);
 
-        // Guards above already confirmed `self.active` is `Some`.
         let Some(prepared) = self.stop_active_now() else { return };
 
         match spawn_track_preparation(prepared.clone(), start_frame, end_frame, self.events.clone()) {
@@ -1620,11 +1671,77 @@ impl PlaybackWorker {
                     pinned_output: Some(pinned),
                 };
                 if let Err((error, prep)) = self.start_track(prepared.clone(), preparation, None, options) {
-                    self.fail_seek(prepared, error, Some(prep));
+                    self.fail_seek(prepared, error, Some(prep), failure_label);
                 }
             }
-            Err(error) => self.fail_seek(prepared, error, None),
+            Err(error) => self.fail_seek(prepared, error, None, failure_label),
         }
+    }
+
+    /// The one-shot "DAC refresh restart". Hardware evidence (FiiO K11, Hog mode): after a rate
+    /// change the HAL reads the right nominal and physical rate at every checkpoint and the DAC
+    /// prime runs, yet the DAC keeps the old rate until the REAL stream is stopped and rebuilt at the
+    /// already-set rate (a seek or pressing play again). So a playing start that primed the DAC
+    /// schedules this (`dac_refresh_at`); once due, the active track is restarted through the same
+    /// machinery as a seek (`restart_active_at`: pinned output, same Hog lease, no prime and no
+    /// pre-roll since the rate is unchanged). By default it fires while the real stream is still
+    /// emitting its silent pre-roll, so it is inaudible.
+    ///
+    /// Restart position: the track-relative audible position. The pre-roll zeros do not advance the
+    /// consumed-sample counter, so inside the pre-roll that is 0 and nothing is skipped or replayed;
+    /// if the delay outlasts the pre-roll, the restart resumes where playback is. When that position
+    /// is past 0 but the length is unknown (a nonzero restart would be refused), the restart is
+    /// skipped.
+    ///
+    /// The deadline is taken on first examination, so it fires at most once; a track change,
+    /// pause, skip, failure or seek has already replaced or invalidated it. A refused restart
+    /// only emits a Diagnostic (no `SeekRejected`) and leaves the track playing; a restart that
+    /// fails after the stop behaves like a failed seek (`fail_seek`).
+    fn restart_for_dac_refresh_if_due(&mut self) {
+        let Some(active) = self.active.as_mut() else { return };
+        let Some(deadline) = active.dac_refresh_at else { return };
+        if Instant::now() < deadline {
+            return;
+        }
+        active.dac_refresh_at = None;
+        let delay_ms = dac_refresh_restart_ms();
+        let key = active.prepared.key.clone();
+        let position_ms = active_track_relative_position_ms(active);
+        let skip_reason = if !active.playing {
+            Some("paused")
+        } else if active.cancel.load(Ordering::Acquire) || active.skip_requested {
+            Some("skip pending")
+        } else if active.decoder_failed.load(Ordering::Acquire) || active.output_failed.load(Ordering::Acquire) {
+            Some("playback failed")
+        } else if active.drained.load(Ordering::Acquire)
+            || active
+                .prepared
+                .info
+                .duration_ms
+                .is_some_and(|duration| duration.saturating_sub(position_ms) < DAC_REFRESH_MIN_REMAINING_MS)
+        {
+            // Restarting this close to the end would replay the tail (the seek clamp is
+            // `duration - 500 ms`) or restart a very short track from 0.
+            Some("near the end")
+        } else if position_ms > 0 && active.prepared.info.duration_ms.is_none() {
+            Some("unknown length")
+        } else {
+            None
+        };
+        if let Some(reason) = skip_reason {
+            self.emit(PlaybackEvent::Diagnostic(format!("DAC refresh restart skipped · reason={reason} · key={key:?}")));
+            return;
+        }
+        if self.retiring_decoders_at_capacity() {
+            self.emit(PlaybackEvent::Diagnostic(format!(
+                "DAC refresh restart skipped · reason=retiring decoders busy · key={key:?}"
+            )));
+            return;
+        }
+        self.emit(PlaybackEvent::Diagnostic(format!(
+            "DAC refresh restart · after_ms={delay_ms} · position_ms={position_ms} · key={key:?}"
+        )));
+        self.restart_active_at(position_ms, "DAC refresh restart failed");
     }
 
     /// Starts the queue head for a request that is not itself a play/pause request (Enqueue,
@@ -2232,6 +2349,13 @@ impl PlaybackWorker {
             skip_requested: false,
             output_id: selected_id,
             hog_mode: hog_mode_enabled,
+            dac_refresh_at: dac_refresh_deadline(
+                did_dac_prime,
+                options.reason,
+                options.start_playing,
+                dac_refresh_restart_ms(),
+                Instant::now(),
+            ),
         });
         Ok(())
     }
@@ -2499,6 +2623,7 @@ impl PlaybackWorker {
                 self.emit(PlaybackEvent::Status(format!("Could not pause output: {error}")));
             } else {
                 active.playing = false;
+                active.dac_refresh_at = None;
                 let position_ms = audible_position_for(active);
                 let duration_ms = active.prepared.info.duration_ms;
                 self.emit(PlaybackEvent::Playing(false));
@@ -3185,6 +3310,7 @@ mod tests {
             skip_requested: false,
             output_id: String::new(),
             hog_mode: false,
+            dac_refresh_at: None,
         }
     }
 
@@ -3233,6 +3359,7 @@ mod tests {
             // deterministic, hardware-free failure instead of touching a real output device.
             output_id: String::new(),
             hog_mode: false,
+            dac_refresh_at: None,
         });
         worker.queue.extend(queue);
         (worker, event_rx)
@@ -3802,6 +3929,87 @@ mod tests {
             None,
             "a first start with no previous route must never trigger DAC priming, and therefore never a pre-roll"
         );
+    }
+
+    #[test]
+    fn clamp_refresh_restart_ms_defaults_and_clamps() {
+        assert_eq!(clamp_refresh_restart_ms(None), 500, "unset or unparsable defaults to 500 ms");
+        assert_eq!(clamp_refresh_restart_ms(Some(200)), 200);
+        assert_eq!(clamp_refresh_restart_ms(Some(3000)), 3000);
+        assert_eq!(clamp_refresh_restart_ms(Some(9000)), 3000, "clamps to the 3000 ms ceiling");
+        assert_eq!(clamp_refresh_restart_ms(Some(0)), 0, "0 stays 0, disabling the refresh restart");
+    }
+
+    #[test]
+    fn dac_refresh_deadline_is_scheduled_only_for_a_playing_primed_new_track() {
+        let now = Instant::now();
+        let at = |prime, reason, playing, ms| dac_refresh_deadline(prime, reason, playing, ms, now);
+        assert_eq!(at(true, StartReason::NewTrack, true, 500), Some(now + Duration::from_millis(500)));
+        assert_eq!(at(false, StartReason::NewTrack, true, 500), None, "no prime, no refresh");
+        assert_eq!(at(true, StartReason::NewTrack, false, 500), None, "a paused start is not refreshed");
+        assert_eq!(at(true, StartReason::Seek, true, 500), None, "a seek restart never schedules another");
+        assert_eq!(at(true, StartReason::NewTrack, true, 0), None, "0 disables the feature");
+    }
+
+    fn has_refresh_diagnostic(events: &[PlaybackEvent], prefix: &str) -> bool {
+        events.iter().any(|event| matches!(event, PlaybackEvent::Diagnostic(m) if m.starts_with(prefix)))
+    }
+
+    #[test]
+    fn dac_refresh_restart_waits_for_its_deadline() {
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        let future = Instant::now() + Duration::from_secs(60);
+        worker.active.as_mut().unwrap().dac_refresh_at = Some(future);
+
+        worker.restart_for_dac_refresh_if_due();
+
+        assert!(drain_events(&events).is_empty());
+        assert_eq!(worker.active.as_ref().unwrap().dac_refresh_at, Some(future), "still scheduled");
+    }
+
+    #[test]
+    fn dac_refresh_restart_is_dropped_when_paused_or_skipping_or_failed() {
+        for case in ["paused", "skip pending", "playback failed", "drained", "short track"] {
+            let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+            let active = worker.active.as_mut().unwrap();
+            active.dac_refresh_at = Some(Instant::now());
+            match case {
+                "paused" => active.playing = false,
+                "skip pending" => active.cancel.store(true, Ordering::Release),
+                "drained" => active.drained.store(true, Ordering::Release),
+                "short track" => active.prepared.info.duration_ms = Some(DAC_REFRESH_MIN_REMAINING_MS - 1),
+                _ => active.output_failed.store(true, Ordering::Release),
+            }
+
+            worker.restart_for_dac_refresh_if_due();
+
+            let events = drain_events(&events);
+            assert!(has_refresh_diagnostic(&events, "DAC refresh restart skipped"), "{case}");
+            assert!(!has_refresh_diagnostic(&events, "DAC refresh restart ·"), "{case}");
+            assert!(!events.iter().any(|e| matches!(e, PlaybackEvent::SeekRejected)), "{case}: no UI seek state");
+            let active = worker.active.as_ref().expect("a refused restart leaves the track alone");
+            assert_eq!(active.dac_refresh_at, None, "{case}: one-shot consumed");
+        }
+    }
+
+    #[test]
+    fn dac_refresh_restart_fires_once_through_the_seek_machinery() {
+        let (mut worker, events) = worker_with_active_track_and_events(Vec::new());
+        worker.active.as_mut().unwrap().dac_refresh_at = Some(Instant::now());
+
+        worker.restart_for_dac_refresh_if_due();
+
+        let first = drain_events(&events);
+        assert!(has_refresh_diagnostic(&first, "DAC refresh restart ·"));
+        assert!(
+            first.iter().any(|e| matches!(e, PlaybackEvent::Status(m) if m.starts_with("DAC refresh restart failed"))),
+            "the hardware-free fixture's restart fails like a failed seek, under its own label"
+        );
+        // The failed restart left no active track, hence no deadline: a second poll does nothing.
+        assert!(worker.active.is_none());
+        worker.restart_for_dac_refresh_if_due();
+        assert!(drain_events(&events).is_empty(), "fires at most once");
+        drain_retiring_decoders(&mut worker);
     }
 
     #[test]
