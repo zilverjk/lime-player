@@ -15,6 +15,9 @@ use super::coreaudio::{self, DacState, HogLease};
 use super::decoder::{AudioInfo, PcmSample, decode_file};
 use super::resample::StreamResampler;
 use crate::library::TrackKey;
+use track_chain::{ChainHandle, HandoverState, OutputSample, TrackChain, TrackFeed, TrackSignals};
+
+mod track_chain;
 
 const RING_SAMPLES: usize = 65_536;
 const PREBUFFER_MILLISECONDS: usize = 60;
@@ -382,8 +385,10 @@ pub struct PreparedTrack {
 struct ActivePlayback {
     prepared: PreparedTrack,
     stream: Option<Stream>,
+    chain: Option<ChainHandle>,
     decoder: Option<JoinHandle<()>>,
     cancel: Arc<AtomicBool>,
+    eof: Arc<AtomicBool>,
     drained: Arc<AtomicBool>,
     decoder_failed: Arc<AtomicBool>,
     output_failed: Arc<AtomicBool>,
@@ -405,6 +410,7 @@ struct ActivePlayback {
     skip_requested: bool,
     /// The exact `DeviceId` string used to open this stream. A seek pins to it (`§4.2`).
     output_id: String,
+    output_label: String,
     /// The Hog preference used at this start. A seek pins to it too, so it never re-acquires,
     /// releases or steals Hog (`§1.4`).
     hog_mode: bool,
@@ -431,6 +437,29 @@ struct PinnedOutput {
     device_id: String,
     hog_mode: bool,
     plan: OutputPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StreamFormat<'a> {
+    device_id: &'a str,
+    hog_mode: bool,
+    plan: OutputPlan,
+}
+
+fn continues_stream(active: StreamFormat, next: StreamFormat, next_info: &AudioInfo) -> bool {
+    active == next && (next.plan.route != Route::Strict || next_info.source_channels == 2)
+}
+
+struct HandedOver {
+    preparation: TrackPreparation,
+    consumed_output_samples: Arc<AtomicU64>,
+    handover: HandoverState,
+}
+
+fn reached_the_listener(consumed_samples: u64, latency_nanos: u64, output_rate: u32) -> bool {
+    let latency_frames =
+        u128::from(latency_nanos.min(MAX_OUTPUT_LATENCY_NANOS)) * u128::from(output_rate) / 1_000_000_000;
+    u128::from(consumed_samples / 2) > latency_frames
 }
 
 #[derive(Clone)]
@@ -619,6 +648,10 @@ impl PlaybackFailure {
 }
 
 impl ActivePlayback {
+    fn stream_format(&self) -> StreamFormat<'_> {
+        StreamFormat { device_id: &self.output_id, hog_mode: self.hog_mode, plan: self.plan }
+    }
+
     fn stop_output(&mut self) {
         self.cancel.store(true, Ordering::Release);
         if let Some(stream) = self.stream.take() {
@@ -1294,6 +1327,7 @@ struct PlaybackWorker {
     events: Sender<PlaybackEvent>,
     queue: VecDeque<PreparedTrack>,
     lookahead: Option<TrackPreparation>,
+    handed_over: Option<HandedOver>,
     failed_preparation_key: Option<TrackKey>,
     waiting_for_decoder_cancel: bool,
     /// The `start_playing` the start that is waiting on `waiting_for_decoder_cancel` will be made
@@ -1342,6 +1376,7 @@ impl PlaybackWorker {
             events,
             queue: VecDeque::new(),
             lookahead: None,
+            handed_over: None,
             failed_preparation_key: None,
             waiting_for_decoder_cancel: false,
             pending_start_playing: true,
@@ -1382,6 +1417,7 @@ impl PlaybackWorker {
                 }
             }
             self.reconcile_lookahead();
+            self.hand_over_next_track();
             self.resume_start_after_decoder_cancel();
         }
         self.shutdown_audio_workers();
@@ -1414,6 +1450,7 @@ impl PlaybackWorker {
     }
 
     fn shutdown_audio_workers(&mut self) {
+        self.drop_handover();
         let deadline = Instant::now() + SHUTDOWN_DECODER_GRACE;
         // Signal speculative work first. A NAS read may be inside a blocking OS call, so the
         // active decoder join must never happen while lookahead is still uncancelled.
@@ -1699,6 +1736,7 @@ impl PlaybackWorker {
     /// prime, the prebuffer wait: hundreds of ms, up to 30 s on a NAS). A caller whose start may not
     /// happen uses `start_next_after_stop`, which reports the stop only when nothing took over.
     fn stop_active_now(&mut self) -> Option<PreparedTrack> {
+        self.drop_handover();
         let mut active = self.active.take()?;
         self.last_stop = Some(StoppedOutput {
             at: Instant::now(),
@@ -2061,6 +2099,14 @@ impl PlaybackWorker {
             }
             return;
         }
+        if self.handed_over.is_some() {
+            if self.handed_over_still_fits() {
+                return;
+            }
+            if !self.withdraw_handover() {
+                self.promote_handed_over();
+            }
+        }
         let Some(prepared) = self
             .active
             .as_ref()
@@ -2385,20 +2431,25 @@ impl PlaybackWorker {
             )));
         }
         let stream_build_started_at = Instant::now();
+        let consumer =
+            preparation.audio.consumer.take().ok_or_else(|| "The prepared audio buffer is unavailable.".to_owned())?;
+        let first_feed = TrackFeed::new(
+            consumer,
+            track_signals(&preparation.audio, consumed_output_samples.clone(), HandoverState::started()),
+        );
+        let (chain, chain_handle) = TrackChain::new(
+            first_feed,
+            preroll_frames.saturating_mul(2), // stereo
+            output_failed.clone(),
+            format_mismatch.clone(),
+        );
         let stream_result = build_stream(
             &device,
             config,
             sample_format,
-            preroll_frames,
-            preparation.audio.consumer.take().ok_or_else(|| "The prepared audio buffer is unavailable.".to_owned())?,
-            preparation.audio.buffered.clone(),
-            preparation.audio.eof.clone(),
-            preparation.audio.drained.clone(),
-            output_failed.clone(),
-            format_mismatch.clone(),
-            preparation.audio.diagnostics.clone(),
-            consumed_output_samples.clone(),
+            chain,
             output_latency_nanos.clone(),
+            output_failed.clone(),
             error_sender,
         );
         let stream = match stream_result {
@@ -2520,8 +2571,10 @@ impl PlaybackWorker {
         self.active = Some(ActivePlayback {
             prepared: prepared.clone(),
             stream: Some(stream),
+            chain: Some(chain_handle),
             decoder: preparation.audio.decoder.take(),
             cancel: preparation.audio.cancel.clone(),
+            eof: preparation.audio.eof.clone(),
             drained: preparation.audio.drained.clone(),
             decoder_failed: preparation.audio.decoder_failed.clone(),
             output_failed,
@@ -2542,6 +2595,7 @@ impl PlaybackWorker {
             playing: options.start_playing,
             skip_requested: false,
             output_id: selected_id,
+            output_label,
             hog_mode: hog_mode_enabled,
             dac_refresh_at: dac_refresh_deadline(
                 did_dac_prime,
@@ -2571,12 +2625,24 @@ impl PlaybackWorker {
     fn advance_if_drained(&mut self) {
         self.emit_audio_diagnostics_if_changed();
         let Some(active) = self.active.as_mut() else { return; };
+        if let Some(chain) = active.chain.as_mut() {
+            chain.release_finished();
+        }
         if active.output_failed.load(Ordering::Acquire) {
             let mismatch_code = active.format_mismatch.load(Ordering::Relaxed);
             let detail = format_mismatch_message(mismatch_code);
             self.finish_active_failure(PlaybackFailure::Output, detail);
             return;
         }
+        if let Some(handed) = self.handed_over.as_ref()
+            && handed.handover.has_started()
+        {
+            if self.handed_over_is_audible() {
+                self.promote_handed_over();
+            }
+            return;
+        }
+        let Some(active) = self.active.as_mut() else { return; };
         if !active.drained.load(Ordering::Acquire) {
             return;
         }
@@ -2590,6 +2656,10 @@ impl PlaybackWorker {
         let worker_drain_observed_at = active.drain_started.unwrap_or_else(Instant::now);
         if active.decoder_failed.load(Ordering::Acquire) && !active.skip_requested {
             self.finish_active_failure(PlaybackFailure::Decoder, None);
+            return;
+        }
+        if !self.withdraw_handover() {
+            self.promote_handed_over();
             return;
         }
         let active = self.active.take().unwrap();
@@ -2846,17 +2916,14 @@ impl PlaybackWorker {
     }
 
     fn next_track(&mut self) {
-        if let Some(active) = self.active.as_mut() {
+        if let Some(active) = self.active.as_ref() {
             let active_failed = active.decoder_failed.load(Ordering::Acquire)
                 || active.output_failed.load(Ordering::Acquire);
             match next_action(!self.queue.is_empty(), active_failed, active.cancel.load(Ordering::Acquire), active.playing) {
                 NextAction::QueueEmpty => self.emit(PlaybackEvent::Status("The queue is empty.".into())),
                 NextAction::SkipPending => self.emit(PlaybackEvent::Status("A safe skip is already pending.".into())),
                 NextAction::AdvancePaused => self.skip_paused_to_next(),
-                NextAction::GracefulSkip => {
-                    let status = request_graceful_skip(&active.cancel, &mut active.skip_requested, active.playing);
-                    self.emit(PlaybackEvent::Status(status.into()));
-                }
+                NextAction::GracefulSkip => self.skip_gracefully(),
             }
             return;
         }
@@ -2883,11 +2950,206 @@ impl PlaybackWorker {
         self.start_next();
     }
 
+    fn skip_gracefully(&mut self) {
+        if !self.withdraw_handover() {
+            self.promote_handed_over();
+            return;
+        }
+        let Some(active) = self.active.as_mut() else { return; };
+        let status = request_graceful_skip(&active.cancel, &mut active.skip_requested, active.playing);
+        self.emit(PlaybackEvent::Status(status.into()));
+    }
+
+    fn lookahead_can_join_stream(&self) -> bool {
+        let (Some(active), Some(lookahead), Some(head)) = (self.active.as_ref(), self.lookahead.as_ref(), self.queue.front())
+        else {
+            return false;
+        };
+        active.chain.is_some()
+            && active.playing
+            && !active.cancel.load(Ordering::Acquire)
+            && active.eof.load(Ordering::Acquire)
+            && !active.decoder_failed.load(Ordering::Acquire)
+            && lookahead.prepared.key == head.key
+            && lookahead.epoch == self.output_epoch
+            && !lookahead.audio.cancel.load(Ordering::Acquire)
+            && !lookahead.audio.decoder_failed.load(Ordering::Acquire)
+            && lookahead.prebuffer_ready_observed_at.is_some()
+            && lookahead.audio.buffered.load(Ordering::Acquire) > 0
+            && lookahead.audio.consumer.is_some()
+            && continues_stream(active.stream_format(), self.next_stream_format(lookahead.plan), &lookahead.prepared.info)
+    }
+
+    fn handed_over_still_fits(&self) -> bool {
+        let (Some(active), Some(handed), Some(head)) = (self.active.as_ref(), self.handed_over.as_ref(), self.queue.front())
+        else {
+            return false;
+        };
+        let preparation = &handed.preparation;
+        !active.cancel.load(Ordering::Acquire)
+            && preparation.prepared.key == head.key
+            && preparation.epoch == self.output_epoch
+            && !preparation.audio.decoder_failed.load(Ordering::Acquire)
+            && continues_stream(active.stream_format(), self.next_stream_format(preparation.plan), &preparation.prepared.info)
+    }
+
+    fn next_stream_format(&self, plan: OutputPlan) -> StreamFormat<'_> {
+        StreamFormat {
+            device_id: self.selected_output.as_deref().unwrap_or_default(),
+            hog_mode: self.settings.hog_mode_enabled,
+            plan,
+        }
+    }
+
+    /// Waits for the active track's EOF to keep the withdraw window short.
+    fn hand_over_next_track(&mut self) {
+        if self.handed_over.is_some() || !self.lookahead_can_join_stream() {
+            return;
+        }
+        let (Some(active), Some(mut preparation)) = (self.active.as_mut(), self.lookahead.take()) else { return; };
+        let (Some(chain), Some(consumer)) = (active.chain.as_mut(), preparation.audio.consumer.take()) else {
+            self.lookahead = Some(preparation);
+            return;
+        };
+        let consumed_output_samples = Arc::new(AtomicU64::new(0));
+        let handover = HandoverState::pending();
+        let feed = TrackFeed::new(
+            consumer,
+            track_signals(&preparation.audio, consumed_output_samples.clone(), handover.clone()),
+        );
+        chain.release_finished();
+        if let Err(feed) = chain.queue(feed) {
+            preparation.audio.consumer = Some(feed.into_consumer());
+            self.lookahead = Some(preparation);
+            return;
+        }
+        self.emit(PlaybackEvent::Diagnostic(format!(
+            "Gapless handover queued: {}",
+            preparation.prepared.key.path.display()
+        )));
+        self.handed_over = Some(HandedOver { preparation, consumed_output_samples, handover });
+    }
+
+    fn handed_over_is_audible(&self) -> bool {
+        let (Some(active), Some(handed)) = (self.active.as_ref(), self.handed_over.as_ref()) else { return false; };
+        handed.handover.has_started()
+            && (handed.preparation.audio.drained.load(Ordering::Acquire)
+                || reached_the_listener(
+                    handed.consumed_output_samples.load(Ordering::Acquire),
+                    active.output_latency_nanos.load(Ordering::Relaxed),
+                    active.plan.output_rate,
+                ))
+    }
+
+    fn withdraw_handover(&mut self) -> bool {
+        let Some(handed) = self.handed_over.take() else { return true; };
+        if !handed.handover.try_withdraw() {
+            self.handed_over = Some(handed);
+            return false;
+        }
+        self.recycle_handed_over(handed);
+        true
+    }
+
+    fn drop_handover(&mut self) {
+        if let Some(handed) = self.handed_over.take() {
+            handed.handover.try_withdraw();
+            self.recycle_handed_over(handed);
+        }
+    }
+
+    fn recycle_handed_over(&mut self, handed: HandedOver) {
+        let mut preparation = handed.preparation;
+        preparation.cancel();
+        if self.lookahead.is_none() {
+            self.lookahead = Some(preparation);
+        } else {
+            self.retire_preparation(preparation);
+        }
+    }
+
+    fn promote_handed_over(&mut self) {
+        let Some(handed) = self.handed_over.take() else { return; };
+        let Some(mut finished) = self.active.take() else {
+            self.recycle_handed_over(handed);
+            return;
+        };
+        if let Some((message, _)) = flush_underrun_report(
+            finished.reported_underrun_samples,
+            finished.diagnostics.underrun_samples.load(Ordering::Acquire),
+            finished.plan.output_rate,
+        ) {
+            self.emit(PlaybackEvent::Status(message));
+        }
+        self.emit(PlaybackEvent::Timeline {
+            position_ms: active_track_relative_position_ms(&finished),
+            duration_ms: finished.prepared.info.duration_ms,
+        });
+        self.push_history(finished.prepared.clone());
+        if !finished.skip_requested {
+            self.last_completed = Some(finished.prepared.clone());
+        }
+        // Its decoder reached EOF before the handover, so this join returns at once.
+        if let Some(decoder) = finished.decoder.take() {
+            let _ = decoder.join();
+        }
+
+        let HandedOver { mut preparation, consumed_output_samples, .. } = handed;
+        let prepared = preparation.prepared.clone();
+        if let Some(position) = self.queue.iter().position(|queued| queued.key == prepared.key) {
+            self.queue.remove(position);
+        }
+        self.blocked_head = false;
+        self.emit(started_event(&prepared, &finished.output_label, finished.hog_mode, finished.plan));
+        self.emit(PlaybackEvent::Timeline { position_ms: 0, duration_ms: prepared.info.duration_ms });
+        self.emit(PlaybackEvent::Playing(finished.playing));
+        self.emit(PlaybackEvent::Diagnostic(format!(
+            "audio_handoff gapless=true track={:?} format={:?} output_rate_hz={}",
+            prepared.key.path.display().to_string(),
+            prepared.info.format,
+            finished.plan.output_rate
+        )));
+        self.active = Some(ActivePlayback {
+            stream: finished.stream.take(),
+            chain: finished.chain.take(),
+            decoder: preparation.audio.decoder.take(),
+            cancel: preparation.audio.cancel.clone(),
+            eof: preparation.audio.eof.clone(),
+            drained: preparation.audio.drained.clone(),
+            decoder_failed: preparation.audio.decoder_failed.clone(),
+            output_failed: finished.output_failed.clone(),
+            format_mismatch: finished.format_mismatch.clone(),
+            diagnostics: preparation.audio.diagnostics.clone(),
+            reported_diagnostics: AudioDiagnosticsSnapshot::default(),
+            reported_underrun_samples: 0,
+            underrun_reported_at: Instant::now(),
+            stream_play_returned_stream_time: finished.stream_play_returned_stream_time,
+            stream_play_returned_unix_ms: finished.stream_play_returned_unix_ms,
+            first_output_pcm_callback_reported: true,
+            consumed_output_samples,
+            output_latency_nanos: finished.output_latency_nanos.clone(),
+            start_frame: prepared.key.start_frame,
+            timeline_reported_samples: 0,
+            timeline_reported_at: Instant::now(),
+            drain_started: None,
+            playing: finished.playing,
+            skip_requested: false,
+            output_id: finished.output_id.clone(),
+            output_label: finished.output_label.clone(),
+            hog_mode: finished.hog_mode,
+            dac_refresh_at: None,
+            plan: finished.plan,
+            prepared,
+        });
+        self.emit_queue_snapshot();
+    }
+
     /// `detail`, when present, is the specific reason for the failure (for example a format
     /// mismatch message). It is folded into the single retained-track `Status` below, because
     /// `main.rs` keeps only one status line and a separate `Status` emitted first would be
     /// overwritten before the UI ever repaints it (`§3.2`).
     fn finish_active_failure(&mut self, failure: PlaybackFailure, detail: Option<&'static str>) {
+        self.drop_handover();
         let Some(active) = self.active.take() else { return; };
         let status = retain_failed_track(&mut self.queue, active.prepared.clone(), failure, active.skip_requested);
         // Flush any underrun growth the rate limiter is still holding back before the track
@@ -3144,171 +3406,50 @@ fn build_stream(
     device: &Device,
     config: StreamConfig,
     sample_format: SampleFormat,
-    preroll_frames: usize,
-    mut consumer: Consumer<PcmSample>,
-    buffered: Arc<AtomicUsize>,
-    eof: Arc<AtomicBool>,
-    drained: Arc<AtomicBool>,
-    output_failed: Arc<AtomicBool>,
-    format_mismatch: Arc<AtomicU8>,
-    diagnostics: Arc<AudioDiagnostics>,
-    consumed_output_samples: Arc<AtomicU64>,
+    chain: TrackChain,
     output_latency_nanos: Arc<AtomicU64>,
+    output_failed: Arc<AtomicBool>,
     events: Sender<PlaybackEvent>,
 ) -> Result<Stream, String> {
     match sample_format {
-        SampleFormat::I32 => {
-            let data_failure = output_failed.clone();
-            let data_mismatch = format_mismatch;
-            let data_diagnostics = diagnostics.clone();
-            let timeline_samples = consumed_output_samples.clone();
-            let timeline_latency = output_latency_nanos;
-            let callback_failure = output_failed;
-            // Persistent closure-local countdown (not shared/atomic): counts down once per output
-            // sample across callback invocations, writing exact silence ahead of the first real PCM
-            // sample so a just-primed DAC has finished unmuting/relocking before real audio reaches
-            // it. Invisible to every downstream counter (`delivered_pcm_samples`,
-            // `callback_found_nonzero_sample`, `underrun_samples`, `buffered`/`eof`/`drained`) since
-            // it returns before any of those are touched.
-            let mut preroll_remaining_samples = preroll_frames.saturating_mul(2); // stereo
-            device
-                .build_output_stream::<i32, _, _>(
-                    config,
-                    move |data, callback_info| {
-                        let mut mismatch_reported = false;
-                        let mut callback_found_nonzero_sample = false;
-                        let mut underrun_samples = 0u64;
-                        let mut delivered_pcm_samples = 0u64;
-                        for target in data {
-                            if preroll_remaining_samples > 0 {
-                                *target = 0;
-                                preroll_remaining_samples -= 1;
-                                continue;
-                            }
-                            match consumer.pop() {
-                                Ok(PcmSample::Integer(sample)) => {
-                                    *target = sample;
-                                    callback_found_nonzero_sample |= sample != 0;
-                                    delivered_pcm_samples = delivered_pcm_samples.saturating_add(1);
-                                    buffered.fetch_sub(1, Ordering::Release);
-                                }
-                                Ok(_) => {
-                                    *target = 0;
-                                    buffered.fetch_sub(1, Ordering::Release);
-                                    if !mismatch_reported {
-                                        mismatch_reported = true;
-                                        data_mismatch.store(MISMATCH_FLOAT_IN_I32, Ordering::Relaxed);
-                                        data_failure.store(true, Ordering::Release);
-                                    }
-                                }
-                                Err(_) => {
-                                    *target = 0;
-                                    if eof.load(Ordering::Acquire) {
-                                        drained.store(true, Ordering::Release);
-                                    } else {
-                                        underrun_samples += 1;
-                                    }
-                                }
-                            }
-                        }
-                        if callback_found_nonzero_sample {
-                            data_diagnostics.callback_nonzero_sample.store(true, Ordering::Release);
-                        }
-                        mark_first_output_pcm_playback_time(
-                            &data_diagnostics.first_output_timestamp_state,
-                            &data_diagnostics.first_output_playback_secs,
-                            &data_diagnostics.first_output_playback_nanos,
-                            callback_info.timestamp().playback,
-                            delivered_pcm_samples,
-                        );
-                        record_output_latency(&timeline_latency, callback_info.timestamp());
-                        record_output_samples_consumed(&timeline_samples, delivered_pcm_samples);
-                        if underrun_samples > 0 {
-                            data_diagnostics.underrun_samples.fetch_add(underrun_samples, Ordering::AcqRel);
-                        }
-                    },
-                    move |error| {
-                        callback_failure.store(true, Ordering::Release);
-                        let _ = events.send(PlaybackEvent::Status(format!("Audio output error: {error}")));
-                    },
-                    None,
-                )
-                .map_err(|error| error.to_string())
-        }
-        SampleFormat::F32 => {
-            let data_failure = output_failed.clone();
-            let data_mismatch = format_mismatch;
-            let data_diagnostics = diagnostics;
-            let timeline_samples = consumed_output_samples;
-            let timeline_latency = output_latency_nanos;
-            let callback_failure = output_failed;
-            // See the I32 arm above for why this is a plain closure-local counter, not shared state.
-            let mut preroll_remaining_samples = preroll_frames.saturating_mul(2); // stereo
-            device
-                .build_output_stream::<f32, _, _>(
-                    config,
-                    move |data, callback_info| {
-                        let mut mismatch_reported = false;
-                        let mut callback_found_nonzero_sample = false;
-                        let mut underrun_samples = 0u64;
-                        let mut delivered_pcm_samples = 0u64;
-                        for target in data {
-                            if preroll_remaining_samples > 0 {
-                                *target = 0.0;
-                                preroll_remaining_samples -= 1;
-                                continue;
-                            }
-                            match consumer.pop() {
-                                Ok(PcmSample::Float(sample)) => {
-                                    *target = sample;
-                                    callback_found_nonzero_sample |= sample != 0.0;
-                                    delivered_pcm_samples = delivered_pcm_samples.saturating_add(1);
-                                    buffered.fetch_sub(1, Ordering::Release);
-                                }
-                                Ok(PcmSample::Integer(_)) => {
-                                    *target = 0.0;
-                                    buffered.fetch_sub(1, Ordering::Release);
-                                    if !mismatch_reported {
-                                        mismatch_reported = true;
-                                        data_mismatch.store(MISMATCH_INTEGER_IN_F32, Ordering::Relaxed);
-                                        data_failure.store(true, Ordering::Release);
-                                    }
-                                }
-                                Err(_) => {
-                                    *target = 0.0;
-                                    if eof.load(Ordering::Acquire) {
-                                        drained.store(true, Ordering::Release);
-                                    } else {
-                                        underrun_samples += 1;
-                                    }
-                                }
-                            }
-                        }
-                        if callback_found_nonzero_sample {
-                            data_diagnostics.callback_nonzero_sample.store(true, Ordering::Release);
-                        }
-                        mark_first_output_pcm_playback_time(
-                            &data_diagnostics.first_output_timestamp_state,
-                            &data_diagnostics.first_output_playback_secs,
-                            &data_diagnostics.first_output_playback_nanos,
-                            callback_info.timestamp().playback,
-                            delivered_pcm_samples,
-                        );
-                        record_output_latency(&timeline_latency, callback_info.timestamp());
-                        record_output_samples_consumed(&timeline_samples, delivered_pcm_samples);
-                        if underrun_samples > 0 {
-                            data_diagnostics.underrun_samples.fetch_add(underrun_samples, Ordering::AcqRel);
-                        }
-                    },
-                    move |error| {
-                        callback_failure.store(true, Ordering::Release);
-                        let _ = events.send(PlaybackEvent::Status(format!("Audio output error: {error}")));
-                    },
-                    None,
-                )
-                .map_err(|error| error.to_string())
-        }
+        SampleFormat::I32 => build_chain_stream::<i32>(device, config, chain, output_latency_nanos, output_failed, events),
+        SampleFormat::F32 => build_chain_stream::<f32>(device, config, chain, output_latency_nanos, output_failed, events),
         other => Err(format!("The selected output sample format {other:?} is not supported.")),
+    }
+}
+
+fn build_chain_stream<S: OutputSample + cpal::SizedSample>(
+    device: &Device,
+    config: StreamConfig,
+    mut chain: TrackChain,
+    output_latency_nanos: Arc<AtomicU64>,
+    output_failed: Arc<AtomicBool>,
+    events: Sender<PlaybackEvent>,
+) -> Result<Stream, String> {
+    device
+        .build_output_stream::<S, _, _>(
+            config,
+            move |data: &mut [S], callback_info: &cpal::OutputCallbackInfo| {
+                record_output_latency(&output_latency_nanos, callback_info.timestamp());
+                chain.fill(data, callback_info.timestamp().playback);
+            },
+            move |error| {
+                output_failed.store(true, Ordering::Release);
+                let _ = events.send(PlaybackEvent::Status(format!("Audio output error: {error}")));
+            },
+            None,
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn track_signals(audio: &AudioPreparation, consumed_output_samples: Arc<AtomicU64>, handover: HandoverState) -> TrackSignals {
+    TrackSignals {
+        buffered: audio.buffered.clone(),
+        eof: audio.eof.clone(),
+        drained: audio.drained.clone(),
+        diagnostics: audio.diagnostics.clone(),
+        consumed_output_samples,
+        handover,
     }
 }
 
