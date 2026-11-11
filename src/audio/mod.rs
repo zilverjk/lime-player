@@ -2,6 +2,7 @@ mod coreaudio;
 mod decoder;
 pub mod metadata;
 mod player;
+mod resample;
 pub mod rate_repair;
 
 pub use decoder::{AudioInfo, probe_file};

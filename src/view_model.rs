@@ -1141,6 +1141,7 @@ mod ui_contract {
         // outside `theme.slint` for the pill itself.
         for token in [
             "flac-soft", "flac-strong", "hires-soft", "hires-strong", "mix-soft", "mix-strong", "wav-soft", "wav-strong",
+            "bitperfect-soft", "bitperfect-strong",
         ] {
             let declaration_needle = format!("out property <color> {token}:");
             assert!(THEME_SLINT.contains(&declaration_needle), "theme.slint must declare `{token}`");
@@ -1208,7 +1209,7 @@ mod ui_contract {
     }
 
     /// `output-popup` (`PlayerBar`, narrow-window Output/Hog mode) must not use the default
-    /// `close-on-click` policy: a `ComboBox` inside it opens its own dropdown on the same
+    /// `close-on-click` policy: the `OutputSelect` inside it opens its own list on the same
     /// click/release that would otherwise close this popup first, dropping the popup's component
     /// and orphaning the dropdown before a selection can ever reach it (Slint 1.18.1 closes the
     /// popup in the same `process_mouse_input` pass that dispatched the click, see
@@ -1221,7 +1222,7 @@ mod ui_contract {
         let popup = &player_bar[popup_start..];
         assert!(
             popup.contains("close-policy: close-on-click-outside;"),
-            "output-popup must not use the default close-on-click policy, which breaks its own ComboBox"
+            "output-popup must not use the default close-on-click policy, which breaks its own output list"
         );
     }
 
@@ -1296,42 +1297,52 @@ mod ui_contract {
         );
     }
 
-    /// `PlayerBar`'s `output-popup` `ComboBox` and `NowPlayingPanel`'s own `ComboBox` both end up
-    /// two-way bound to the same `MainWindow.selected-output-index` storage (chained `<=>`
-    /// bindings), and Rust writes that index programmatically both at startup and on every
-    /// `PlaybackEvent::Devices` refresh (`main.rs`). A `changed current-index` handler fires on
-    /// those programmatic writes too, so round 1 guarded it on which control was currently visible
-    /// — but that made whether a Rust-side index write sent `output-chosen` (and therefore
-    /// `Command::SelectOutput`, a preference save/clear, and a possible `start_next`) depend on
-    /// panel visibility/window width, which is wrong: e.g. the saved DAC being unplugged resets the
-    /// index to 0 through `Devices`, and only a visible panel/open popup would then clear the saved
-    /// preference and overwrite the "unavailable" status. `ComboBoxBase.selected(value)` fires only
-    /// from `ComboBoxBase.select()` (a user click or arrow-key move), never from a plain
-    /// `current-index` write, so both `ComboBox`es use it instead and no visibility guard is needed
-    /// — each user selection still sends exactly one `output-chosen`, and Rust-side writes send
-    /// none.
+    /// Rust writes `selected-output-index` on every device refresh; only a user pick may send `output-chosen`.
     #[test]
-    fn output_selection_fires_output_chosen_exactly_once() {
-        let player_bar = extract_component(APP_SLINT, "PlayerBar");
-        let popup_start = player_bar.find("output-popup := PopupWindow").expect("PlayerBar must declare output-popup");
-        let popup_combo = &player_bar[popup_start..];
-        assert!(
-            popup_combo.contains("selected(value) => {\n                                root.output-chosen(root.selected-output-index);\n                            }"),
-            "PlayerBar's output-popup ComboBox must send output-chosen from the `selected` callback, not `changed current-index`"
-        );
-        assert!(
-            !popup_combo.contains("changed current-index =>"),
-            "PlayerBar's output-popup ComboBox must not use `changed current-index`, which also fires on Rust's programmatic index writes"
-        );
+    fn output_selection_fires_output_chosen_only_on_a_user_pick() {
+        let select = without_comments(extract_component(WIDGETS_SLINT, "OutputSelect"));
+        assert_eq!(select.matches("root.chosen(index);").count(), 1);
+        assert!(select.contains("clicked => {\n                            root.selected-index = index;\n                            root.chosen(index);"));
+        assert!(!select.contains("changed selected-index"), "a changed handler would also fire on Rust's writes");
+        for component in ["PlayerBar", "NowPlayingPanel"] {
+            let body = extract_component(APP_SLINT, component);
+            assert!(body.contains("OutputSelect {"), "{component} must use OutputSelect");
+            assert!(body.contains("chosen(index) => { root.output-chosen(index); }"), "{component} must forward the pick");
+        }
+    }
 
-        let now_playing_panel = extract_component(APP_SLINT, "NowPlayingPanel");
-        assert!(
-            now_playing_panel.contains("selected(value) => {\n                    root.output-chosen(root.selected-output-index);\n                }"),
-            "NowPlayingPanel's own ComboBox must send output-chosen from the `selected` callback, not `changed current-index`"
-        );
-        assert!(
-            !now_playing_panel.contains("changed current-index =>"),
-            "NowPlayingPanel's own ComboBox must not use `changed current-index`, which also fires on Rust's programmatic index writes"
+    #[test]
+    fn output_options_carry_a_bit_perfect_pill() {
+        assert!(WIDGETS_SLINT.contains("export struct OutputOption { name: string, bit-perfect: bool }"));
+        let select = extract_component(WIDGETS_SLINT, "OutputSelect");
+        assert_eq!(select.matches("FormatPill { text: \"Bit Perfect\"; variant: \"bitperfect\"; }").count(), 2, "button and list rows");
+        assert!(select.contains("if option.bit-perfect: FormatPill"));
+        let pill = extract_component(WIDGETS_SLINT, "FormatPill");
+        assert!(pill.contains("root.variant == \"bitperfect\" ? Theme.bitperfect-soft"));
+        assert!(pill.contains("root.variant == \"bitperfect\" ? Theme.bitperfect-strong"));
+        assert!(!THEME_SLINT.contains("bitperfect-strong: #8ef552") && !THEME_SLINT.contains("bitperfect-strong: #bdf65a"));
+        assert!(APP_SLINT.contains("in-out property <[OutputOption]> output-device-options:"));
+    }
+
+    #[test]
+    fn compatibility_mode_switch_sits_below_hog_mode_in_both_output_panels() {
+        let switch = extract_component(WIDGETS_SLINT, "CompatibilityModeSwitch");
+        assert!(switch.contains("text: \"Compatibility mode\";"));
+        assert!(switch.contains("\"Not bit-perfect: audio is resampled and converted to float to match this output.\""));
+        assert!(switch.contains("color: root.checked ? Theme.danger : Theme.text-tertiary;"));
+        for component in ["PlayerBar", "NowPlayingPanel"] {
+            let body = extract_component(APP_SLINT, component);
+            let hog = body.find("text: \"Hog mode\";").unwrap_or_else(|| panic!("{component} lost its Hog mode switch"));
+            let compat = body.find("CompatibilityModeSwitch {").unwrap_or_else(|| panic!("{component} lacks the compatibility switch"));
+            assert!(hog < compat, "{component}: Compatibility mode goes right below Hog mode");
+            assert!(body.contains("toggled(enabled) => { root.compatibility-mode-changed(enabled); }"));
+        }
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert!(main_window.contains("in-out property <bool> compatibility-mode-enabled: false;"));
+        assert_eq!(main_window.matches("compatibility-mode-enabled <=> root.compatibility-mode-enabled;").count(), 2);
+        assert_eq!(
+            main_window.matches("compatibility-mode-changed(enabled) => { root.compatibility-mode-changed(enabled); }").count(),
+            2
         );
     }
 
@@ -1485,6 +1496,7 @@ mod ui_contract {
             "root.seek-requested(f);",
             "root.volume-requested(v, is-final);",
             "root.now-playing-album-requested();",
+            "root.output-refresh-requested();",
         ] {
             let all = main_window.matches(call).count();
             let releasing = main_window.matches(&format!("root.release-search-focus(); {call}")).count();
@@ -1590,30 +1602,28 @@ mod ui_contract {
         );
     }
 
-    /// An Output `ComboBox` that keeps the keyboard is a trap: Slint drops the focus item of a key press
-    /// when it is invisible (the details panel hidden), and key bubbling stops at a popup's edge, so
-    /// Space would reach nobody. Both forwarders of a choice hand the keyboard back to `key-root` once
-    /// the dropdown has closed, and hiding the panel does it for a `ComboBox` that still holds it.
     #[test]
-    fn output_combo_boxes_never_keep_the_keyboard() {
+    fn the_output_selector_never_takes_the_keyboard() {
+        assert!(!without_comments(APP_SLINT).contains("ComboBox"));
+        let select = without_comments(extract_component(WIDGETS_SLINT, "OutputSelect"));
+        assert!(!select.contains("FocusScope") && !select.contains("focus()"));
         let main_window = extract_component(APP_SLINT, "MainWindow");
-        assert_eq!(
-            main_window.matches("output-chosen(index) => { root.output-chosen(index); root.hand-focus-back-soon(); }").count(),
-            2,
-            "the panel's and the output popup's choice must both hand the keyboard back"
-        );
-        assert!(
-            main_window.contains("focus-handback := Timer {") && main_window.contains("root.release-search-focus();"),
-            "the hand-back is deferred by a Timer: the ComboBox takes the focus back after `selected` fires"
-        );
-        assert!(main_window.contains("function hand-focus-back-soon() {\n        focus-handback.running = true;\n    }"));
-        assert!(
-            main_window.contains("changed panel-shown => {\n        if (!root.panel-shown && now-playing-panel.output-focused) {"),
-            "hiding the panel must free the keyboard from its Output ComboBox (and only from it)"
-        );
-        let panel = extract_component(APP_SLINT, "NowPlayingPanel");
-        assert!(panel.contains("out property <bool> output-focused: output-combo.has-focus;"));
-        assert!(panel.contains("output-combo := ComboBox {"), "the panel's ComboBox must carry the id output-focused reads");
+        assert!(!main_window.contains("focus-handback") && !main_window.contains("hand-focus-back-soon"));
+        assert_eq!(main_window.matches("output-list-opening => { root.release-search-focus(); }").count(), 2);
+    }
+
+    #[test]
+    fn both_output_selectors_have_a_wired_refresh_button() {
+        for component in ["PlayerBar", "NowPlayingPanel"] {
+            let source = extract_component(APP_SLINT, component);
+            assert!(
+                source.contains("OutputRefreshButton { clicked => { root.output-refresh-requested(); } }"),
+                "{component} must place the refresh button next to its OutputSelect"
+            );
+        }
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert_eq!(main_window.matches("output-refresh-requested => {").count(), 2);
+        assert!(include_str!("main.rs").contains("window.on_output_refresh_requested(move || player_for_refresh.refresh_devices());"));
     }
 
     /// `main.rs`'s Space handler and its OS media session ask `play_button_enabled` whether there is

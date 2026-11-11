@@ -19,7 +19,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, Image, ModelRc, PhysicalSize, Rgb8Pixel, SharedPixelBuffer, VecModel};
 
-use crate::{AlbumCardData, AlbumHeaderData, ArtistRowData, MainWindow, TrackRowData, View};
+use crate::{AlbumCardData, AlbumHeaderData, ArtistRowData, MainWindow, OutputOption, TrackRowData, View};
 
 thread_local! {
     /// The window `create_window_adapter` hands out next. Set by `new_window` right before each
@@ -226,7 +226,11 @@ fn build_queue_window(volume_available: bool) -> (Rc<MinimalSoftwareWindow>, Mai
     ])));
     ui.set_queue_count(3);
 
-    ui.set_output_device_options(ModelRc::new(VecModel::from(vec![slint::SharedString::from("Sample DAC")])));
+    ui.set_output_device_options(ModelRc::new(VecModel::from(vec![
+        OutputOption { name: "Select output device…".into(), bit_perfect: false },
+        OutputOption { name: "Sample DAC".into(), bit_perfect: true },
+        OutputOption { name: "Sample Headphones".into(), bit_perfect: false },
+    ])));
     ui.set_selected_output_index(1);
     ui.set_output_name("Sample DAC".into());
     // This scenario is actively playing (`set_is_playing(true)` below): `active-output-name`, not
@@ -1251,14 +1255,17 @@ mod keyboard_tests {
         assert_eq!(window.ui.get_selected_track_key(), "", "clearing a query swaps the list, so the selection goes");
     }
 
-    // -- the Output combo box must not keep the keyboard -----------------------------------------
+    // -- the output selector -------------------------------------------------------------------
 
-    /// The window with the details panel's Output `ComboBox` focused, and how many times an
-    /// `output-chosen` was seen. Found by clicking down the panel column until an arrow key (which
-    /// only a focused `ComboBox` turns into a selection) produces one.
-    fn window_with_the_output_combo_focused() -> (Window, Rc<Cell<u32>>) {
+    /// Also returns a point on the panel's `OutputSelect`; clicking it, then 50 px lower, picks an output.
+    fn window_with_the_output_select_found() -> (Window, Rc<Cell<u32>>, (f32, f32)) {
         let window = Window::new();
         window.ui.set_library_empty(false);
+        window.ui.set_output_device_options(ModelRc::new(VecModel::from(vec![
+            OutputOption { name: "Select output device…".into(), bit_perfect: false },
+            OutputOption { name: "DAC".into(), bit_perfect: true },
+            OutputOption { name: "Headphones".into(), bit_perfect: false },
+        ])));
         let chosen = Rc::new(Cell::new(0));
         let counted = Rc::clone(&chosen);
         window.ui.on_output_chosen(move |_| counted.set(counted.get() + 1));
@@ -1267,34 +1274,43 @@ mod keyboard_tests {
         let mut y = 60.0;
         while y < HEIGHT as f32 - 100.0 {
             window.click(x, y);
-            window.press(Key::DownArrow);
+            window.frame();
+            window.click(x, y + 50.0);
+            window.frame();
             if chosen.get() > 0 {
-                // The click opened the dropdown; close it the way a user does, leaving the keyboard on the box.
-                window.press(Key::Escape);
-                return (window, chosen);
+                return (window, chosen, (x, y));
             }
             y += 4.0;
         }
-        panic!("no click down the details panel reached the Output combo box");
-    }
-
-    /// Lets the hand-back timer (`MainWindow.focus-handback`) run, as the event loop would.
-    fn wait_for_the_focus_handback(window: &Window) {
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        window.frame();
+        panic!("no click down the details panel reached the output selector");
     }
 
     #[test]
-    fn space_still_toggles_after_the_details_panel_is_hidden_with_the_output_combo_focused() {
-        let (window, _chosen) = window_with_the_output_combo_focused();
-        window.ui.set_right_panel_visible(false);
+    fn choosing_an_output_gives_space_back_to_the_window_scope() {
+        let (window, chosen, (x, y)) = window_with_the_output_select_found();
+        let before = chosen.get();
+        window.focus_search_with_tab();
+        window.type_text("a");
+
+        window.click(x, y);
         window.frame();
+        window.click(x, y + 50.0);
+        window.frame();
+        assert_eq!(chosen.get(), before + 1, "one pick, one output-chosen");
+
         window.press(" ");
-        assert_eq!(
-            window.spaces(),
-            1,
-            "an invisible focus item is dropped at the key press and Space would reach nobody; the panel must give the keyboard back as it hides"
-        );
+        assert_eq!(window.spaces(), 1, "Space reaches the window scope after an output pick");
+        assert_eq!(window.ui.get_search_query(), "a", "the pick did not type into the search field");
+    }
+
+    #[test]
+    fn writing_the_selected_output_index_never_reports_a_choice() {
+        let (window, chosen, _) = window_with_the_output_select_found();
+        let before = chosen.get();
+        window.ui.set_selected_output_index(2);
+        window.ui.set_selected_output_index(0);
+        window.frame();
+        assert_eq!(chosen.get(), before);
     }
 
     #[test]
@@ -1311,22 +1327,6 @@ mod keyboard_tests {
         assert_eq!(window.spaces(), 0);
     }
 
-    #[test]
-    fn choosing_an_output_hands_the_keyboard_back_to_the_window_scope() {
-        let (window, chosen) = window_with_the_output_combo_focused();
-        // The box still holds the keyboard: another arrow key is another selection.
-        window.press(Key::DownArrow);
-        let while_focused = chosen.get();
-        window.press(Key::DownArrow);
-        assert!(chosen.get() > while_focused, "precondition: the focused combo box turns arrow keys into selections");
-
-        wait_for_the_focus_handback(&window);
-        let after_handback = chosen.get();
-        window.press(Key::DownArrow);
-        assert_eq!(chosen.get(), after_handback, "the combo box no longer holds the keyboard once the hand-back ran");
-        window.press(" ");
-        assert_eq!(window.spaces(), 1, "and Space reaches the window scope");
-    }
 }
 
 /// What the OS Now Playing widget mirrors is the snapshot `apply_now_playing_projection` returns
