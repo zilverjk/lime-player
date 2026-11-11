@@ -13,6 +13,7 @@ use rtrb::{Consumer, RingBuffer};
 
 use super::coreaudio::{self, DacState, HogLease};
 use super::decoder::{AudioInfo, PcmSample, decode_file};
+use super::resample::StreamResampler;
 use crate::library::TrackKey;
 
 const RING_SAMPLES: usize = 65_536;
@@ -171,6 +172,7 @@ pub struct OutputDevice {
 pub struct PlayerSettings {
     pub output_device_id: Option<String>,
     pub hog_mode_enabled: bool,
+    pub compatibility_mode_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,6 +192,7 @@ impl Default for PlayerSettings {
         Self {
             output_device_id: None,
             hog_mode_enabled: true,
+            compatibility_mode_enabled: false,
         }
     }
 }
@@ -206,6 +209,9 @@ pub enum PlaybackEvent {
         output: String,
         hog_mode: bool,
         integer_output_verified: bool,
+        compatibility_mode: bool,
+        /// `(source rate, output rate)`.
+        resampled: Option<(u32, u32)>,
     },
     Timeline {
         position_ms: u64,
@@ -247,6 +253,7 @@ enum Command {
     SetVolume(f32),
     SelectOutput(Option<String>),
     SetHogMode(bool),
+    SetCompatibilityMode(bool),
     TogglePlayback,
     Next,
     Shutdown,
@@ -314,6 +321,10 @@ impl AudioPlayer {
 
     pub fn set_hog_mode(&self, enabled: bool) {
         let _ = self.commands.send(Command::SetHogMode(enabled));
+    }
+
+    pub fn set_compatibility_mode(&self, enabled: bool) {
+        let _ = self.commands.send(Command::SetCompatibilityMode(enabled));
     }
 
     pub fn toggle_playback(&self) {
@@ -393,6 +404,7 @@ struct ActivePlayback {
     /// by a playing `NewTrack` start that primed the DAC, taken (cleared) the first time it is
     /// examined, and never carried over: a restart builds a fresh `ActivePlayback` with `None`.
     dac_refresh_at: Option<Instant>,
+    plan: OutputPlan,
 }
 
 /// Why a track is being (re)started: a normal queue advance, or a seek within the same track.
@@ -404,12 +416,13 @@ enum StartReason {
     Seek,
 }
 
-/// The device and Hog mode a seek is pinned to: the ones already active, never the current
-/// selection, so a seek can never trigger a Hog acquire/release/steal (`§1.4`, `§4.2`).
+/// The device, Hog mode and output plan a seek is pinned to: the ones already active, never the current
+/// selection, so a seek can never trigger a Hog acquire/release/steal or a rate change (`§1.4`, `§4.2`).
 #[derive(Clone)]
 struct PinnedOutput {
     device_id: String,
     hog_mode: bool,
+    plan: OutputPlan,
 }
 
 #[derive(Clone)]
@@ -428,7 +441,7 @@ struct StoppedOutput {
     at: Instant,
     device_id: String,
     rate: u32,
-    integer_output: bool,
+    route: Route,
 }
 
 struct AudioPreparation {
@@ -514,6 +527,8 @@ impl Drop for AudioPreparation {
 
 struct TrackPreparation {
     prepared: PreparedTrack,
+    plan: OutputPlan,
+    epoch: u64,
     audio: AudioPreparation,
     started_at: Instant,
     // Playback-worker observation time, not the decoder's exact PCM enqueue time.
@@ -632,6 +647,7 @@ fn audible_position_for(active: &ActivePlayback) -> u64 {
         active.start_frame,
         active.output_latency_nanos.load(Ordering::Relaxed),
         active.prepared.info.sample_rate,
+        active.plan.output_rate,
     )
     .unwrap_or(0);
     track_relative_millis(absolute_ms, active.prepared.key.start_frame, active.prepared.info.sample_rate)
@@ -690,13 +706,21 @@ fn prebuffer_samples(sample_rate: u32) -> usize {
         .max(256)
 }
 
-fn consumed_samples_position_millis(consumed_samples: u64, sample_rate: u32) -> Option<u64> {
-    if sample_rate == 0 {
-        return None;
+fn source_frame_position(start_frame: u64, output_frames: u64, source_rate: u32, output_rate: u32) -> u64 {
+    if output_rate == source_rate || output_rate == 0 {
+        return start_frame.saturating_add(output_frames);
     }
-    let complete_stereo_frames = u128::from(consumed_samples / 2);
-    let millis = complete_stereo_frames * 1_000 / u128::from(sample_rate);
-    u64::try_from(millis).ok()
+    let scaled = u128::from(output_frames) * u128::from(source_rate) / u128::from(output_rate);
+    start_frame.saturating_add(u64::try_from(scaled).unwrap_or(u64::MAX))
+}
+
+fn consumed_samples_position_millis(
+    consumed_samples: u64,
+    start_frame: u64,
+    source_rate: u32,
+    output_rate: u32,
+) -> Option<u64> {
+    audible_position_millis(consumed_samples, start_frame, 0, source_rate, output_rate)
 }
 
 /// `active`'s absolute consumed-samples position (no latency compensation, unlike
@@ -707,7 +731,9 @@ fn consumed_samples_position_millis(consumed_samples: u64, sample_rate: u32) -> 
 fn active_track_relative_position_ms(active: &ActivePlayback) -> u64 {
     let absolute_ms = consumed_samples_position_millis(
         active.consumed_output_samples.load(Ordering::Acquire),
+        active.start_frame,
         active.prepared.info.sample_rate,
+        active.plan.output_rate,
     )
     .unwrap_or(0);
     track_relative_millis(absolute_ms, active.prepared.key.start_frame, active.prepared.info.sample_rate)
@@ -732,26 +758,116 @@ fn record_output_latency(latency: &AtomicU64, ts: OutputStreamTimestamp) {
 
 /// Estimated audible position, compensated for one output-buffer's worth of latency.
 /// Accuracy is bounded by one hardware buffer; this is an estimate, not a measured
-/// acoustic position. Clamped to `start_frame` so a seek's counter never reports behind
-/// its own target.
+/// acoustic position. Samples and latency are at `output_rate`, counted from source frame
+/// `start_frame`, so a seek never reports behind its own target.
 fn audible_position_millis(
     consumed_samples: u64,
     start_frame: u64,
     latency_nanos: u64,
-    sample_rate: u32,
+    source_rate: u32,
+    output_rate: u32,
 ) -> Option<u64> {
-    if sample_rate == 0 {
+    if source_rate == 0 || output_rate == 0 {
         return None;
     }
     let frames = consumed_samples / 2; // output is always stereo
-    let latency_frames = (u128::from(latency_nanos.min(MAX_OUTPUT_LATENCY_NANOS)) * u128::from(sample_rate)
+    let latency_frames = (u128::from(latency_nanos.min(MAX_OUTPUT_LATENCY_NANOS)) * u128::from(output_rate)
         / 1_000_000_000) as u64;
-    let audible = frames.saturating_sub(latency_frames).max(start_frame);
-    u64::try_from(u128::from(audible) * 1_000 / u128::from(sample_rate)).ok()
+    let audible = source_frame_position(start_frame, frames.saturating_sub(latency_frames), source_rate, output_rate);
+    u64::try_from(u128::from(audible) * 1_000 / u128::from(source_rate)).ok()
 }
 
-fn uses_strict_integer_route(info: &AudioInfo) -> bool {
-    cfg!(target_os = "macos") && info.integer_pcm
+/// The only route decision; never inline it.
+fn output_route(info: &AudioInfo, compat_enabled: bool, strict_rates: &[u32]) -> Route {
+    let integer = cfg!(target_os = "macos") && info.integer_pcm;
+    if !compat_enabled {
+        return if integer { Route::Strict } else { Route::Float };
+    }
+    if integer && info.source_channels == 2 && strict_rates.contains(&info.sample_rate) {
+        Route::Strict
+    } else {
+        Route::Compat
+    }
+}
+
+fn compat_output_rate(source_rate: u32, ranges: &[(u32, u32)]) -> Option<u32> {
+    let offered = |rate: u32| ranges.iter().any(|(min, max)| (*min..=*max).contains(&rate));
+    if source_rate == 0 || ranges.is_empty() {
+        return None;
+    }
+    if offered(source_rate) {
+        return Some(source_rate);
+    }
+    if let Some(multiple) = (2..=8u32).rev().filter_map(|factor| source_rate.checked_mul(factor)).find(|rate| offered(*rate)) {
+        return Some(multiple);
+    }
+    let mut candidates: Vec<u32> = crate::audio::rate_repair::STANDARD_SAMPLE_RATES
+        .iter()
+        .copied()
+        .filter(|rate| offered(*rate))
+        .chain(ranges.iter().flat_map(|(min, max)| [*min, *max]))
+        .filter(|rate| *rate > 0)
+        .collect();
+    candidates.sort_unstable();
+    candidates
+        .into_iter()
+        .min_by(|a, b| {
+            let distance = |rate: u32| (f64::from(rate) / f64::from(source_rate)).ln().abs();
+            distance(*a).total_cmp(&distance(*b)).then(b.cmp(a))
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputPlan {
+    route: Route,
+    output_rate: u32,
+}
+
+impl OutputPlan {
+    fn resamples(&self, source_rate: u32) -> bool {
+        self.route == Route::Compat && self.output_rate != source_rate
+    }
+}
+
+/// A read error keeps the strict route, so it never downgrades a bit-perfect device.
+fn resolve_output_plan(info: &AudioInfo, compat_enabled: bool, device: Option<(&Device, &str)>) -> OutputPlan {
+    let strict_rates = if compat_enabled && cfg!(target_os = "macos") && info.integer_pcm {
+        device
+            .and_then(|(_, uid)| coreaudio::strict_integer_rates(uid, &[info.sample_rate]).ok())
+            .unwrap_or_else(|| vec![info.sample_rate])
+    } else {
+        Vec::new()
+    };
+    let route = output_route(info, compat_enabled, &strict_rates);
+    let output_rate = if route == Route::Compat {
+        device
+            .and_then(|(device, _)| stereo_rate_ranges(device))
+            .and_then(|ranges| compat_output_rate(info.sample_rate, &ranges))
+            .unwrap_or(info.sample_rate)
+    } else {
+        info.sample_rate
+    };
+    OutputPlan { route, output_rate }
+}
+
+fn stereo_rate_ranges(device: &Device) -> Option<Vec<(u32, u32)>> {
+    let ranges = device.supported_output_configs().ok()?;
+    Some(
+        ranges
+            .filter(|range| range.channels() == 2)
+            .map(|range| (range.min_sample_rate(), range.max_sample_rate()))
+            .collect(),
+    )
+}
+
+fn lookup_output_device(output_id: &str) -> Option<(Device, String)> {
+    let device_id = DeviceId::from_str(output_id).ok()?;
+    let device = cpal::default_host().device_by_id(&device_id)?;
+    Some((device, device_id.id().to_owned()))
+}
+
+fn lookahead_is_reusable(preparation: &TrackPreparation, key: &TrackKey, plan: OutputPlan) -> bool {
+    preparation.prepared.key == *key && preparation.plan == plan && !preparation.audio.cancel.load(Ordering::Acquire)
 }
 
 /// Pure decision: after `build_stream` returns, was the just-built stream constructed against a
@@ -771,19 +887,16 @@ fn needs_rebuild_after_post_build_check(
     integer_output && pre_build_physical_format != post_build_physical_format
 }
 
-/// Which physical output route a track uses. Derived from `uses_strict_integer_route` rather
-/// than reimplemented, so a `Route` is always consistent with the one real predicate (`rg -n
-/// uses_strict_integer_route src` must keep showing only its definition, its tests, and the two
-/// production call sites in `spawn_track_preparation` and `start_track_prepared`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     Strict,
     Float,
+    Compat,
 }
 
 impl Route {
-    fn from_integer_output(integer_output: bool) -> Route {
-        if integer_output { Route::Strict } else { Route::Float }
+    fn is_integer(self) -> bool {
+        self == Route::Strict
     }
 }
 
@@ -809,7 +922,7 @@ fn needs_dac_prime(
         return Some("format_changed");
     }
     if let Some(prev) = previous_route
-        && prev != new_route
+        && prev.is_integer() != new_route.is_integer()
     {
         return Some("route_changed");
     }
@@ -901,11 +1014,11 @@ fn seek_target_frame(position_ms: u64, sample_rate: u32, duration_ms: u64) -> u6
     (u128::from(ms) * u128::from(sample_rate) / 1_000) as u64
 }
 
-/// The device and Hog mode a seek must pin to: whatever the active stream is already using,
+/// The device, Hog mode and output plan a seek must pin to: whatever the active stream is already using,
 /// never `self.selected_output`/`self.settings` (`§4.2`). Kept as a pure function so the
 /// construction itself is unit-testable without touching CoreAudio.
 fn pinned_output(active: &ActivePlayback) -> PinnedOutput {
-    PinnedOutput { device_id: active.output_id.clone(), hog_mode: active.hog_mode }
+    PinnedOutput { device_id: active.output_id.clone(), hog_mode: active.hog_mode, plan: active.plan }
 }
 
 /// The raw `DeviceId` string the volume slider should control (`§4.5`): the active stream's own
@@ -1033,11 +1146,17 @@ impl Drop for DecoderExitGuard {
 
 fn spawn_track_preparation(
     prepared: PreparedTrack,
+    plan: OutputPlan,
     start_frame: u64,
     end_frame: Option<u64>,
     events: Sender<PlaybackEvent>,
 ) -> Result<TrackPreparation, String> {
-    let integer_output = uses_strict_integer_route(&prepared.info);
+    let integer_output = plan.route == Route::Strict;
+    let resampler = if plan.resamples(prepared.info.sample_rate) {
+        Some(StreamResampler::new(prepared.info.sample_rate, plan.output_rate)?)
+    } else {
+        None
+    };
     let (mut producer, consumer) = RingBuffer::<PcmSample>::new(RING_SAMPLES);
     let cancel = Arc::new(AtomicBool::new(false));
     let eof = Arc::new(AtomicBool::new(false));
@@ -1046,7 +1165,7 @@ fn spawn_track_preparation(
     let buffered = Arc::new(AtomicUsize::new(0));
     let diagnostics = Arc::new(AudioDiagnostics::default());
     let decoder_error = Arc::new(Mutex::new(None));
-    let prebuffer_samples = prebuffer_samples(prepared.info.sample_rate);
+    let prebuffer_samples = prebuffer_samples(plan.output_rate);
     let decoder_cancel = cancel.clone();
     let decoder_eof = eof.clone();
     let decoder_buffered = buffered.clone();
@@ -1068,14 +1187,8 @@ fn spawn_track_preparation(
                 error_slot: decoder_error_slot.clone(),
             };
             let mut decoder_found_nonzero_sample = false;
-            let result = decode_file(&decoder_path, &decoder_expected_info, &decoder_cancel, integer_output, start_frame, end_frame, |sample| {
-                if decoder_cancel.load(Ordering::Acquire) {
-                    return Err("Playback cancelled".into());
-                }
-                if !decoder_found_nonzero_sample && sample_is_nonzero(sample) {
-                    decoder_found_nonzero_sample = true;
-                    decoder_diagnostics.decoder_nonzero_sample.store(true, Ordering::Release);
-                }
+            let mut resampler = resampler;
+            let mut push_to_ring = |sample: PcmSample| -> Result<(), String> {
                 while producer.is_full() {
                     if decoder_cancel.load(Ordering::Relaxed) {
                         return Err("Playback cancelled".into());
@@ -1085,13 +1198,35 @@ fn spawn_track_preparation(
                 producer.push(sample).map_err(|e| format!("PCM queue failed: {e}"))?;
                 decoder_buffered.fetch_add(1, Ordering::Release);
                 Ok(())
+            };
+            let decoded = decode_file(&decoder_path, &decoder_expected_info, &decoder_cancel, integer_output, start_frame, end_frame, |sample| {
+                if decoder_cancel.load(Ordering::Acquire) {
+                    return Err("Playback cancelled".into());
+                }
+                if !decoder_found_nonzero_sample && sample_is_nonzero(sample) {
+                    decoder_found_nonzero_sample = true;
+                    decoder_diagnostics.decoder_nonzero_sample.store(true, Ordering::Release);
+                }
+                match resampler.as_mut() {
+                    Some(resampler) => resampler.push(sample_as_f32(sample), &mut |resampled| push_to_ring(PcmSample::Float(resampled))),
+                    None => push_to_ring(sample),
+                }
+            });
+            let result = decoded.map_err(|error| error.to_string()).and_then(|_| match resampler.as_mut() {
+                Some(resampler) => resampler.finish(&mut |resampled| {
+                    if decoder_cancel.load(Ordering::Acquire) {
+                        return Err("Playback cancelled".into());
+                    }
+                    push_to_ring(PcmSample::Float(resampled))
+                }),
+                None => Ok(()),
             });
             if let Err(error) = result {
                 if !decoder_cancel.load(Ordering::Acquire) {
                     decoder_failure_flag.store(true, Ordering::Release);
                     *decoder_error_slot
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.to_string());
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.clone());
                     let _ = events.send(PlaybackEvent::Status(format!("Decoder stopped: {error}")));
                 }
             }
@@ -1102,6 +1237,8 @@ fn spawn_track_preparation(
 
     Ok(TrackPreparation {
         prepared,
+        plan,
+        epoch: 0,
         audio: AudioPreparation {
             consumer: Some(consumer),
             decoder: Some(decoder),
@@ -1180,6 +1317,7 @@ struct PlaybackWorker {
     /// A command dequeued by `drain_same_key_seeks` while coalescing same-key seeks, held so
     /// command order is preserved across the next `run()` iteration (`§4.2`).
     pending_command: Option<Command>,
+    output_epoch: u64,
     /// Test-only record of the `start_playing` every fresh queue-head start asked for, so a
     /// hardware-free test can tell a paused start (Next while paused) from a playing one even though
     /// the start itself fails without a device.
@@ -1209,15 +1347,14 @@ impl PlaybackWorker {
             last_stop: None,
             history: Vec::new(),
             pending_command: None,
+            output_epoch: 0,
             #[cfg(test)]
             new_track_start_requests: Vec::new(),
         }
     }
 
     fn run(mut self) {
-        if let Ok(devices) = enumerate_outputs() {
-            self.emit(PlaybackEvent::Devices(devices));
-        }
+        self.emit_devices();
         // First reading, forced: the UI has nothing to show until this arrives (`§4.5`).
         self.refresh_volume(true);
         while !self.shutdown {
@@ -1290,6 +1427,13 @@ impl PlaybackWorker {
         }
     }
 
+    fn emit_devices(&self) {
+        match enumerate_outputs() {
+            Ok(devices) => self.emit(PlaybackEvent::Devices(devices)),
+            Err(error) => self.emit(PlaybackEvent::Status(format!("Could not read the output devices: {error}"))),
+        }
+    }
+
     fn handle(&mut self, command: Command) {
         match command {
             Command::Enqueue(paths) => self.enqueue(paths),
@@ -1302,6 +1446,7 @@ impl PlaybackWorker {
                 self.seek_to(key, position_ms);
             }
             Command::SelectOutput(id) => {
+                self.output_epoch += 1;
                 self.selected_output = id.clone();
                 self.settings.output_device_id = id;
                 if self.active.is_some() {
@@ -1330,6 +1475,24 @@ impl PlaybackWorker {
                         "Hog mode is enabled for macOS playback.".into()
                     } else {
                         "Hog mode is disabled by user preference.".into()
+                    }));
+                    if !self.queue.is_empty() {
+                        self.start_next();
+                    }
+                }
+            }
+            Command::SetCompatibilityMode(enabled) => {
+                self.output_epoch += 1;
+                self.settings.compatibility_mode_enabled = enabled;
+                if self.active.is_some() {
+                    self.emit(PlaybackEvent::Status(
+                        "Compatibility mode preference will apply when the next track starts.".into(),
+                    ));
+                } else {
+                    self.emit(PlaybackEvent::Status(if enabled {
+                        "Compatibility mode is on: outputs that cannot play bit-perfect get resampled float audio.".into()
+                    } else {
+                        "Compatibility mode is off: playback is bit-perfect or refused.".into()
                     }));
                     if !self.queue.is_empty() {
                         self.start_next();
@@ -1531,12 +1694,8 @@ impl PlaybackWorker {
         self.last_stop = Some(StoppedOutput {
             at: Instant::now(),
             device_id: active.output_id.clone(),
-            rate: active.prepared.info.sample_rate,
-            // Raw field, not `uses_strict_integer_route(&active.prepared.info)`: this call runs on
-            // every platform (not `cfg(target_os = "macos")`), and `uses_strict_integer_route` must
-            // keep exactly its 2 real call sites (`spawn_track_preparation`, `start_track_prepared`).
-            // `Route::from_integer_output` reads this bool the same way either predicate would.
-            integer_output: active.prepared.info.integer_pcm,
+            rate: active.plan.output_rate,
+            route: active.plan.route,
         });
         active.stop_output();
         if let Some(handle) = active.decoder.take() {
@@ -1548,7 +1707,7 @@ impl PlaybackWorker {
         if let Some((message, _)) = flush_underrun_report(
             active.reported_underrun_samples,
             active.diagnostics.underrun_samples.load(Ordering::Acquire),
-            active.prepared.info.sample_rate,
+            active.plan.output_rate,
         ) {
             self.emit(PlaybackEvent::Status(message));
         }
@@ -1662,7 +1821,7 @@ impl PlaybackWorker {
 
         let Some(prepared) = self.stop_active_now() else { return };
 
-        match spawn_track_preparation(prepared.clone(), start_frame, end_frame, self.events.clone()) {
+        match spawn_track_preparation(prepared.clone(), pinned.plan, start_frame, end_frame, self.events.clone()) {
             Ok(preparation) => {
                 let options = StartOptions {
                     start_frame,
@@ -1853,10 +2012,9 @@ impl PlaybackWorker {
     }
 
     fn preparation_for_start(&mut self, prepared: &PreparedTrack) -> Result<TrackPreparation, String> {
+        let plan = self.plan_for_selected_output(&prepared.info);
         if let Some(mut preparation) = self.lookahead.take() {
-            if preparation.prepared.key == prepared.key
-                && !preparation.audio.cancel.load(Ordering::Acquire)
-            {
+            if lookahead_is_reusable(&preparation, &prepared.key, plan) {
                 return Ok(preparation);
             }
             preparation.cancel();
@@ -1874,7 +2032,16 @@ impl PlaybackWorker {
         }
         self.failed_preparation_key = None;
         self.waiting_for_decoder_cancel = false;
-        spawn_track_preparation(prepared.clone(), prepared.key.start_frame, prepared.key.end_frame, self.events.clone())
+        spawn_track_preparation(prepared.clone(), plan, prepared.key.start_frame, prepared.key.end_frame, self.events.clone())
+    }
+
+    fn plan_for_selected_output(&self, info: &AudioInfo) -> OutputPlan {
+        let device = self.selected_output.as_deref().filter(|id| !id.is_empty()).and_then(lookup_output_device);
+        resolve_output_plan(
+            info,
+            self.settings.compatibility_mode_enabled,
+            device.as_ref().map(|(device, uid)| (device, uid.as_str())),
+        )
     }
 
     fn reconcile_lookahead(&mut self) {
@@ -1907,6 +2074,7 @@ impl PlaybackWorker {
 
         let has_current_head = self.lookahead.as_ref().is_some_and(|preparation| {
             preparation.prepared.key == prepared.key
+                && preparation.epoch == self.output_epoch
                 && !preparation.audio.cancel.load(Ordering::Acquire)
         });
         if has_current_head {
@@ -1939,8 +2107,10 @@ impl PlaybackWorker {
         if self.failed_preparation_key.as_ref() == Some(&prepared.key) {
             return;
         }
-        match spawn_track_preparation(prepared.clone(), prepared.key.start_frame, prepared.key.end_frame, self.events.clone()) {
-            Ok(preparation) => {
+        let plan = self.plan_for_selected_output(&prepared.info);
+        match spawn_track_preparation(prepared.clone(), plan, prepared.key.start_frame, prepared.key.end_frame, self.events.clone()) {
+            Ok(mut preparation) => {
+                preparation.epoch = self.output_epoch;
                 self.failed_preparation_key = None;
                 self.lookahead = Some(preparation);
             }
@@ -2017,11 +2187,24 @@ impl PlaybackWorker {
             .ok_or_else(|| "Selected output device is no longer available.".to_owned())?;
         let description = device.description().map_err(|e| e.to_string())?;
         let output_label = description.name().to_owned();
-        let integer_output = uses_strict_integer_route(&prepared.info);
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut plan = match &options.pinned_output {
+            Some(pinned) => pinned.plan,
+            None => resolve_output_plan(
+                &prepared.info,
+                self.settings.compatibility_mode_enabled,
+                Some((&device, device_id.id())),
+            ),
+        };
+        let integer_output = plan.route == Route::Strict;
         if integer_output && prepared.info.source_channels != 2 {
             return Err("Strict integer output requires stereo PCM; mono-to-stereo conversion is not allowed.".into());
         }
-        let (sample_format, config) = exact_output_config(&device, prepared.info.sample_rate, integer_output)?;
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let (mut sample_format, mut config) = exact_output_config(&device, plan.output_rate, integer_output)?;
+        if preparation.plan != plan {
+            self.replace_preparation(preparation, prepared, plan, options.start_frame)?;
+        }
 
         // Decode/prebuffer is speculative and does not touch CoreAudio or the existing Hog
         // lease. This wait occurs only once the prior active stream has fully drained.
@@ -2071,13 +2254,31 @@ impl PlaybackWorker {
                 .last_stop
                 .as_ref()
                 .filter(|stopped| stopped.device_id == selected_id)
-                .map(|stopped| Route::from_integer_output(stopped.integer_output));
-            let new_route = Route::from_integer_output(integer_output);
-            if let Some(wait) = rate_change_guard_wait(self.last_stop.as_ref(), uid, prepared.info.sample_rate, Instant::now()) {
+                .map(|stopped| stopped.route);
+            let new_route = plan.route;
+            if let Some(wait) = rate_change_guard_wait(self.last_stop.as_ref(), uid, plan.output_rate, Instant::now()) {
                 thread::sleep(wait);
             }
             let nominal_rate_started_at = Instant::now();
-            let audio_device_id = coreaudio::set_and_verify_sample_rate(uid, prepared.info.sample_rate)?;
+            let audio_device_id = match coreaudio::set_and_verify_sample_rate(uid, plan.output_rate) {
+                Ok(audio_device_id) => audio_device_id,
+                Err(error) if plan.route == Route::Compat => {
+                    let audio_device_id = coreaudio::device_id_for_uid(uid)?;
+                    let actual_rate = coreaudio::nominal_sample_rate(audio_device_id)?;
+                    self.emit(PlaybackEvent::Diagnostic(format!(
+                        "Compatibility mode · device refused {} Hz ({error}); resampling to its {actual_rate} Hz",
+                        plan.output_rate
+                    )));
+                    if actual_rate != plan.output_rate {
+                        plan.output_rate = actual_rate;
+                        (sample_format, config) = exact_output_config(&device, actual_rate, false)?;
+                        self.replace_preparation(preparation, prepared, plan, options.start_frame)?;
+                        preparation.audio.wait_until_prebuffered()?;
+                    }
+                    audio_device_id
+                }
+                Err(error) => return Err(error),
+            };
             // The nominal-rate readback above can report the new rate while the physical stream is
             // still mid-switch. Wait for the physical side to settle, then (strict route only)
             // select the exact integer physical format, BEFORE `build_stream` — never after: a CPAL
@@ -2085,18 +2286,14 @@ impl PlaybackWorker {
             // corrected afterward. That ordering (fix-after-build) is the root cause of the
             // "sampling config stays stuck" bug when switching between the strict integer and float
             // routes; see the bugfix memory saved under this change.
-            coreaudio::wait_for_physical_sample_rate(
-                audio_device_id,
-                prepared.info.sample_rate,
-                PHYSICAL_RATE_SETTLE_TIMEOUT,
-            )?;
+            coreaudio::wait_for_physical_sample_rate(audio_device_id, plan.output_rate, PHYSICAL_RATE_SETTLE_TIMEOUT)?;
             if integer_output {
-                coreaudio::ensure_exact_integer_output(audio_device_id, prepared.info.sample_rate)?;
+                coreaudio::ensure_exact_integer_output(audio_device_id, plan.output_rate)?;
             }
             timings.nominal_rate_setup = Some(nominal_rate_started_at.elapsed());
             let mut physical_format = coreaudio::get_physical_format_description(audio_device_id)
                 .unwrap_or_else(|error| format!("unavailable ({error})"));
-            self.emit_dac_format_diagnostic("before build", prepared.info.sample_rate, &physical_format);
+            self.emit_dac_format_diagnostic("before build", plan.output_rate, &physical_format);
 
             // DAC priming: even though the HAL property state read above already looks correct
             // (or already looked correct on a prior track's own before-build snapshot), the DAC
@@ -2114,7 +2311,7 @@ impl PlaybackWorker {
             let prime_reason = match (before_dac_state.as_ref(), settle_ms > 0) {
                 (Some(before_state), true) => {
                     let after_state =
-                        DacState { nominal_rate: prepared.info.sample_rate, physical_format: physical_format.clone() };
+                        DacState { nominal_rate: plan.output_rate, physical_format: physical_format.clone() };
                     needs_dac_prime(before_state, &after_state, previous_route, new_route)
                 }
                 _ => None,
@@ -2135,7 +2332,7 @@ impl PlaybackWorker {
                         // the "before build" diagnostic below so it reflects post-priming state.
                         if integer_output
                             && let Err(error) =
-                                coreaudio::ensure_exact_integer_output(audio_device_id, prepared.info.sample_rate)
+                                coreaudio::ensure_exact_integer_output(audio_device_id, plan.output_rate)
                         {
                             self.emit(PlaybackEvent::Diagnostic(format!(
                                 "DAC prime failed · reason={reason} · error={error}"
@@ -2165,13 +2362,13 @@ impl PlaybackWorker {
 
         let output_failed = Arc::new(AtomicBool::new(false));
         let format_mismatch = Arc::new(AtomicU8::new(0));
-        let consumed_output_samples = Arc::new(AtomicU64::new(options.start_frame * 2));
+        let consumed_output_samples = Arc::new(AtomicU64::new(0));
         let output_latency_nanos = Arc::new(AtomicU64::new(0));
         let error_sender = self.events.clone();
         // Only a start that actually primed the DAC (`did_dac_prime`) can leave it muted/relocking
         // once the real stream begins; a seek or an unchanged-rate/route start never primes and
         // therefore never pre-rolls.
-        let preroll_frames = if did_dac_prime { dac_preroll_frames(dac_preroll_ms(), prepared.info.sample_rate) } else { 0 };
+        let preroll_frames = if did_dac_prime { dac_preroll_frames(dac_preroll_ms(), plan.output_rate) } else { 0 };
         if preroll_frames > 0 {
             self.emit(PlaybackEvent::Diagnostic(format!(
                 "DAC preroll · ms={} · frames={preroll_frames}",
@@ -2209,7 +2406,7 @@ impl PlaybackWorker {
             let format_verify_started_at = Instant::now();
             let post_build_physical_format = coreaudio::get_physical_format_description(audio_device_id)
                 .unwrap_or_else(|error| format!("unavailable ({error})"));
-            self.emit_dac_format_diagnostic("after build", prepared.info.sample_rate, &post_build_physical_format);
+            self.emit_dac_format_diagnostic("after build", plan.output_rate, &post_build_physical_format);
             // CPAL only reports its virtual callback format and may itself change the device's
             // *physical* format while constructing the AudioUnit, even though it was already set
             // correctly right before `build_stream` above. When that happens the just-built
@@ -2228,7 +2425,7 @@ impl PlaybackWorker {
                     "DAC physical format changed while building the output stream (before: {pre_build_physical_format}; after: {post_build_physical_format}); refusing to play a stale stream."
                 ))
             } else if !integer_output {
-                coreaudio::verify_physical_sample_rate(audio_device_id, prepared.info.sample_rate)
+                coreaudio::verify_physical_sample_rate(audio_device_id, plan.output_rate)
             } else {
                 Ok(())
             };
@@ -2260,7 +2457,7 @@ impl PlaybackWorker {
         {
             let physical_format = coreaudio::get_physical_format_description(audio_device_id)
                 .unwrap_or_else(|error| format!("unavailable ({error})"));
-            self.emit_dac_format_diagnostic("after play", prepared.info.sample_rate, &physical_format);
+            self.emit_dac_format_diagnostic("after play", plan.output_rate, &physical_format);
         }
         let stream_play_returned_at = Instant::now();
         timings.stream_play_call = stream_play_returned_at.duration_since(stream_play_started_at);
@@ -2269,18 +2466,7 @@ impl PlaybackWorker {
 
         match options.reason {
             StartReason::NewTrack => {
-                let title = display_name(&prepared.key.path);
-                let parent = prepared.key.path.parent().map(display_path).unwrap_or_else(|| "Audio file".into());
-                self.emit(PlaybackEvent::Started {
-                    key: prepared.key.clone(),
-                    info: prepared.info.clone(),
-                    title,
-                    album: parent,
-                    artist: "Unknown Artist".into(),
-                    output: output_label,
-                    hog_mode: cfg!(target_os = "macos") && hog_mode_enabled,
-                    integer_output_verified: integer_output,
-                });
+                self.emit(started_event(prepared, &output_label, hog_mode_enabled, plan));
                 self.emit(PlaybackEvent::Timeline {
                     position_ms: 0,
                     duration_ms: prepared.info.duration_ms,
@@ -2298,7 +2484,7 @@ impl PlaybackWorker {
                     let diagnostic = handoff_timing_diagnostic(
                         &prepared.key.path.display().to_string(),
                         &prepared.info.format,
-                        prepared.info.sample_rate,
+                        plan.output_rate,
                         stream_play_returned_at.saturating_duration_since(worker_drain_observed_at),
                         &timings,
                     );
@@ -2312,12 +2498,11 @@ impl PlaybackWorker {
             }
             StartReason::Seek => {
                 // No `Started` and no handoff diagnostic: the track itself has not changed.
-                // `consumed_samples_position_millis` gives the *absolute* file position; the
+                // `frame_to_millis` gives the *absolute* file position of the seek target; the
                 // emitted Timeline must be track-relative (0 at this track's own `key.start_frame`),
                 // subtracted here via `track_relative_millis` so it is never double-subtracted or
                 // forgotten on this code path (`CLAUDE.md` CUE sheet support, §4).
-                let absolute_ms =
-                    consumed_samples_position_millis(options.start_frame * 2, prepared.info.sample_rate).unwrap_or(0);
+                let absolute_ms = frame_to_millis(options.start_frame, prepared.info.sample_rate);
                 let position_ms = track_relative_millis(absolute_ms, prepared.key.start_frame, prepared.info.sample_rate);
                 self.emit(PlaybackEvent::Timeline { position_ms, duration_ms: prepared.info.duration_ms });
                 self.emit(PlaybackEvent::Playing(options.start_playing));
@@ -2342,7 +2527,7 @@ impl PlaybackWorker {
             consumed_output_samples,
             output_latency_nanos,
             start_frame: options.start_frame,
-            timeline_reported_samples: options.start_frame * 2,
+            timeline_reported_samples: 0,
             timeline_reported_at: Instant::now(),
             drain_started: None,
             playing: options.start_playing,
@@ -2356,7 +2541,21 @@ impl PlaybackWorker {
                 dac_refresh_restart_ms(),
                 Instant::now(),
             ),
+            plan,
         });
+        Ok(())
+    }
+
+    fn replace_preparation(
+        &mut self,
+        preparation: &mut TrackPreparation,
+        prepared: &PreparedTrack,
+        plan: OutputPlan,
+        start_frame: u64,
+    ) -> Result<(), String> {
+        let fresh = spawn_track_preparation(prepared.clone(), plan, start_frame, prepared.key.end_frame, self.events.clone())?;
+        let stale = std::mem::replace(preparation, fresh);
+        self.retire_preparation(stale);
         Ok(())
     }
 
@@ -2390,7 +2589,7 @@ impl PlaybackWorker {
         if let Some((message, _)) = flush_underrun_report(
             active.reported_underrun_samples,
             active.diagnostics.underrun_samples.load(Ordering::Acquire),
-            active.prepared.info.sample_rate,
+            active.plan.output_rate,
         ) {
             self.emit(PlaybackEvent::Status(message));
         }
@@ -2443,7 +2642,7 @@ impl PlaybackWorker {
                 current,
                 active.underrun_reported_at,
                 Instant::now(),
-                active.prepared.info.sample_rate,
+                active.plan.output_rate,
             ) else {
                 return;
             };
@@ -2689,7 +2888,7 @@ impl PlaybackWorker {
         let underrun_status = flush_underrun_report(
             active.reported_underrun_samples,
             active.diagnostics.underrun_samples.load(Ordering::Acquire),
-            active.prepared.info.sample_rate,
+            active.plan.output_rate,
         );
         self.emit(PlaybackEvent::Timeline {
             position_ms: active_track_relative_position_ms(&active),
@@ -3101,6 +3300,28 @@ fn build_stream(
                 .map_err(|error| error.to_string())
         }
         other => Err(format!("The selected output sample format {other:?} is not supported.")),
+    }
+}
+
+fn started_event(prepared: &PreparedTrack, output_label: &str, hog_mode: bool, plan: OutputPlan) -> PlaybackEvent {
+    PlaybackEvent::Started {
+        key: prepared.key.clone(),
+        info: prepared.info.clone(),
+        title: display_name(&prepared.key.path),
+        album: prepared.key.path.parent().map(display_path).unwrap_or_else(|| "Audio file".into()),
+        artist: "Unknown Artist".into(),
+        output: output_label.to_owned(),
+        hog_mode: cfg!(target_os = "macos") && hog_mode,
+        integer_output_verified: plan.route == Route::Strict,
+        compatibility_mode: plan.route == Route::Compat,
+        resampled: plan.resamples(prepared.info.sample_rate).then_some((prepared.info.sample_rate, plan.output_rate)),
+    }
+}
+
+fn sample_as_f32(sample: PcmSample) -> f32 {
+    match sample {
+        PcmSample::Float(value) => value,
+        PcmSample::Integer(value) => value as f32 / 2_147_483_648.0,
     }
 }
 

@@ -13,6 +13,7 @@ pub struct Preferences {
     /// accept when they are scanned, keeping a backup of the original (`audio::rate_repair`).
     /// Rewrites files on disk, so it can be switched off here (`settings.json`); there is no UI for it.
     pub repair_nonstandard_sample_rates: bool,
+    pub compatibility_mode_enabled: bool,
 }
 
 impl Default for Preferences {
@@ -21,6 +22,7 @@ impl Default for Preferences {
             output_device_id: None,
             hog_mode_enabled: true,
             repair_nonstandard_sample_rates: true,
+            compatibility_mode_enabled: false,
         }
     }
 }

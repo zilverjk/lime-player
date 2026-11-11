@@ -340,6 +340,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let audio_player = Arc::new(AudioPlayer::new(PlayerSettings {
         output_device_id: preferences.borrow().output_device_id.clone(),
         hog_mode_enabled: preferences.borrow().hog_mode_enabled,
+        compatibility_mode_enabled: preferences.borrow().compatibility_mode_enabled,
     }));
     // The scanner probes opened files and reads their tags/artwork on its own thread, keeping that
     // work off both the UI thread and the audio controller thread (`§6` Stage 3); `app_state`
@@ -476,6 +477,7 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
     window.set_hog_mode_enabled(preferences.borrow().hog_mode_enabled);
+    window.set_compatibility_mode_enabled(preferences.borrow().compatibility_mode_enabled);
     set_device_model(&window, &output_devices.borrow());
     sync_navigation(&window, &navigation.borrow());
     project_and_set_library(
@@ -742,6 +744,28 @@ fn main() -> Result<(), slint::PlatformError> {
         };
         if let Some(window) = hog_window.upgrade() {
             set_playback_status(&window, status, &save_error_for_hog);
+        }
+    });
+
+    let player_for_compat = Arc::clone(&audio_player);
+    let preferences_for_compat = Rc::clone(&preferences);
+    let save_error_for_compat = Rc::clone(&settings_save_error);
+    let compat_window = window.as_weak();
+    window.on_compatibility_mode_changed(move |enabled| {
+        player_for_compat.set_compatibility_mode(enabled);
+        preferences_for_compat.borrow_mut().compatibility_mode_enabled = enabled;
+        let status = match preferences_for_compat.borrow().save() {
+            Ok(()) => {
+                *save_error_for_compat.borrow_mut() = None;
+                "Compatibility mode preference saved."
+            }
+            Err(error) => {
+                *save_error_for_compat.borrow_mut() = Some(format!("Could not save Compatibility mode setting: {error}"));
+                "Compatibility mode changed, but the preference could not be saved."
+            }
+        };
+        if let Some(window) = compat_window.upgrade() {
+            set_playback_status(&window, status, &save_error_for_compat);
         }
     });
 
@@ -1178,6 +1202,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     output,
                     hog_mode,
                     integer_output_verified,
+                    compatibility_mode,
+                    resampled,
                 } => {
                     *event_now_playing_key.borrow_mut() = Some(key.clone());
                     *event_fallback.borrow_mut() = (title, album);
@@ -1202,13 +1228,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     // (set at startup and by `on_output_chosen` alone, before anything necessarily
                     // plays there), while this is the device the stream is actually on (`§6`).
                     window.set_active_output_name(output.into());
-                    let status = match (integer_output_verified, hog_mode) {
-                        (true, true) => "Playing · 32-bit integer output verified · Hog mode active",
-                        (true, false) => "Playing · 32-bit integer output verified",
-                        (false, true) => "Playing · Float output path (not bit-perfect) · Hog mode active",
-                        (false, false) => "Playing · Float output path (not bit-perfect)",
-                    };
-                    *event_active_route_status.borrow_mut() = Some(status.to_owned());
+                    let status = route_status(integer_output_verified, compatibility_mode, resampled, hog_mode);
+                    *event_active_route_status.borrow_mut() = Some(status.clone());
                     set_playback_status(&window, status, &event_save_error);
                     window.set_is_playing(true);
                 }
@@ -1963,6 +1984,27 @@ fn set_device_model(window: &MainWindow, devices: &[OutputDevice]) {
     let mut names = vec![SharedString::from("Select output device…")];
     names.extend(devices.iter().map(|device| SharedString::from(device.label.as_str())));
     window.set_output_device_options(ModelRc::new(VecModel::from_iter(names)));
+}
+
+fn route_status(integer_output_verified: bool, compatibility_mode: bool, resampled: Option<(u32, u32)>, hog_mode: bool) -> String {
+    let mut status = if integer_output_verified {
+        "Playing · 32-bit integer output verified".to_owned()
+    } else if compatibility_mode {
+        "Playing · Compatibility mode (not bit-perfect)".to_owned()
+    } else {
+        "Playing · Float output path (not bit-perfect)".to_owned()
+    };
+    if let Some((source, output)) = resampled {
+        status.push_str(&format!(" · {} \u{2192} {}", khz_number(source), library::format::format_khz(output)));
+    }
+    if hog_mode {
+        status.push_str(" · Hog mode active");
+    }
+    status
+}
+
+fn khz_number(rate: u32) -> String {
+    library::format::format_khz(rate).trim_end_matches("\u{00A0}kHz").to_owned()
 }
 
 async fn pick_audio_files(parent_window: slint::WindowHandle) -> Option<Vec<PathBuf>> {

@@ -263,6 +263,51 @@ export component FormatPill inherits Rectangle {
     }
 }
 
+export component SettingSwitch inherits HorizontalLayout {
+    in property <string> text;
+    in-out property <bool> checked;
+    callback toggled(bool);
+    cross-axis-alignment: center;
+    Text { text: root.text; font-size: Theme.fs-body; color: Theme.text-primary; horizontal-stretch: 1; }
+    Rectangle {
+        width: 34px;
+        height: 20px;
+        border-radius: 10px;
+        background: root.checked ? Theme.accent : Theme.slider-track;
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            border-radius: 8px;
+            y: 2px;
+            x: root.checked ? 16px : 2px;
+            background: Theme.knob;
+        }
+        TouchArea {
+            clicked => {
+                root.checked = !root.checked;
+                root.toggled(root.checked);
+            }
+        }
+    }
+}
+
+export component CompatibilityModeSwitch inherits VerticalLayout {
+    in-out property <bool> checked;
+    callback toggled(bool);
+    spacing: 2px;
+    SettingSwitch {
+        text: "Compatibility mode";
+        checked <=> root.checked;
+        toggled(enabled) => { root.toggled(enabled); }
+    }
+    Text {
+        text: "Not bit-perfect: audio is resampled and converted to float to match this output.";
+        font-size: Theme.fs-caption;
+        color: root.checked ? Theme.danger : Theme.text-tertiary;
+        wrap: word-wrap;
+    }
+}
+
 // Either the artwork or the neutral placeholder disc, clipped to `radius` (`§5.5`).
 export component ArtworkView inherits Rectangle {
     in property <image> art;

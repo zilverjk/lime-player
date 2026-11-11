@@ -123,7 +123,7 @@ Typing in the top-bar search field shows a dedicated Search view (`SearchResults
 
 Library scanner: opened path → `decoder::probe_file` → `PreparedTrack` → `AudioPlayer::enqueue`/`play_next`/`replace_queue`. Controller: `PreparedTrack` → `start_track_prepared` (resolve device, Hog lease, set nominal rate, wait for prebuffer, `build_stream`, re-verify physical format, `play()`).
 
-The route is decided only by `uses_strict_integer_route(&AudioInfo)` (`player.rs`), called from `spawn_track_preparation` and `start_track_prepared`; never inline the predicate again — besides its own definition and tests, `rg -n uses_strict_integer_route src` must show only those two call sites:
+The route (`Route::{Strict, Float, Compat}`) is decided only by `output_route(&AudioInfo, compat_enabled, strict_rates)` (`player.rs`); never inline it again — besides its definition and tests, `rg -n output_route src` must show only its one call site, `resolve_output_plan`. That planner returns an `OutputPlan { route, output_rate }` and is read-only (it never touches Hog, rate or format, so it runs before any device mutation and against a device that is still playing); with Compatibility mode off it reads nothing from the device. A preparation is bound to its plan: `spawn_track_preparation` decodes (and resamples) for it, `preparation_for_start` reuses a lookahead only when key AND plan match (`lookahead_is_reusable`), `PlaybackWorker.output_epoch` (bumped by `SelectOutput`/`SetCompatibilityMode`) makes `reconcile_lookahead` redo a lookahead planned under older settings, and a seek pins the active plan (`PinnedOutput.plan`), so it never changes route or rate.
 - **Strict integer route** (macOS, integer PCM): samples are left-aligned into I32, the CPAL stream is requested as I32 at the exact source rate, and playback is refused unless CoreAudio's physical stream reads back as exact-rate packed signed 32-bit stereo LPCM. Mono is refused, not upmixed.
 - **Float fallback** (float WavPack, MP3, non-macOS): F32 stream, labeled "not bit-perfect" in the UI.
 
@@ -186,7 +186,7 @@ A FLAC at a non-standard sample rate (`audio::rate_repair::STANDARD_SAMPLE_RATES
 
 ### Settings
 
-`src/settings.rs` persists `Preferences { output_device_id, hog_mode_enabled, repair_nonstandard_sample_rates }` as JSON at `ProjectDirs::from("com", "Lime Player", "Lime Player")` config dir `/settings.json`. Load/save errors are reported, not fatal.
+`src/settings.rs` persists `Preferences { output_device_id, hog_mode_enabled, repair_nonstandard_sample_rates, compatibility_mode_enabled }` (the last one also has a switch below Hog mode in both output panels) as JSON at `ProjectDirs::from("com", "Lime Player", "Lime Player")` config dir `/settings.json`. Load/save errors are reported, not fatal.
 
 ### Persistent library
 
@@ -215,7 +215,7 @@ Every album card (`AlbumTile`, `ui/widgets.slint`) carries a three-dot menu with
 ## Invariants
 
 - Never change the macOS system-wide default output device; always target the selected CPAL device.
-- Prefer refusing playback with an error over silently degrading: no hidden sample-rate fallback, no format conversion in the strict route, no playing WavPack hybrid (`.wvc`) streams, no acquiring Hog mode from another owner.
+- Prefer refusing playback with an error over silently degrading: no hidden sample-rate fallback (the Compatibility route resamples only when the user turned it on, only where the strict route is unavailable, and is always labeled "not bit-perfect"), no format conversion in the strict route, no playing WavPack hybrid (`.wvc`) streams, no acquiring Hog mode from another owner.
 - The 90 ms guard is software-side only. Do not claim verified hardware drain, bit-perfect USB output, or a <200 ms rate transition — those are unverified on device (see README "Known limits").
 - The library's *decoded* contents (tags, durations, artwork, and cue-derived tracks) are authoritative only from a scan: the on-disk library cache (`library::cache`) is a disposable copy loaded at startup so the library shows at once, refreshed and pruned by the startup rescan, and never trusted over it. `library.json` (individually opened files, added folders, directly opened `.cue` sheets, exclusions) stays the only record of what the user added; the cache must never write to it, never be required (a missing/corrupt/other-version cache is ignored), never resurrect an excluded track, and never persist derived grouping state (albums, effective artists, hidden copies are recomputed from the raw records by `Library::load_records`, so a restored library equals a scanned one). Cached tracks are dropped only on positive evidence that they are gone ("when in doubt, keep").
 - The OS media session is created only in `main()`; no test or the snapshot harness constructs one, and its handlers only `send` into the channel (no UI or player state is touched off the UI thread). Do not claim media-key or Now Playing behavior as verified on a real keyboard/Control Center session — see "Media controls".

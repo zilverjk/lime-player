@@ -333,6 +333,14 @@ mod platform {
         Ok(device_id)
     }
 
+    pub fn nominal_sample_rate(device_id: u32) -> Result<u32, String> {
+        let rate = get_nominal_sample_rate(device_id)?;
+        if !rate.is_finite() || rate < 1.0 {
+            return Err(format!("DAC reported an invalid nominal sample rate ({rate} Hz)"));
+        }
+        Ok(rate.round() as u32)
+    }
+
     pub fn verify_physical_sample_rate(device_id: u32, desired_rate: u32) -> Result<(), String> {
         let actual = get_physical_format(device_id)?.sample_rate;
         if (actual - desired_rate as f64).abs() > 0.5 {
@@ -436,6 +444,26 @@ mod platform {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    pub fn strict_integer_rates(uid: &str, extra_rates: &[u32]) -> Result<Vec<u32>, String> {
+        let device_id = device_id_for_uid(uid)?;
+        let supported = get_supported_physical_formats(output_stream_id(device_id)?)?;
+        Ok(strict_integer_rates_in(&supported, extra_rates))
+    }
+
+    fn strict_integer_rates_in(formats: &[AudioStreamRangedDescription], extra_rates: &[u32]) -> Vec<u32> {
+        let mut candidates: Vec<u32> = crate::audio::rate_repair::STANDARD_SAMPLE_RATES
+            .iter()
+            .chain(extra_rates)
+            .copied()
+            .chain(formats.iter().map(|ranged| ranged.format.sample_rate.round() as u32))
+            .filter(|rate| *rate > 0)
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|rate| select_strict_integer_format(formats, *rate).is_some());
+        candidates
     }
 
     fn get_device_uid(device_id: u32) -> Result<String, String> {
@@ -823,6 +851,14 @@ mod platform {
         Err("DAC physical-state capture is available only on macOS".into())
     }
 
+    pub fn nominal_sample_rate(_device_id: u32) -> Result<u32, String> {
+        Err("Per-device sample-rate control is available only on macOS".into())
+    }
+
+    pub fn strict_integer_rates(_uid: &str, _extra_rates: &[u32]) -> Result<Vec<u32>, String> {
+        Err("Physical format inspection is available only on macOS".into())
+    }
+
     pub fn device_volume(_uid: &str) -> Result<Option<f32>, String> {
         Err("Device volume control is available only on macOS.".into())
     }
@@ -849,7 +885,7 @@ mod platform {
 }
 
 pub use platform::{
-    HogLease, acquire_hog, capture_dac_state, device_volume, ensure_exact_integer_output,
-    get_physical_format_description, set_and_verify_sample_rate, set_device_volume, verify_physical_sample_rate,
-    wait_for_physical_sample_rate,
+    HogLease, acquire_hog, capture_dac_state, device_id_for_uid, device_volume, ensure_exact_integer_output,
+    get_physical_format_description, nominal_sample_rate, set_and_verify_sample_rate, set_device_volume,
+    strict_integer_rates, verify_physical_sample_rate, wait_for_physical_sample_rate,
 };
