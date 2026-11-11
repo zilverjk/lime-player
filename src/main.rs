@@ -681,6 +681,9 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     }
 
+    let player_for_refresh = Arc::clone(&audio_player);
+    window.on_output_refresh_requested(move || player_for_refresh.refresh_devices());
+
     let player_for_output = Arc::clone(&audio_player);
     let preferences_for_output = Rc::clone(&preferences);
     let save_error_for_output = Rc::clone(&settings_save_error);
@@ -1981,9 +1984,13 @@ fn restore_active_route_status(
 }
 
 fn set_device_model(window: &MainWindow, devices: &[OutputDevice]) {
-    let mut names = vec![SharedString::from("Select output device…")];
-    names.extend(devices.iter().map(|device| SharedString::from(device.label.as_str())));
-    window.set_output_device_options(ModelRc::new(VecModel::from_iter(names)));
+    let mut options = vec![OutputOption { name: "Select output device…".into(), bit_perfect: false }];
+    options.extend(
+        devices
+            .iter()
+            .map(|device| OutputOption { name: device.label.as_str().into(), bit_perfect: !device.bit_perfect_rates.is_empty() }),
+    );
+    window.set_output_device_options(ModelRc::new(VecModel::from(options)));
 }
 
 fn route_status(integer_output_verified: bool, compatibility_mode: bool, resampled: Option<(u32, u32)>, hog_mode: bool) -> String {

@@ -166,6 +166,7 @@ fn playback_estimate_from_play_return(
 pub struct OutputDevice {
     pub id: String,
     pub label: String,
+    pub bit_perfect_rates: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +253,7 @@ enum Command {
     /// 0.0..=1.0 device volume scalar (`§4.5`).
     SetVolume(f32),
     SelectOutput(Option<String>),
+    RefreshDevices,
     SetHogMode(bool),
     SetCompatibilityMode(bool),
     TogglePlayback,
@@ -319,6 +321,10 @@ impl AudioPlayer {
         let _ = self.commands.send(Command::SelectOutput(id));
     }
 
+    pub fn refresh_devices(&self) {
+        let _ = self.commands.send(Command::RefreshDevices);
+    }
+
     pub fn set_hog_mode(&self, enabled: bool) {
         let _ = self.commands.send(Command::SetHogMode(enabled));
     }
@@ -349,9 +355,11 @@ pub fn enumerate_outputs() -> Result<Vec<OutputDevice>, String> {
     for device in devices {
         let description = device.description().map_err(|e| e.to_string())?;
         let device_id = device.id().map_err(|e| e.to_string())?;
+        let bit_perfect_rates = coreaudio::strict_integer_rates(device_id.id(), &[]).unwrap_or_default();
         outputs.push(OutputDevice {
             id: device_id.to_string(),
             label: description.name().to_owned(),
+            bit_perfect_rates,
         });
     }
     let mut labels = std::collections::HashMap::<String, usize>::new();
@@ -1436,6 +1444,7 @@ impl PlaybackWorker {
 
     fn handle(&mut self, command: Command) {
         match command {
+            Command::RefreshDevices => self.emit_devices(),
             Command::Enqueue(paths) => self.enqueue(paths),
             Command::PlayNext(tracks) => self.play_next(tracks),
             Command::ReplaceQueue(tracks) => self.replace_queue(tracks),

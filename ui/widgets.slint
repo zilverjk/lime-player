@@ -29,6 +29,7 @@ export struct TrackRowData {
 }
 export struct AlbumCardData { key: string, title: string, artist: string, subtitle: string, art: image, has-art: bool, format-label: string, format-variant: string }
 export struct ArtistRowData { name: string, subtitle: string }
+export struct OutputOption { name: string, bit-perfect: bool }
 export struct AlbumHeaderData { key: string, title: string, artist: string, meta: string, art: image, has-art: bool, format-label: string, format-variant: string }
 
 // `Icon`. Renders `source` through `colorize`, sized to a square of `size` (`§5.5`).
@@ -244,11 +245,13 @@ export component FormatPill inherits Rectangle {
         : root.variant == "hires" ? Theme.hires-soft
         : root.variant == "mix" ? Theme.mix-soft
         : root.variant == "mp3" ? Theme.accent-soft
+        : root.variant == "bitperfect" ? Theme.bitperfect-soft
         : Theme.wav-soft;
     property <color> pill-text: (root.variant == "flac" || root.variant == "wavpack") ? Theme.flac-strong
         : root.variant == "hires" ? Theme.hires-strong
         : root.variant == "mix" ? Theme.mix-strong
         : root.variant == "mp3" ? Theme.accent-strong
+        : root.variant == "bitperfect" ? Theme.bitperfect-strong
         : Theme.wav-strong;
     background: root.pill-bg;
     border-radius: 4px;
@@ -305,6 +308,71 @@ export component CompatibilityModeSwitch inherits VerticalLayout {
         font-size: Theme.fs-caption;
         color: root.checked ? Theme.danger : Theme.text-tertiary;
         wrap: word-wrap;
+    }
+}
+
+// Never takes focus; owners release the search focus in `opening`, before the list records it.
+export component OutputRefreshButton inherits IconButton {
+    source: Icons.refresh;
+    tooltip: "Refresh output devices";
+}
+
+export component OutputSelect inherits Rectangle {
+    in property <[OutputOption]> options;
+    in-out property <int> selected-index: 0;
+    callback opening();
+    callback chosen(int);
+    property <OutputOption> current: root.options[root.selected-index];
+    height: 30px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.bg-hover : Theme.bg-field;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 6px;
+        cross-axis-alignment: center;
+        Text { text: root.current.name; font-size: Theme.fs-body; color: Theme.text-primary; overflow: elide; horizontal-stretch: 1; }
+        if root.current.bit-perfect: FormatPill { text: "Bit Perfect"; variant: "bitperfect"; }
+        Icon { source: Icons.chevron-down; size: Theme.icon-inline; tint: Theme.text-secondary; }
+    }
+    touch := TouchArea {
+        clicked => {
+            root.opening();
+            list.show();
+        }
+    }
+    list := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        Rectangle {
+            background: Theme.bg-panel;
+            border-radius: 8px;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #000000.with-alpha(0.35);
+            VerticalLayout {
+                padding: 4px;
+                for option[index] in root.options: Rectangle {
+                    height: 30px;
+                    border-radius: 6px;
+                    background: row-touch.has-hover ? Theme.bg-hover : index == root.selected-index ? Theme.bg-selected : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 6px;
+                        cross-axis-alignment: center;
+                        Text { text: option.name; font-size: Theme.fs-body; color: Theme.text-primary; overflow: elide; horizontal-stretch: 1; }
+                        if option.bit-perfect: FormatPill { text: "Bit Perfect"; variant: "bitperfect"; }
+                    }
+                    row-touch := TouchArea {
+                        clicked => {
+                            root.selected-index = index;
+                            root.chosen(index);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
