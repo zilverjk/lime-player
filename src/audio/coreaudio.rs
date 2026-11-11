@@ -803,6 +803,26 @@ mod platform {
         }
 
         #[test]
+        fn strict_rates_come_only_from_strict_integer_formats() {
+            let mut float = strict_i32_format(48_000.0);
+            float.format_flags = FORMAT_FLAG_FLOAT | FORMAT_FLAG_PACKED;
+            assert!(strict_integer_rates_in(&[ranged(float, 48_000.0, 48_000.0)], &[]).is_empty());
+
+            let mut packed_24 = strict_i32_format(96_000.0);
+            packed_24.bits_per_channel = 24;
+            packed_24.bytes_per_frame = 6;
+            packed_24.bytes_per_packet = 6;
+            let usb_dac = [
+                ranged(float, 44_100.0, 192_000.0),
+                ranged(packed_24, 44_100.0, 192_000.0),
+                ranged(strict_i32_format(44_100.0), 44_100.0, 44_100.0),
+                ranged(strict_i32_format(96_000.0), 88_200.0, 96_000.0),
+            ];
+            assert_eq!(strict_integer_rates_in(&usb_dac, &[]), vec![44_100, 88_200, 96_000]);
+            assert_eq!(strict_integer_rates_in(&usb_dac, &[90_000, 37_800]), vec![44_100, 88_200, 90_000, 96_000]);
+        }
+
+        #[test]
         fn scale_channel_volumes_preserves_balance() {
             assert_eq!(scale_channel_volumes(0.8, 0.4, 0.5), (0.5, 0.25));
             assert_eq!(scale_channel_volumes(0.0, 0.0, 0.3), (0.3, 0.3));

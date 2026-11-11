@@ -3658,8 +3658,10 @@ mod tests {
         ActivePlayback {
             prepared: PreparedTrack { key, info },
             stream: None,
+            chain: None,
             decoder: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            eof: Arc::new(AtomicBool::new(false)),
             drained: Arc::new(AtomicBool::new(false)),
             decoder_failed: Arc::new(AtomicBool::new(false)),
             output_failed: Arc::new(AtomicBool::new(false)),
@@ -3680,9 +3682,15 @@ mod tests {
             playing: true,
             skip_requested: false,
             output_id: String::new(),
+            output_label: String::new(),
             hog_mode: false,
             dac_refresh_at: None,
+            plan: OutputPlan { route: Route::Strict, output_rate: 44_100 },
         }
+    }
+
+    fn device_free_plan(info: &AudioInfo) -> OutputPlan {
+        resolve_output_plan(info, false, None)
     }
 
     fn worker_with_active_track(queue: Vec<PreparedTrack>) -> PlaybackWorker {
@@ -3699,13 +3707,16 @@ mod tests {
         let settings = PlayerSettings {
             output_device_id: Some("unchanged-output-id".into()),
             hog_mode_enabled: true,
+            compatibility_mode_enabled: false,
         };
         let mut worker = PlaybackWorker::new(settings, commands, events);
         worker.active = Some(ActivePlayback {
             prepared: test_track("/music/current.flac"),
             stream: None,
+            chain: None,
             decoder: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            eof: Arc::new(AtomicBool::new(false)),
             drained: Arc::new(AtomicBool::new(false)),
             decoder_failed: Arc::new(AtomicBool::new(false)),
             output_failed: Arc::new(AtomicBool::new(false)),
@@ -3729,8 +3740,10 @@ mod tests {
             // call): lets seek/restart tests exercise the real start path and observe a
             // deterministic, hardware-free failure instead of touching a real output device.
             output_id: String::new(),
+            output_label: String::new(),
             hog_mode: false,
             dac_refresh_at: None,
+            plan: device_free_plan(&test_track("/music/current.flac").info),
         });
         worker.queue.extend(queue);
         (worker, event_rx)
@@ -3789,6 +3802,8 @@ mod tests {
         active.decoder = Some(active_decoder);
         worker.lookahead = Some(TrackPreparation {
             prepared: test_track("/nas/next.flac"),
+            plan: device_free_plan(&test_track("/nas/next.flac").info),
+            epoch: 0,
             audio: AudioPreparation {
                 consumer: Some(consumer),
                 decoder: Some(lookahead_decoder),
@@ -4057,10 +4072,22 @@ mod tests {
 
     #[test]
     fn playback_position_counts_only_complete_stereo_pcm_frames() {
-        assert_eq!(consumed_samples_position_millis(88_200, 44_100), Some(1_000));
-        assert_eq!(consumed_samples_position_millis(44_100, 44_100), Some(500));
-        assert_eq!(consumed_samples_position_millis(44_101, 44_100), Some(500));
-        assert_eq!(consumed_samples_position_millis(0, 0), None);
+        assert_eq!(consumed_samples_position_millis(88_200, 0, 44_100, 44_100), Some(1_000));
+        assert_eq!(consumed_samples_position_millis(44_100, 0, 44_100, 44_100), Some(500));
+        assert_eq!(consumed_samples_position_millis(44_101, 0, 44_100, 44_100), Some(500));
+        assert_eq!(consumed_samples_position_millis(0, 0, 0, 0), None);
+        assert_eq!(consumed_samples_position_millis(88_200, 44_100, 44_100, 44_100), Some(2_000));
+    }
+
+    #[test]
+    fn resampled_output_frames_convert_back_to_source_frames() {
+        assert_eq!(source_frame_position(1_000, 44_100, 44_100, 44_100), 45_100);
+        assert_eq!(source_frame_position(441_000, 48_000, 44_100, 48_000), 485_100);
+        assert_eq!(source_frame_position(0, 44_100, 48_000, 44_100), 48_000);
+        assert_eq!(source_frame_position(10, 96_000, 48_000, 96_000), 48_010);
+        assert_eq!(source_frame_position(7, 123, 44_100, 0), 130, "a zero output rate never divides by zero");
+        assert_eq!(consumed_samples_position_millis(48_000 * 2 * 2, 441_000, 44_100, 48_000), Some(12_000));
+        assert_eq!(audible_position_millis(48_000 * 2, 0, 10_000_000, 44_100, 48_000), Some(990));
     }
 
     #[test]
@@ -4157,22 +4184,23 @@ mod tests {
 
     #[test]
     fn audible_position_subtracts_output_latency() {
-        assert_eq!(audible_position_millis(88_200, 0, 10_000_000, 44_100), Some(990));
+        assert_eq!(audible_position_millis(88_200, 0, 10_000_000, 44_100, 44_100), Some(990));
     }
 
     #[test]
     fn audible_position_never_precedes_seek_start() {
-        assert_eq!(audible_position_millis(88_300, 44_100, 20_000_000, 44_100), Some(1_000));
+        assert_eq!(audible_position_millis(100, 44_100, 20_000_000, 44_100, 44_100), Some(1_000));
     }
 
     #[test]
     fn audible_position_clamps_absurd_latency_and_zero_rate() {
-        assert_eq!(audible_position_millis(88_200, 0, 0, 0), None);
+        assert_eq!(audible_position_millis(88_200, 0, 0, 0, 0), None);
+        assert_eq!(audible_position_millis(88_200, 0, 0, 44_100, 0), None);
         // 882_000 consumed samples is 10 s of audio at 44.1 kHz (frames = samples / 2). With
         // latency clamped to MAX_OUTPUT_LATENCY_NANOS (5 s), the audible position is 10 s - 5 s.
         // Without the clamp, u64::MAX of latency would swamp the 10 s of audio entirely and
         // saturate to 0, so this case would not distinguish a missing clamp from a present one.
-        assert_eq!(audible_position_millis(882_000, 0, u64::MAX, 44_100), Some(5_000));
+        assert_eq!(audible_position_millis(882_000, 0, u64::MAX, 44_100, 44_100), Some(5_000));
     }
 
     #[test]
@@ -4201,12 +4229,93 @@ mod tests {
     }
 
     #[test]
-    fn strict_route_predicate_matches_platform_and_integer_pcm() {
-        let mut info = test_track("/music/route.flac").info;
-        info.integer_pcm = true;
-        assert_eq!(uses_strict_integer_route(&info), cfg!(target_os = "macos"));
-        info.integer_pcm = false;
-        assert!(!uses_strict_integer_route(&info));
+    fn output_route_follows_the_compatibility_table() {
+        let mac = cfg!(target_os = "macos");
+        let integer = test_track("/music/route.flac").info;
+        let mut float = integer.clone();
+        float.integer_pcm = false;
+        float.is_float = true;
+        let mut mono = integer.clone();
+        mono.source_channels = 1;
+        let offered = [44_100, 48_000, 96_000];
+        let not_offered = [48_000, 96_000];
+
+        let strict_or_float = if mac { Route::Strict } else { Route::Float };
+        assert_eq!(output_route(&integer, false, &offered), strict_or_float);
+        assert_eq!(output_route(&integer, false, &not_offered), strict_or_float, "refused by the strict route, as before");
+        assert_eq!(output_route(&integer, false, &[]), strict_or_float);
+        assert_eq!(output_route(&mono, false, &offered), strict_or_float, "mono is still refused, not converted");
+        assert_eq!(output_route(&float, false, &offered), Route::Float);
+
+        assert_eq!(output_route(&integer, true, &offered), if mac { Route::Strict } else { Route::Compat });
+        assert_eq!(output_route(&integer, true, &not_offered), Route::Compat);
+        assert_eq!(output_route(&integer, true, &[]), Route::Compat, "a float-only output (AirPods)");
+        assert_eq!(output_route(&mono, true, &offered), Route::Compat);
+        assert_eq!(output_route(&float, true, &offered), Route::Compat);
+    }
+
+    #[test]
+    fn device_free_plans_keep_the_source_rate() {
+        let integer = test_track("/music/plan.flac").info;
+        let plan = resolve_output_plan(&integer, false, None);
+        assert_eq!(plan.output_rate, 44_100);
+        assert!(!plan.resamples(44_100));
+        let compat = resolve_output_plan(&integer, true, None);
+        assert_eq!(compat.route, if cfg!(target_os = "macos") { Route::Strict } else { Route::Compat });
+        assert_eq!(compat.output_rate, 44_100);
+    }
+
+    #[test]
+    fn compat_output_rate_prefers_the_source_rate_then_a_multiple_then_the_closest() {
+        assert_eq!(compat_output_rate(44_100, &[(44_100, 44_100), (48_000, 48_000)]), Some(44_100));
+        assert_eq!(compat_output_rate(44_100, &[(8_000, 192_000)]), Some(44_100));
+        assert_eq!(compat_output_rate(44_100, &[(48_000, 48_000)]), Some(48_000));
+        assert_eq!(compat_output_rate(96_000, &[(48_000, 48_000)]), Some(48_000));
+        assert_eq!(compat_output_rate(44_100, &[(48_000, 48_000), (88_200, 88_200)]), Some(88_200));
+        assert_eq!(compat_output_rate(44_100, &[(48_000, 48_000), (88_200, 88_200), (176_400, 176_400)]), Some(176_400));
+        assert_eq!(compat_output_rate(37_800, &[(44_100, 44_100), (32_000, 32_000)]), Some(44_100));
+        assert_eq!(compat_output_rate(22_050, &[(48_000, 96_000)]), Some(88_200), "4x falls inside a continuous range");
+        assert_eq!(compat_output_rate(44_100, &[]), None);
+        assert_eq!(compat_output_rate(0, &[(48_000, 48_000)]), None);
+    }
+
+    #[test]
+    fn a_lookahead_is_reused_only_for_the_same_track_and_plan() {
+        let track = test_track("/music/next.flac");
+        let strict = OutputPlan { route: Route::Strict, output_rate: 44_100 };
+        let preparation = TrackPreparation {
+            prepared: track.clone(),
+            plan: strict,
+            epoch: 0,
+            audio: empty_audio_preparation(None),
+            started_at: Instant::now(),
+            prebuffer_ready_observed_at: None,
+        };
+        assert!(lookahead_is_reusable(&preparation, &track.key, strict));
+        assert!(!lookahead_is_reusable(&preparation, &track.key, OutputPlan { route: Route::Compat, output_rate: 44_100 }));
+        assert!(!lookahead_is_reusable(&preparation, &track.key, OutputPlan { route: Route::Compat, output_rate: 48_000 }));
+        assert!(!lookahead_is_reusable(&preparation, &test_track("/music/other.flac").key, strict));
+        preparation.audio.cancel.store(true, Ordering::Release);
+        assert!(!lookahead_is_reusable(&preparation, &track.key, strict), "a cancelled lookahead is never reused");
+    }
+
+    #[test]
+    fn changing_compatibility_mode_invalidates_the_lookahead_epoch() {
+        let mut worker = worker_with_active_track(Vec::new());
+        let before = worker.output_epoch;
+        worker.handle(Command::SetCompatibilityMode(true));
+        assert!(worker.settings.compatibility_mode_enabled);
+        assert_ne!(worker.output_epoch, before, "a lookahead prepared before the change must be prepared again");
+        let after_compat = worker.output_epoch;
+        worker.handle(Command::SelectOutput(Some("another-output".into())));
+        assert_ne!(worker.output_epoch, after_compat);
+    }
+
+    #[test]
+    fn dac_prime_treats_float_and_compatibility_as_one_family() {
+        let same = dac_state(48_000, "rate=48000 float");
+        assert_eq!(needs_dac_prime(&same, &same, Some(Route::Float), Route::Compat), None);
+        assert_eq!(needs_dac_prime(&same, &same, Some(Route::Compat), Route::Strict), Some("route_changed"));
     }
 
     #[test]
@@ -4644,7 +4753,7 @@ mod tests {
         let mut active = test_active_playback_with_key(key.clone());
         // 12 s into the physical file: 2 s into this track's own 10 s sub-range.
         active.start_frame = key.start_frame;
-        active.consumed_output_samples.store(44_100 * 12 * 2, Ordering::Release);
+        active.consumed_output_samples.store(44_100 * 2 * 2, Ordering::Release);
 
         let position_ms = audible_position_for(&active);
 
@@ -4817,7 +4926,9 @@ mod tests {
     fn retire_preparation_cancels_the_decoder_before_retiring_it() {
         let mut worker = worker_with_active_track(Vec::new());
         let (events_tx, _events_rx) = unbounded();
-        let prep = spawn_track_preparation(fixture_track("decoder-tone.flac"), 0, None, events_tx).unwrap();
+        let track = fixture_track("decoder-tone.flac");
+        let plan = device_free_plan(&track.info);
+        let prep = spawn_track_preparation(track, plan, 0, None, events_tx).unwrap();
         let cancel = prep.audio.cancel.clone();
 
         worker.retire_preparation(prep);
@@ -4913,7 +5024,7 @@ mod tests {
     fn rate_change_guard_waits_only_for_same_device_new_rate_within_90ms() {
         let now = Instant::now();
         let last =
-            StoppedOutput { at: now, device_id: "coreaudio:builtin-output".into(), rate: 44_100, integer_output: true };
+            StoppedOutput { at: now, device_id: "coreaudio:builtin-output".into(), rate: 44_100, route: Route::Strict };
 
         assert_eq!(
             rate_change_guard_wait(Some(&last), "builtin-output", 44_100, now),
@@ -5508,6 +5619,8 @@ mod tests {
         });
         worker.lookahead = Some(TrackPreparation {
             prepared: test_track(path),
+            plan: device_free_plan(&test_track(path).info),
+            epoch: 0,
             audio: empty_audio_preparation(Some(decoder)),
             started_at: Instant::now(),
             prebuffer_ready_observed_at: None,
@@ -5993,5 +6106,285 @@ mod tests {
             }
         }
         assert!(saw_volume_event, "a non-finite level must still snap the UI back with a real value, never be ignored");
+    }
+
+    fn attach_chain(worker: &mut PlaybackWorker, samples: &[i32]) -> TrackChain {
+        let selected = worker.selected_output.clone().unwrap();
+        let hog_mode = worker.settings.hog_mode_enabled;
+        let active = worker.active.as_mut().unwrap();
+        active.output_id = selected;
+        active.hog_mode = hog_mode;
+        active.eof.store(true, Ordering::Release);
+        let (consumer, buffered) = filled_ring(samples);
+        let signals = TrackSignals {
+            buffered,
+            eof: active.eof.clone(),
+            drained: active.drained.clone(),
+            diagnostics: active.diagnostics.clone(),
+            consumed_output_samples: active.consumed_output_samples.clone(),
+            handover: HandoverState::started(),
+        };
+        let (chain, handle) = TrackChain::new(
+            TrackFeed::new(consumer, signals),
+            0,
+            active.output_failed.clone(),
+            active.format_mismatch.clone(),
+        );
+        active.chain = Some(handle);
+        chain
+    }
+
+    fn filled_ring(samples: &[i32]) -> (Consumer<PcmSample>, Arc<AtomicUsize>) {
+        let (mut producer, consumer) = RingBuffer::new(RING_SAMPLES);
+        for sample in samples {
+            producer.push(PcmSample::Integer(*sample)).unwrap();
+        }
+        (consumer, Arc::new(AtomicUsize::new(samples.len())))
+    }
+
+    fn install_ready_lookahead(worker: &mut PlaybackWorker, track: &PreparedTrack, samples: &[i32]) {
+        let (consumer, buffered) = filled_ring(samples);
+        let mut audio = empty_audio_preparation(None);
+        audio.consumer = Some(consumer);
+        audio.buffered = buffered;
+        audio.eof.store(true, Ordering::Release);
+        worker.lookahead = Some(TrackPreparation {
+            prepared: track.clone(),
+            plan: device_free_plan(&track.info),
+            epoch: worker.output_epoch,
+            audio,
+            started_at: Instant::now(),
+            prebuffer_ready_observed_at: Some(Instant::now()),
+        });
+    }
+
+    fn play(chain: &mut TrackChain, len: usize) -> Vec<i32> {
+        let mut out = vec![-1; len];
+        chain.fill(&mut out, StreamInstant::new(0, 0));
+        out
+    }
+
+    fn handover_of(worker: &PlaybackWorker) -> HandoverState {
+        worker.handed_over.as_ref().expect("the next track was handed over").handover.clone()
+    }
+
+    fn started_keys(events: &[PlaybackEvent]) -> Vec<TrackKey> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PlaybackEvent::Started { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_compatible_next_track_continues_the_stream_without_a_new_start() {
+        let next = test_track("/music/next.flac");
+        let after = test_track("/music/after.flac");
+        let (mut worker, events) = worker_with_active_track_and_events(vec![next.clone(), after.clone()]);
+        let mut chain = attach_chain(&mut worker, &[1, 2]);
+        install_ready_lookahead(&mut worker, &next, &[3, 4, 5, 6]);
+
+        worker.hand_over_next_track();
+        assert!(worker.lookahead.is_none(), "its ring now belongs to the stream");
+
+        assert_eq!(play(&mut chain, 4), vec![1, 2, 3, 4], "no gap and no repeat at the boundary");
+        worker.advance_if_drained();
+
+        let active = worker.active.as_ref().expect("the next track is active");
+        assert_eq!(active.prepared.key, next.key);
+        assert!(active.chain.is_some(), "the same stream carries on");
+        assert_eq!(active.consumed_output_samples.load(Ordering::Acquire), 2);
+        assert!(worker.new_track_start_requests.is_empty(), "no new stream was started");
+        assert_eq!(worker.queue.front().map(|track| track.key.clone()), Some(after.key));
+        assert_eq!(worker.history.last().map(|track| track.key.path.clone()), Some(PathBuf::from("/music/current.flac")));
+        assert!(worker.last_completed.is_some());
+        let events = drain_events(&events);
+        assert_eq!(started_keys(&events), vec![next.key]);
+        assert!(!events.iter().any(|event| matches!(event, PlaybackEvent::Playing(false))), "{events:?}");
+        assert!(events.iter().any(|event| matches!(event, PlaybackEvent::Playing(true))));
+        assert!(!events.iter().any(|event| matches!(event, PlaybackEvent::Inactive | PlaybackEvent::Stopped)));
+    }
+
+    #[test]
+    fn the_next_track_becomes_active_only_once_it_is_audible() {
+        let next = test_track("/music/next.flac");
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![next.clone()]);
+        let mut chain = attach_chain(&mut worker, &[1, 2]);
+        install_ready_lookahead(&mut worker, &next, &[3, 4, 5, 6]);
+        worker.hand_over_next_track();
+        {
+            let active = worker.active.as_mut().unwrap();
+            active.output_latency_nanos.store(1_000_000_000, Ordering::Relaxed);
+            active.drain_started = Some(Instant::now() - OUTPUT_DRAIN_GUARD);
+        }
+
+        play(&mut chain, 4);
+        worker.advance_if_drained();
+
+        assert_eq!(worker.active.as_ref().unwrap().prepared.key.path, PathBuf::from("/music/current.flac"));
+        assert!(worker.handed_over.is_some(), "a drained track whose successor already plays is not torn down");
+
+        worker.active.as_ref().unwrap().output_latency_nanos.store(0, Ordering::Relaxed);
+        worker.advance_if_drained();
+        assert_eq!(worker.active.as_ref().unwrap().prepared.key, next.key);
+    }
+
+    #[test]
+    fn an_incompatible_next_track_falls_back_to_a_new_stream() {
+        let mut next = test_track("/music/next.flac");
+        next.info.sample_rate = 48_000;
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![next.clone()]);
+        let mut chain = attach_chain(&mut worker, &[1, 2]);
+        install_ready_lookahead(&mut worker, &next, &[3, 4]);
+
+        worker.hand_over_next_track();
+        assert!(worker.handed_over.is_none());
+
+        assert_eq!(play(&mut chain, 4), vec![1, 2, 0, 0]);
+        worker.active.as_mut().unwrap().drain_started = Some(Instant::now() - OUTPUT_DRAIN_GUARD);
+        worker.advance_if_drained();
+
+        assert_eq!(worker.new_track_start_requests, vec![true], "the drained track is followed by an ordinary start");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn nothing_is_handed_over_before_the_active_track_is_fully_decoded() {
+        let next = test_track("/music/next.flac");
+        let mut worker = worker_with_active_track(vec![next.clone()]);
+        attach_chain(&mut worker, &[1, 2]);
+        worker.active.as_ref().unwrap().eof.store(false, Ordering::Release);
+        install_ready_lookahead(&mut worker, &next, &[3, 4]);
+
+        worker.hand_over_next_track();
+
+        assert!(worker.handed_over.is_none());
+        assert!(worker.lookahead.is_some());
+    }
+
+    #[test]
+    fn next_withdraws_the_handed_over_track_and_skips_gracefully() {
+        let next = test_track("/music/next.flac");
+        let (mut worker, events) = worker_with_active_track_and_events(vec![next.clone()]);
+        let mut chain = attach_chain(&mut worker, &[1, 2]);
+        install_ready_lookahead(&mut worker, &next, &[3, 4]);
+        worker.hand_over_next_track();
+        let handover = handover_of(&worker);
+
+        worker.next_track();
+
+        assert!(worker.handed_over.is_none());
+        assert!(worker.lookahead.as_ref().unwrap().audio.cancel.load(Ordering::Acquire));
+        assert!(worker.active.as_ref().unwrap().skip_requested);
+        assert_eq!(statuses(&drain_events(&events)), vec!["Skipping after buffered audio drains."]);
+        assert_eq!(play(&mut chain, 4), vec![1, 2, 0, 0], "the withdrawn track is never played");
+        assert!(!handover.has_started());
+    }
+
+    #[test]
+    fn next_after_the_stream_moved_on_promotes_the_next_track_instead() {
+        let next = test_track("/music/next.flac");
+        let mut worker = worker_with_active_track(vec![next.clone()]);
+        let mut chain = attach_chain(&mut worker, &[1, 2]);
+        install_ready_lookahead(&mut worker, &next, &[3, 4]);
+        worker.hand_over_next_track();
+        play(&mut chain, 3);
+
+        worker.next_track();
+
+        let active = worker.active.as_ref().unwrap();
+        assert_eq!(active.prepared.key, next.key);
+        assert!(!active.skip_requested, "the track that just began is not skipped too");
+    }
+
+    #[test]
+    fn seek_drops_the_handed_over_track() {
+        let next = test_track("/music/next.flac");
+        let mut worker = worker_with_active_track(vec![next.clone()]);
+        let mut chain = attach_chain(&mut worker, &[1, 2]);
+        install_ready_lookahead(&mut worker, &next, &[3, 4]);
+        worker.hand_over_next_track();
+        let handover = handover_of(&worker);
+
+        worker.seek_to(TrackKey::whole_file(PathBuf::from("/music/current.flac")), 0);
+
+        assert!(worker.handed_over.is_none());
+        assert_eq!(play(&mut chain, 4), vec![1, 2, 0, 0]);
+        assert!(!handover.has_started());
+        assert!(worker.queue.iter().any(|track| track.key == next.key), "the next track stays queued");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn replacing_the_queue_drops_the_handed_over_track() {
+        let next = test_track("/music/next.flac");
+        let mut worker = worker_with_active_track(vec![next.clone()]);
+        let mut chain = attach_chain(&mut worker, &[1, 2]);
+        install_ready_lookahead(&mut worker, &next, &[3, 4]);
+        worker.hand_over_next_track();
+
+        worker.replace_queue(vec![test_track("/music/other.flac")]);
+
+        assert!(worker.handed_over.is_none());
+        assert_eq!(play(&mut chain, 4), vec![1, 2, 0, 0]);
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
+    }
+
+    #[test]
+    fn a_new_queue_head_or_output_withdraws_the_handed_over_track() {
+        for change in ["play next", "select output", "hog mode"] {
+            let next = test_track("/music/next.flac");
+            let mut worker = worker_with_active_track(vec![next.clone()]);
+            let mut chain = attach_chain(&mut worker, &[1, 2]);
+            install_ready_lookahead(&mut worker, &next, &[3, 4]);
+            worker.hand_over_next_track();
+            match change {
+                "play next" => worker.play_next(vec![test_track("/music/inserted.flac")]),
+                "select output" => worker.handle(Command::SelectOutput(Some("another-output-id".into()))),
+                _ => worker.handle(Command::SetHogMode(false)),
+            }
+
+            worker.reconcile_lookahead();
+
+            assert!(worker.handed_over.is_none(), "{change}");
+            assert_eq!(play(&mut chain, 4), vec![1, 2, 0, 0], "{change}");
+            cancel_and_reap_lookahead(&mut worker);
+        }
+    }
+
+    #[test]
+    fn a_stream_continues_only_on_the_same_device_hog_setting_route_and_rate() {
+        let stereo = test_track("/music/a.flac").info;
+        let mut mono = stereo.clone();
+        mono.source_channels = 1;
+        let strict = OutputPlan { route: Route::Strict, output_rate: 44_100 };
+        let format = |device_id, hog_mode, plan| StreamFormat { device_id, hog_mode, plan };
+        let active = format("dac", true, strict);
+
+        assert!(continues_stream(active, format("dac", true, strict), &stereo));
+        assert!(!continues_stream(active, format("other", true, strict), &stereo));
+        assert!(!continues_stream(active, format("dac", false, strict), &stereo));
+        assert!(!continues_stream(active, format("dac", true, OutputPlan { output_rate: 48_000, ..strict }), &stereo));
+        assert!(!continues_stream(active, format("dac", true, OutputPlan { route: Route::Float, ..strict }), &stereo));
+        assert!(!continues_stream(active, format("dac", true, strict), &mono), "strict output never upmixes");
+
+        let float = OutputPlan { route: Route::Float, output_rate: 44_100 };
+        let compat = OutputPlan { route: Route::Compat, output_rate: 44_100 };
+        assert!(continues_stream(format("dac", true, float), format("dac", true, float), &mono));
+        assert!(!continues_stream(format("dac", true, float), format("dac", true, compat), &stereo));
+    }
+
+    #[test]
+    fn output_counts_as_heard_once_it_is_past_the_output_latency() {
+        assert!(reached_the_listener(2, 0, 44_100));
+        assert!(!reached_the_listener(0, 0, 44_100));
+        // 10 ms at 44.1 kHz is 441 frames.
+        assert!(!reached_the_listener(441 * 2, 10_000_000, 44_100));
+        assert!(reached_the_listener(442 * 2, 10_000_000, 44_100));
     }
 }

@@ -270,3 +270,192 @@ impl TrackChain {
         self.output_failed.store(true, Ordering::Release);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestTrack {
+        producer: Producer<PcmSample>,
+        signals: TrackSignals,
+        feed: Option<TrackFeed>,
+    }
+
+    impl TestTrack {
+        fn new(handover: HandoverState) -> Self {
+            let (producer, consumer) = RingBuffer::new(64);
+            let signals = TrackSignals {
+                buffered: Arc::new(AtomicUsize::new(0)),
+                eof: Arc::new(AtomicBool::new(false)),
+                drained: Arc::new(AtomicBool::new(false)),
+                diagnostics: Arc::new(AudioDiagnostics::default()),
+                consumed_output_samples: Arc::new(AtomicU64::new(0)),
+                handover,
+            };
+            let feed = Some(TrackFeed::new(consumer, signals.clone()));
+            Self { producer, signals, feed }
+        }
+
+        fn with_samples(handover: HandoverState, samples: impl IntoIterator<Item = i32>, eof: bool) -> Self {
+            let mut track = Self::new(handover);
+            for sample in samples {
+                track.producer.push(PcmSample::Integer(sample)).unwrap();
+                track.signals.buffered.fetch_add(1, Ordering::Release);
+            }
+            track.signals.eof.store(eof, Ordering::Release);
+            track
+        }
+
+        fn feed(&mut self) -> TrackFeed {
+            self.feed.take().unwrap()
+        }
+
+        fn consumed(&self) -> u64 {
+            self.signals.consumed_output_samples.load(Ordering::Acquire)
+        }
+
+        fn underruns(&self) -> u64 {
+            self.signals.diagnostics.underrun_samples.load(Ordering::Acquire)
+        }
+
+        fn drained(&self) -> bool {
+            self.signals.drained.load(Ordering::Acquire)
+        }
+    }
+
+    fn chain_playing(first: &mut TestTrack) -> (TrackChain, ChainHandle) {
+        TrackChain::new(first.feed(), 0, Arc::new(AtomicBool::new(false)), Arc::new(AtomicU8::new(0)))
+    }
+
+    fn fill(chain: &mut TrackChain, len: usize) -> Vec<i32> {
+        let mut out = vec![-1; len];
+        chain.fill(&mut out, StreamInstant::new(0, 0));
+        out
+    }
+
+    fn finished_count(handle: &mut ChainHandle) -> usize {
+        std::iter::from_fn(|| handle.finished.pop().ok()).count()
+    }
+
+    #[test]
+    fn the_next_track_follows_within_the_same_buffer_with_nothing_lost_or_inserted() {
+        let mut first = TestTrack::with_samples(HandoverState::started(), [1, 2, 3], true);
+        let mut second = TestTrack::with_samples(HandoverState::pending(), [10, 11, 12, 13], false);
+        let (mut chain, mut handle) = chain_playing(&mut first);
+        assert!(handle.queue(second.feed()).is_ok());
+
+        assert_eq!(fill(&mut chain, 6), vec![1, 2, 3, 10, 11, 12]);
+
+        assert!(first.drained());
+        assert!(second.signals.handover.has_started());
+        assert_eq!((first.consumed(), second.consumed()), (3, 3));
+        assert_eq!((first.underruns(), second.underruns()), (0, 0), "the boundary is not an underrun");
+        assert_eq!(second.signals.buffered.load(Ordering::Acquire), 1);
+        assert_eq!(finished_count(&mut handle), 1, "the finished track goes back to the controller");
+    }
+
+    #[test]
+    fn a_finished_track_with_nothing_queued_drains_into_silence_without_underruns() {
+        let mut first = TestTrack::with_samples(HandoverState::started(), [5, 6], true);
+        let (mut chain, mut handle) = chain_playing(&mut first);
+
+        assert_eq!(fill(&mut chain, 4), vec![5, 6, 0, 0]);
+        assert_eq!(fill(&mut chain, 2), vec![0, 0]);
+
+        assert!(first.drained());
+        assert_eq!(first.consumed(), 2);
+        assert_eq!(first.underruns(), 0);
+        assert_eq!(finished_count(&mut handle), 0, "the playing track stays put");
+    }
+
+    #[test]
+    fn an_empty_ring_before_eof_is_an_underrun_of_that_track() {
+        let mut first = TestTrack::with_samples(HandoverState::started(), [5], false);
+        let (mut chain, _handle) = chain_playing(&mut first);
+
+        assert_eq!(fill(&mut chain, 3), vec![5, 0, 0]);
+
+        assert!(!first.drained());
+        assert_eq!(first.underruns(), 2);
+    }
+
+    #[test]
+    fn a_track_queued_after_the_drain_starts_on_the_next_buffer() {
+        let mut first = TestTrack::with_samples(HandoverState::started(), [1], true);
+        let mut second = TestTrack::with_samples(HandoverState::pending(), [7, 8], true);
+        let (mut chain, mut handle) = chain_playing(&mut first);
+        assert_eq!(fill(&mut chain, 2), vec![1, 0]);
+
+        assert!(handle.queue(second.feed()).is_ok());
+
+        assert_eq!(fill(&mut chain, 3), vec![7, 8, 0]);
+        assert!(second.drained());
+        assert_eq!(first.underruns() + second.underruns(), 0);
+    }
+
+    #[test]
+    fn a_withdrawn_track_is_never_played_and_goes_back_for_dropping() {
+        let mut first = TestTrack::with_samples(HandoverState::started(), [1, 2], true);
+        let mut second = TestTrack::with_samples(HandoverState::pending(), [9, 9], true);
+        let (mut chain, mut handle) = chain_playing(&mut first);
+        assert!(handle.queue(second.feed()).is_ok());
+
+        assert!(second.signals.handover.try_withdraw());
+        assert_eq!(fill(&mut chain, 4), vec![1, 2, 0, 0]);
+
+        assert_eq!(second.consumed(), 0);
+        assert!(!second.signals.handover.has_started());
+        assert_eq!(finished_count(&mut handle), 1);
+    }
+
+    #[test]
+    fn a_withdrawn_track_is_skipped_for_the_one_queued_after_it() {
+        let mut first = TestTrack::with_samples(HandoverState::started(), [1], true);
+        let mut withdrawn = TestTrack::with_samples(HandoverState::pending(), [9], true);
+        let mut replacement = TestTrack::with_samples(HandoverState::pending(), [4, 5], false);
+        let (mut chain, mut handle) = chain_playing(&mut first);
+        assert!(handle.queue(withdrawn.feed()).is_ok());
+        assert!(withdrawn.signals.handover.try_withdraw());
+        assert!(handle.queue(replacement.feed()).is_ok());
+
+        assert_eq!(fill(&mut chain, 3), vec![1, 4, 5]);
+        assert_eq!(finished_count(&mut handle), 2, "the withdrawn track and the finished one");
+    }
+
+    #[test]
+    fn a_started_track_can_no_longer_be_withdrawn() {
+        let mut first = TestTrack::with_samples(HandoverState::started(), [1], true);
+        let mut second = TestTrack::with_samples(HandoverState::pending(), [2, 3], false);
+        let (mut chain, mut handle) = chain_playing(&mut first);
+        assert!(handle.queue(second.feed()).is_ok());
+        fill(&mut chain, 2);
+
+        assert!(!second.signals.handover.try_withdraw());
+        assert_eq!(fill(&mut chain, 1), vec![3]);
+    }
+
+    #[test]
+    fn preroll_silence_comes_first_and_is_not_counted() {
+        let mut first = TestTrack::with_samples(HandoverState::started(), [1, 2], false);
+        let (mut chain, _handle) =
+            TrackChain::new(first.feed(), 2, Arc::new(AtomicBool::new(false)), Arc::new(AtomicU8::new(0)));
+
+        assert_eq!(fill(&mut chain, 4), vec![0, 0, 1, 2]);
+        assert_eq!(first.consumed(), 2);
+        assert_eq!(first.underruns(), 0);
+    }
+
+    #[test]
+    fn the_wrong_sample_type_fails_the_output_and_plays_silence() {
+        let mut first = TestTrack::new(HandoverState::started());
+        first.producer.push(PcmSample::Float(0.5)).unwrap();
+        let output_failed = Arc::new(AtomicBool::new(false));
+        let format_mismatch = Arc::new(AtomicU8::new(0));
+        let (mut chain, _handle) = TrackChain::new(first.feed(), 0, output_failed.clone(), format_mismatch.clone());
+
+        assert_eq!(fill(&mut chain, 1), vec![0]);
+        assert!(output_failed.load(Ordering::Acquire));
+        assert_eq!(format_mismatch.load(Ordering::Acquire), MISMATCH_FLOAT_IN_I32);
+        assert_eq!(first.consumed(), 0);
+    }
+}

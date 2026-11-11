@@ -83,4 +83,14 @@ mod tests {
         let preferences: Preferences = serde_json::from_str(r#"{"repair_nonstandard_sample_rates":false}"#).unwrap();
         assert!(!preferences.repair_nonstandard_sample_rates);
     }
+
+    #[test]
+    fn compatibility_mode_is_off_by_default_and_round_trips() {
+        assert!(!Preferences::default().compatibility_mode_enabled);
+        let older: Preferences = serde_json::from_str(r#"{"output_device_id":"dac","hog_mode_enabled":true}"#).unwrap();
+        assert!(!older.compatibility_mode_enabled, "an older settings file keeps compatibility mode off");
+        let enabled = Preferences { compatibility_mode_enabled: true, ..Preferences::default() };
+        let restored: Preferences = serde_json::from_slice(&serde_json::to_vec(&enabled).unwrap()).unwrap();
+        assert!(restored.compatibility_mode_enabled);
+    }
 }

@@ -2232,6 +2232,17 @@ mod output_selection_tests {
     use super::*;
 
     #[test]
+    fn route_status_names_the_route_rates_and_hog_mode() {
+        assert_eq!(route_status(true, false, None, true), "Playing · 32-bit integer output verified · Hog mode active");
+        assert_eq!(route_status(false, false, None, false), "Playing · Float output path (not bit-perfect)");
+        assert_eq!(route_status(false, true, None, false), "Playing · Compatibility mode (not bit-perfect)");
+        assert_eq!(
+            route_status(false, true, Some((44_100, 48_000)), true),
+            "Playing · Compatibility mode (not bit-perfect) · 44.1 \u{2192} 48\u{00A0}kHz · Hog mode active"
+        );
+    }
+
+    #[test]
     fn reselecting_the_same_saved_device_is_a_noop() {
         assert!(is_output_reselection_noop(Some("coreaudio:builtin-output"), Some("coreaudio:builtin-output")));
     }
