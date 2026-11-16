@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "README.md", "description": "Playback scope, supported formats and known limits" },
+    { "path": "CLAUDE.md", "description": "Commands, architecture and conventions for contributors" }
+  ]
+}
