@@ -418,6 +418,9 @@ struct ActivePlayback {
     /// by a playing `NewTrack` start that primed the DAC, taken (cleared) the first time it is
     /// examined, and never carried over: a restart builds a fresh `ActivePlayback` with `None`.
     dac_refresh_at: Option<Instant>,
+    /// The start that built this stream primed the DAC. Such a stream only carries the new rate
+    /// after the refresh restart rebuilds it, so until then no next track may join it.
+    stream_primed: bool,
     plan: OutputPlan,
 }
 
@@ -2604,6 +2607,7 @@ impl PlaybackWorker {
                 dac_refresh_restart_ms(),
                 Instant::now(),
             ),
+            stream_primed: did_dac_prime,
             plan,
         });
         Ok(())
@@ -2967,6 +2971,7 @@ impl PlaybackWorker {
         };
         active.chain.is_some()
             && active.playing
+            && !active.stream_primed
             && !active.cancel.load(Ordering::Acquire)
             && active.eof.load(Ordering::Acquire)
             && !active.decoder_failed.load(Ordering::Acquire)
@@ -3138,6 +3143,7 @@ impl PlaybackWorker {
             output_label: finished.output_label.clone(),
             hog_mode: finished.hog_mode,
             dac_refresh_at: None,
+            stream_primed: finished.stream_primed,
             plan: finished.plan,
             prepared,
         });
@@ -3685,6 +3691,7 @@ mod tests {
             output_label: String::new(),
             hog_mode: false,
             dac_refresh_at: None,
+            stream_primed: false,
             plan: OutputPlan { route: Route::Strict, output_rate: 44_100 },
         }
     }
@@ -3743,6 +3750,7 @@ mod tests {
             output_label: String::new(),
             hog_mode: false,
             dac_refresh_at: None,
+            stream_primed: false,
             plan: device_free_plan(&test_track("/music/current.flac").info),
         });
         worker.queue.extend(queue);
@@ -6205,6 +6213,22 @@ mod tests {
         assert!(!events.iter().any(|event| matches!(event, PlaybackEvent::Playing(false))), "{events:?}");
         assert!(events.iter().any(|event| matches!(event, PlaybackEvent::Playing(true))));
         assert!(!events.iter().any(|event| matches!(event, PlaybackEvent::Inactive | PlaybackEvent::Stopped)));
+    }
+
+    #[test]
+    fn a_primed_stream_without_its_refresh_restart_does_not_take_a_handover() {
+        let next = test_track("/music/next.flac");
+        let (mut worker, _events) = worker_with_active_track_and_events(vec![next.clone()]);
+        attach_chain(&mut worker, &[1, 2]);
+        install_ready_lookahead(&mut worker, &next, &[3, 4]);
+        worker.active.as_mut().unwrap().stream_primed = true;
+
+        worker.hand_over_next_track();
+
+        assert!(worker.handed_over.is_none(), "the next track must get a fresh stream");
+        assert!(worker.lookahead.is_some(), "the lookahead stays for the ordinary start");
+        cancel_and_reap_lookahead(&mut worker);
+        drain_retiring_decoders(&mut worker);
     }
 
     #[test]
