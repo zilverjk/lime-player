@@ -1,0 +1,8 @@
+{
+  "effort": "base",
+  "autoReview": ["open"],
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax", "style"],
+  "ignorePatterns": "target/**\ndist/**\nCargo.lock",
+  "instructions": "Rust + Slint desktop audio player focused on bit-exact playback of local or NAS-mounted files to an explicitly selected output device. README.md is the source of truth for playback scope and known limits; flag changes that contradict it."
+}
