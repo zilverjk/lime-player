@@ -169,7 +169,6 @@ fn playback_estimate_from_play_return(
 pub struct OutputDevice {
     pub id: String,
     pub label: String,
-    pub bit_perfect_rates: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -358,11 +357,9 @@ pub fn enumerate_outputs() -> Result<Vec<OutputDevice>, String> {
     for device in devices {
         let description = device.description().map_err(|e| e.to_string())?;
         let device_id = device.id().map_err(|e| e.to_string())?;
-        let bit_perfect_rates = coreaudio::strict_integer_rates(device_id.id(), &[]).unwrap_or_default();
         outputs.push(OutputDevice {
             id: device_id.to_string(),
             label: description.name().to_owned(),
-            bit_perfect_rates,
         });
     }
     let mut labels = std::collections::HashMap::<String, usize>::new();

@@ -5,15 +5,15 @@
 // literal from the earlier hard-coded UI (`§2.4`) is gone: nothing here is sample data, and the
 // session library (`§3.3`) is the only source of what the views show.
 
-import { Palette, ScrollView } from "std-widgets.slint";
+import { ComboBox, Palette, ScrollView } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 import {
     ActionButton, AlbumGrid, ArtistListRow, ArtworkView, Badge, ButtonKind, CompatibilityModeSwitch, EmptyState, FormatPill, Icon,
-    IconButton, NavItem, OutputRefreshButton, OutputSelect, Scrubber, SectionLabel, SettingSwitch, TrackTable, VDivider, VirtualizedTrackTable,
-    View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData, OutputOption,
+    IconButton, NavItem, OutputRefreshButton, Scrubber, SectionLabel, SettingSwitch, TrackTable, VDivider, VirtualizedTrackTable,
+    View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData,
 } from "widgets.slint";
 
-export { View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData, OutputOption }
+export { View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData }
     from "widgets.slint";
 
 component Sidebar inherits Rectangle {
@@ -253,7 +253,7 @@ component PlayerBar inherits Rectangle {
     // (`§1.4`/`§4.6.4`: underruns and refusals must stay visible) and to reach Output/Hog mode
     // (otherwise a first-run user on a narrow window has no way to ever select an output device).
     in property <string> playback-status: "";
-    in-out property <[OutputOption]> output-device-options;
+    in-out property <[string]> output-device-options;
     in-out property <int> selected-output-index: 0;
     in-out property <bool> hog-mode-enabled: true;
     in-out property <bool> compatibility-mode-enabled: false;
@@ -265,7 +265,6 @@ component PlayerBar inherits Rectangle {
     callback volume-requested(float, bool);
     callback now-playing-album-requested();
     callback queue-opened();
-    callback output-list-opening();
     callback output-refresh-requested();
     callback output-chosen(int);
     callback hog-mode-changed(bool);
@@ -422,10 +421,10 @@ component PlayerBar inherits Rectangle {
             if !root.panel-toggle-enabled: Tooltip { Text { text: "Widen the window to show the details panel, or click for output and Hog mode"; font-size: Theme.fs-meta; color: Theme.text-primary; wrap: word-wrap; } }
             output-popup := PopupWindow {
                 // The default close policy (`close-on-click`) closes this popup on the very same
-                // click/release that the `OutputSelect` below uses to open its own list, dropping
-                // this popup's own instance and orphaning the list before a selection can reach
+                // click/release that the `ComboBox` below uses to open its own dropdown, dropping
+                // this popup's own instance and orphaning the dropdown before a selection can reach
                 // it (Slint 1.18.1 `window.rs` closes the popup in the same `process_mouse_input`
-                // pass that dispatched the click to the selector). `close-on-click-outside` still
+                // pass that dispatched the click to the combo box). `close-on-click-outside` still
                 // dismisses this popup on an outside click, but leaves clicks on its own contents
                 // alone.
                 close-policy: close-on-click-outside;
@@ -444,12 +443,15 @@ component PlayerBar inherits Rectangle {
                         HorizontalLayout {
                             spacing: 8px;
                             cross-axis-alignment: center;
-                            OutputSelect {
+                            ComboBox {
+                                height: 30px;
                                 horizontal-stretch: 1;
-                                options: root.output-device-options;
-                                selected-index <=> root.selected-output-index;
-                                opening => { root.output-list-opening(); }
-                                chosen(index) => { root.output-chosen(index); }
+                                model: root.output-device-options;
+                                current-index <=> root.selected-output-index;
+                                // `selected` fires only on a user pick, never on Rust's index writes.
+                                selected(value) => {
+                                    root.output-chosen(root.selected-output-index);
+                                }
                             }
                             OutputRefreshButton { clicked => { root.output-refresh-requested(); } }
                         }
@@ -500,7 +502,7 @@ component NowPlayingPanel inherits Rectangle {
     in property <string> file-size-line: "";
     in property <string> lyrics: "";
     in property <bool> has-lyrics: false;
-    in-out property <[OutputOption]> output-device-options;
+    in-out property <[string]> output-device-options;
     in-out property <int> selected-output-index: 0;
     in-out property <bool> hog-mode-enabled: true;
     in-out property <bool> compatibility-mode-enabled: false;
@@ -510,9 +512,11 @@ component NowPlayingPanel inherits Rectangle {
     in property <string> output-name: "";
     // Set only from a `Started` event's own `output` and cleared whenever nothing is actively
     // routing (`Stopped`/`Inactive`/a failed start or seek) — unlike `output-name`, which also
-    // updates from the output selection alone, before anything necessarily plays there (`§6`).
+    // updates from the ComboBox selection alone, before anything necessarily plays there (`§6`).
     in property <string> active-output-name: "";
-    callback output-list-opening();
+    // Whether the Output `ComboBox` holds the keyboard, so `MainWindow` can take it back before this
+    // panel is hidden (`MainWindow.panel-shown`).
+    out property <bool> output-focused: output-combo.has-focus;
     callback output-refresh-requested();
     callback output-chosen(int);
     callback hog-mode-changed(bool);
@@ -533,7 +537,7 @@ component NowPlayingPanel inherits Rectangle {
             // `ScrollView`'s viewport height (`§6` Stage 5 fix): with the default `stretch`
             // alignment, a plain `Text`/`SectionLabel` has an unbounded max-height, so leftover
             // viewport space was handed to whichever ones sat in this layout, opening 25-50 px gaps
-            // between the title, artist, album, format line, "Output" label and the selector.
+            // between the title, artist, album, format line, "Output" label and the ComboBox.
             alignment: start;
             padding-left: 20px;
             padding-right: 20px;
@@ -593,7 +597,7 @@ component NowPlayingPanel inherits Rectangle {
                 // `overflow: elide` shrinks this Text's reported min-width down to a single
                 // ellipsis instead of its full unwrapped text width (`§6` Stage 5 fix): a long
                 // genre tag was otherwise widening this `ScrollView`'s content past the 300 px
-                // panel, clipping the centered title and the output selector on the right.
+                // panel, clipping the centered title and the Output `ComboBox` on the right.
                 if root.now-playing-genre != "": HorizontalLayout {
                     spacing: 4px;
                     cross-axis-alignment: center;
@@ -619,12 +623,15 @@ component NowPlayingPanel inherits Rectangle {
             HorizontalLayout {
                 spacing: 8px;
                 cross-axis-alignment: center;
-                OutputSelect {
+                output-combo := ComboBox {
+                    height: 30px;
                     horizontal-stretch: 1;
-                    options: root.output-device-options;
-                    selected-index <=> root.selected-output-index;
-                    opening => { root.output-list-opening(); }
-                    chosen(index) => { root.output-chosen(index); }
+                    model: root.output-device-options;
+                    current-index <=> root.selected-output-index;
+                    // `selected` fires only on a user pick, never on Rust's index writes.
+                    selected(value) => {
+                        root.output-chosen(root.selected-output-index);
+                    }
                 }
                 OutputRefreshButton { clicked => { root.output-refresh-requested(); } }
             }
@@ -1142,8 +1149,9 @@ export component MainWindow inherits Window {
     // item's ancestors, so without this Space would go nowhere until the search field was clicked.
     forward-focus: key-root;
 
-    // This UI is dark-only; the `std-widgets` controls it uses otherwise follow
-    // `prefers-color-scheme` and render in the light Fluent palette on a Light-appearance system.
+    // This UI is dark-only; the one `std-widgets` control it uses (`ComboBox`) otherwise follows
+    // `prefers-color-scheme` and renders in the light Fluent palette on a Light-appearance system,
+    // a light-grey box with dark text inside this dark panel (`§6` Stage 5 fix).
     init => { Palette.color-scheme = ColorScheme.dark; }
 
     // Navigation (`§3.5`, `§3.6`).
@@ -1235,7 +1243,7 @@ export component MainWindow inherits Window {
     in property <int> duration-ms: 0;
 
     // Output.
-    in-out property <[OutputOption]> output-device-options: [{ name: "Select output device…", bit-perfect: false }];
+    in-out property <[string]> output-device-options: ["Select output device…"];
     in-out property <int> selected-output-index: 0;
     in-out property <bool> hog-mode-enabled: true;
     in-out property <bool> compatibility-mode-enabled: false;
@@ -1307,6 +1315,34 @@ export component MainWindow inherits Window {
         key-root.focus();
     }
 
+    // Clicking an Output `ComboBox` gives it the keyboard, and closing its dropdown hands the focus back
+    // to it AFTER `selected` has fired, so `output-chosen` cannot release it inline: this waits a
+    // moment for the dropdown to finish closing, then gives the keyboard to `key-root`. A `ComboBox`
+    // that keeps it is a trap: Slint drops the focus item of a key press when that item is no longer
+    // visible (the details panel hidden or scrolled away, the output popup closed), and the Space
+    // then reaches nobody, not even `key-root`, until something else takes the focus.
+    focus-handback := Timer {
+        interval: 50ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            root.release-search-focus();
+        }
+    }
+    function hand-focus-back-soon() {
+        focus-handback.running = true;
+    }
+
+    // Hiding the details panel (its toggle, or a window narrower than `Theme.panel-threshold`) makes
+    // the panel's Output `ComboBox` invisible, and an invisible focus item loses the Space the same
+    // way. Only when that `ComboBox` is the one holding the keyboard: releasing unconditionally would
+    // also pull it out of the search field the user is typing in.
+    changed panel-shown => {
+        if (!root.panel-shown && now-playing-panel.output-focused) {
+            root.release-search-focus();
+        }
+    }
+
     // A click on a track row (any table): the row is the selection, and the keyboard goes back from
     // the search field. Tables report only real clicks (there is no "created with nothing selected"
     // report any more: the key lives here, not in the table), so a table appearing while the user types
@@ -1318,10 +1354,10 @@ export component MainWindow inherits Window {
 
     // The window-wide keyboard scope (`CLAUDE.md` "Media controls" -> "Spacebar"). It wraps the whole
     // layout, as an ancestor of everything focusable, so a Space that a visible focused control does
-    // not consume (a `FocusScope` of its own) still bubbles up to it. That holds only while the focus
-    // item is visible and not inside a popup: Slint drops an invisible focus item at the key press,
-    // and key bubbling stops at a popup's edge, which is why the output selector never takes the
-    // keyboard (`OutputSelect`). Space is handled in
+    // not consume (a `ComboBox`, a `FocusScope` of its own) still bubbles up to it. That holds only
+    // while the focus item is visible and not inside a popup: Slint drops an invisible focus item at
+    // the key press, and key bubbling stops at a popup's edge, which is why the Output `ComboBox`es
+    // never keep the keyboard (`hand-focus-back-soon`, `changed panel-shown`). Space is handled in
     // the bubbling `key-pressed`, never `capture-key-pressed`: a capture handler runs before the
     // focused search field and would steal the spaces typed into it.
     key-root := FocusScope {
@@ -1524,9 +1560,8 @@ export component MainWindow inherits Window {
                         playback-status: root.playback-status;
                         output-name: root.output-name;
                         active-output-name: root.active-output-name;
-                        output-list-opening => { root.release-search-focus(); }
                         output-refresh-requested => { root.release-search-focus(); root.output-refresh-requested(); }
-                        output-chosen(index) => { root.output-chosen(index); }
+                        output-chosen(index) => { root.output-chosen(index); root.hand-focus-back-soon(); }
                         hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
                         compatibility-mode-changed(enabled) => { root.compatibility-mode-changed(enabled); }
                     }
@@ -1566,9 +1601,8 @@ export component MainWindow inherits Window {
                 volume-requested(v, is-final) => { root.release-search-focus(); root.volume-requested(v, is-final); }
                 now-playing-album-requested => { root.release-search-focus(); root.now-playing-album-requested(); }
                 queue-opened => { root.release-search-focus(); root.nav-selected(View.queue); }
-                output-list-opening => { root.release-search-focus(); }
                 output-refresh-requested => { root.release-search-focus(); root.output-refresh-requested(); }
-                output-chosen(index) => { root.output-chosen(index); }
+                output-chosen(index) => { root.output-chosen(index); root.hand-focus-back-soon(); }
                 hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
                 compatibility-mode-changed(enabled) => { root.compatibility-mode-changed(enabled); }
             }

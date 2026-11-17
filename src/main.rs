@@ -1984,13 +1984,9 @@ fn restore_active_route_status(
 }
 
 fn set_device_model(window: &MainWindow, devices: &[OutputDevice]) {
-    let mut options = vec![OutputOption { name: "Select output device…".into(), bit_perfect: false }];
-    options.extend(
-        devices
-            .iter()
-            .map(|device| OutputOption { name: device.label.as_str().into(), bit_perfect: !device.bit_perfect_rates.is_empty() }),
-    );
-    window.set_output_device_options(ModelRc::new(VecModel::from(options)));
+    let mut names = vec![SharedString::from("Select output device…")];
+    names.extend(devices.iter().map(|device| SharedString::from(device.label.as_str())));
+    window.set_output_device_options(ModelRc::new(VecModel::from_iter(names)));
 }
 
 fn route_status(integer_output_verified: bool, compatibility_mode: bool, resampled: Option<(u32, u32)>, hog_mode: bool) -> String {
