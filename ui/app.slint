@@ -8,8 +8,8 @@
 import { ComboBox, Palette, ScrollView } from "std-widgets.slint";
 import { Theme, Icons } from "theme.slint";
 import {
-    ActionButton, AlbumGrid, ArtistListRow, ArtworkView, Badge, ButtonKind, EmptyState, FormatPill, Icon, IconButton, NavItem, Scrubber,
-    SectionLabel, TrackTable, VDivider, VirtualizedTrackTable,
+    ActionButton, AlbumGrid, ArtistListRow, ArtworkView, Badge, ButtonKind, CompatibilityModeSwitch, EmptyState, FormatPill, Icon,
+    IconButton, NavItem, OutputRefreshButton, Scrubber, SectionLabel, SettingSwitch, TrackTable, VDivider, VirtualizedTrackTable,
     View, TrackListKind, AlbumAction, TrackRowData, AlbumCardData, ArtistRowData, AlbumHeaderData,
 } from "widgets.slint";
 
@@ -256,6 +256,7 @@ component PlayerBar inherits Rectangle {
     in-out property <[string]> output-device-options;
     in-out property <int> selected-output-index: 0;
     in-out property <bool> hog-mode-enabled: true;
+    in-out property <bool> compatibility-mode-enabled: false;
 
     callback play-pause-requested();
     callback previous-track-requested();
@@ -264,8 +265,10 @@ component PlayerBar inherits Rectangle {
     callback volume-requested(float, bool);
     callback now-playing-album-requested();
     callback queue-opened();
+    callback output-refresh-requested();
     callback output-chosen(int);
     callback hog-mode-changed(bool);
+    callback compatibility-mode-changed(bool);
 
     height: Theme.playerbar-h;
     background: Theme.bg-bar;
@@ -437,47 +440,29 @@ component PlayerBar inherits Rectangle {
                         padding: 14px;
                         spacing: 8px;
                         SectionLabel { text: "Output"; }
-                        ComboBox {
-                            height: 30px;
-                            model: root.output-device-options;
-                            current-index <=> root.selected-output-index;
-                            // `selected-output-index` is two-way bound all the way up to
-                            // `MainWindow` and back down into `NowPlayingPanel`'s own `ComboBox`,
-                            // so both combo boxes alias the same storage. `selected(value)` (from
-                            // `ComboBoxBase`) fires only through `ComboBoxBase.select()` — a user
-                            // click or arrow-key move — never from a programmatic write to
-                            // `current-index`/`selected-output-index` (Rust writes it at startup
-                            // and on every device-list refresh), so it sends `output-chosen`
-                            // exactly once per real user choice regardless of which output control
-                            // is currently visible. A `changed current-index` handler would also
-                            // fire on those Rust-side writes, which is why it must not be used here.
-                            selected(value) => {
-                                root.output-chosen(root.selected-output-index);
-                            }
-                        }
                         HorizontalLayout {
+                            spacing: 8px;
                             cross-axis-alignment: center;
-                            Text { text: "Hog mode"; font-size: Theme.fs-body; color: Theme.text-primary; horizontal-stretch: 1; }
-                            Rectangle {
-                                width: 34px;
-                                height: 20px;
-                                border-radius: 10px;
-                                background: root.hog-mode-enabled ? Theme.accent : Theme.slider-track;
-                                Rectangle {
-                                    width: 16px;
-                                    height: 16px;
-                                    border-radius: 8px;
-                                    y: 2px;
-                                    x: root.hog-mode-enabled ? 16px : 2px;
-                                    background: Theme.knob;
-                                }
-                                TouchArea {
-                                    clicked => {
-                                        root.hog-mode-enabled = !root.hog-mode-enabled;
-                                        root.hog-mode-changed(root.hog-mode-enabled);
-                                    }
+                            ComboBox {
+                                height: 30px;
+                                horizontal-stretch: 1;
+                                model: root.output-device-options;
+                                current-index <=> root.selected-output-index;
+                                // `selected` fires only on a user pick, never on Rust's index writes.
+                                selected(value) => {
+                                    root.output-chosen(root.selected-output-index);
                                 }
                             }
+                            OutputRefreshButton { clicked => { root.output-refresh-requested(); } }
+                        }
+                        SettingSwitch {
+                            text: "Hog mode";
+                            checked <=> root.hog-mode-enabled;
+                            toggled(enabled) => { root.hog-mode-changed(enabled); }
+                        }
+                        CompatibilityModeSwitch {
+                            checked <=> root.compatibility-mode-enabled;
+                            toggled(enabled) => { root.compatibility-mode-changed(enabled); }
                         }
                     }
                 }
@@ -520,6 +505,7 @@ component NowPlayingPanel inherits Rectangle {
     in-out property <[string]> output-device-options;
     in-out property <int> selected-output-index: 0;
     in-out property <bool> hog-mode-enabled: true;
+    in-out property <bool> compatibility-mode-enabled: false;
     in property <string> volume-detail: "";
     in property <bool> volume-available: false;
     in property <string> playback-status: "";
@@ -531,8 +517,10 @@ component NowPlayingPanel inherits Rectangle {
     // Whether the Output `ComboBox` holds the keyboard, so `MainWindow` can take it back before this
     // panel is hidden (`MainWindow.panel-shown`).
     out property <bool> output-focused: output-combo.has-focus;
+    callback output-refresh-requested();
     callback output-chosen(int);
     callback hog-mode-changed(bool);
+    callback compatibility-mode-changed(bool);
     callback now-playing-album-requested();
     background: Theme.bg-panel;
 
@@ -632,21 +620,20 @@ component NowPlayingPanel inherits Rectangle {
 
             Rectangle { height: 1px; width: 100%; background: Theme.divider; }
             SectionLabel { text: "Output"; }
-            output-combo := ComboBox {
-                height: 30px;
-                width: 100%;
-                model: root.output-device-options;
-                current-index <=> root.selected-output-index;
-                // See the matching `ComboBox` in `PlayerBar`'s `output-popup`: both alias the same
-                // `selected-output-index` storage through chained `<=>` bindings via `MainWindow`.
-                // `selected(value)` fires only on a user click/arrow-key selection
-                // (`ComboBoxBase.select()`), never on a programmatic write to `current-index` from
-                // either side of the binding (Rust writes it at startup and on every device-list
-                // refresh), so no visibility guard is needed to keep `output-chosen` firing exactly
-                // once per user choice.
-                selected(value) => {
-                    root.output-chosen(root.selected-output-index);
+            HorizontalLayout {
+                spacing: 8px;
+                cross-axis-alignment: center;
+                output-combo := ComboBox {
+                    height: 30px;
+                    horizontal-stretch: 1;
+                    model: root.output-device-options;
+                    current-index <=> root.selected-output-index;
+                    // `selected` fires only on a user pick, never on Rust's index writes.
+                    selected(value) => {
+                        root.output-chosen(root.selected-output-index);
+                    }
                 }
+                OutputRefreshButton { clicked => { root.output-refresh-requested(); } }
             }
             // The device the active stream is actually on (`Started.output`, via
             // `active-output-name`, never the merely-*selected* device `output-name` also tracks):
@@ -660,29 +647,14 @@ component NowPlayingPanel inherits Rectangle {
                 color: Theme.text-tertiary;
                 overflow: elide;
             }
-            HorizontalLayout {
-                cross-axis-alignment: center;
-                Text { text: "Hog mode"; font-size: Theme.fs-body; color: Theme.text-primary; horizontal-stretch: 1; }
-                Rectangle {
-                    width: 34px;
-                    height: 20px;
-                    border-radius: 10px;
-                    background: root.hog-mode-enabled ? Theme.accent : Theme.slider-track;
-                    Rectangle {
-                        width: 16px;
-                        height: 16px;
-                        border-radius: 8px;
-                        y: 2px;
-                        x: root.hog-mode-enabled ? 16px : 2px;
-                        background: Theme.knob;
-                    }
-                    TouchArea {
-                        clicked => {
-                            root.hog-mode-enabled = !root.hog-mode-enabled;
-                            root.hog-mode-changed(root.hog-mode-enabled);
-                        }
-                    }
-                }
+            SettingSwitch {
+                text: "Hog mode";
+                checked <=> root.hog-mode-enabled;
+                toggled(enabled) => { root.hog-mode-changed(enabled); }
+            }
+            CompatibilityModeSwitch {
+                checked <=> root.compatibility-mode-enabled;
+                toggled(enabled) => { root.compatibility-mode-changed(enabled); }
             }
             Text { text: root.volume-detail; font-size: Theme.fs-meta; color: Theme.text-tertiary; wrap: word-wrap; }
             if root.volume-available: Text {
@@ -1274,6 +1246,7 @@ export component MainWindow inherits Window {
     in-out property <[string]> output-device-options: ["Select output device…"];
     in-out property <int> selected-output-index: 0;
     in-out property <bool> hog-mode-enabled: true;
+    in-out property <bool> compatibility-mode-enabled: false;
     in property <string> output-name: "Not selected";
     in property <string> active-output-name: "";
     in property <string> playback-status: "Choose an output DAC, then open audio.";
@@ -1325,8 +1298,10 @@ export component MainWindow inherits Window {
     callback seek-requested(float);
     callback volume-requested(float, bool);
     callback now-playing-album-requested();
+    callback output-refresh-requested();
     callback output-chosen(int);
     callback hog-mode-changed(bool);
+    callback compatibility-mode-changed(bool);
     callback window-drag-requested();
     callback window-zoom-requested();
 
@@ -1579,13 +1554,16 @@ export component MainWindow inherits Window {
                         output-device-options <=> root.output-device-options;
                         selected-output-index <=> root.selected-output-index;
                         hog-mode-enabled <=> root.hog-mode-enabled;
+                        compatibility-mode-enabled <=> root.compatibility-mode-enabled;
                         volume-detail: root.volume-detail;
                         volume-available: root.volume-available;
                         playback-status: root.playback-status;
                         output-name: root.output-name;
                         active-output-name: root.active-output-name;
+                        output-refresh-requested => { root.release-search-focus(); root.output-refresh-requested(); }
                         output-chosen(index) => { root.output-chosen(index); root.hand-focus-back-soon(); }
                         hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
+                        compatibility-mode-changed(enabled) => { root.compatibility-mode-changed(enabled); }
                     }
                 }
             }
@@ -1615,6 +1593,7 @@ export component MainWindow inherits Window {
                 output-device-options <=> root.output-device-options;
                 selected-output-index <=> root.selected-output-index;
                 hog-mode-enabled <=> root.hog-mode-enabled;
+                compatibility-mode-enabled <=> root.compatibility-mode-enabled;
                 play-pause-requested => { root.release-search-focus(); root.play-pause-requested(); }
                 previous-track-requested => { root.release-search-focus(); root.previous-track-requested(); }
                 next-track-requested => { root.release-search-focus(); root.next-track-requested(); }
@@ -1622,8 +1601,10 @@ export component MainWindow inherits Window {
                 volume-requested(v, is-final) => { root.release-search-focus(); root.volume-requested(v, is-final); }
                 now-playing-album-requested => { root.release-search-focus(); root.now-playing-album-requested(); }
                 queue-opened => { root.release-search-focus(); root.nav-selected(View.queue); }
+                output-refresh-requested => { root.release-search-focus(); root.output-refresh-requested(); }
                 output-chosen(index) => { root.output-chosen(index); root.hand-focus-back-soon(); }
                 hog-mode-changed(enabled) => { root.hog-mode-changed(enabled); }
+                compatibility-mode-changed(enabled) => { root.compatibility-mode-changed(enabled); }
             }
         }
     }

@@ -1316,7 +1316,7 @@ mod ui_contract {
         let popup_start = player_bar.find("output-popup := PopupWindow").expect("PlayerBar must declare output-popup");
         let popup_combo = &player_bar[popup_start..];
         assert!(
-            popup_combo.contains("selected(value) => {\n                                root.output-chosen(root.selected-output-index);\n                            }"),
+            popup_combo.contains("selected(value) => {\n                                    root.output-chosen(root.selected-output-index);\n                                }"),
             "PlayerBar's output-popup ComboBox must send output-chosen from the `selected` callback, not `changed current-index`"
         );
         assert!(
@@ -1326,12 +1326,34 @@ mod ui_contract {
 
         let now_playing_panel = extract_component(APP_SLINT, "NowPlayingPanel");
         assert!(
-            now_playing_panel.contains("selected(value) => {\n                    root.output-chosen(root.selected-output-index);\n                }"),
+            now_playing_panel.contains("selected(value) => {\n                        root.output-chosen(root.selected-output-index);\n                    }"),
             "NowPlayingPanel's own ComboBox must send output-chosen from the `selected` callback, not `changed current-index`"
         );
         assert!(
             !now_playing_panel.contains("changed current-index =>"),
             "NowPlayingPanel's own ComboBox must not use `changed current-index`, which also fires on Rust's programmatic index writes"
+        );
+    }
+
+    #[test]
+    fn compatibility_mode_switch_sits_below_hog_mode_in_both_output_panels() {
+        let switch = extract_component(WIDGETS_SLINT, "CompatibilityModeSwitch");
+        assert!(switch.contains("text: \"Compatibility mode\";"));
+        assert!(switch.contains("\"Not bit-perfect: audio is resampled and converted to float to match this output.\""));
+        assert!(switch.contains("color: root.checked ? Theme.danger : Theme.text-tertiary;"));
+        for component in ["PlayerBar", "NowPlayingPanel"] {
+            let body = extract_component(APP_SLINT, component);
+            let hog = body.find("text: \"Hog mode\";").unwrap_or_else(|| panic!("{component} lost its Hog mode switch"));
+            let compat = body.find("CompatibilityModeSwitch {").unwrap_or_else(|| panic!("{component} lacks the compatibility switch"));
+            assert!(hog < compat, "{component}: Compatibility mode goes right below Hog mode");
+            assert!(body.contains("toggled(enabled) => { root.compatibility-mode-changed(enabled); }"));
+        }
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert!(main_window.contains("in-out property <bool> compatibility-mode-enabled: false;"));
+        assert_eq!(main_window.matches("compatibility-mode-enabled <=> root.compatibility-mode-enabled;").count(), 2);
+        assert_eq!(
+            main_window.matches("compatibility-mode-changed(enabled) => { root.compatibility-mode-changed(enabled); }").count(),
+            2
         );
     }
 
@@ -1485,6 +1507,7 @@ mod ui_contract {
             "root.seek-requested(f);",
             "root.volume-requested(v, is-final);",
             "root.now-playing-album-requested();",
+            "root.output-refresh-requested();",
         ] {
             let all = main_window.matches(call).count();
             let releasing = main_window.matches(&format!("root.release-search-focus(); {call}")).count();
@@ -1614,6 +1637,20 @@ mod ui_contract {
         let panel = extract_component(APP_SLINT, "NowPlayingPanel");
         assert!(panel.contains("out property <bool> output-focused: output-combo.has-focus;"));
         assert!(panel.contains("output-combo := ComboBox {"), "the panel's ComboBox must carry the id output-focused reads");
+    }
+
+    #[test]
+    fn both_output_selectors_have_a_wired_refresh_button() {
+        for component in ["PlayerBar", "NowPlayingPanel"] {
+            let source = extract_component(APP_SLINT, component);
+            assert!(
+                source.contains("OutputRefreshButton { clicked => { root.output-refresh-requested(); } }"),
+                "{component} must place the refresh button next to its output ComboBox"
+            );
+        }
+        let main_window = extract_component(APP_SLINT, "MainWindow");
+        assert_eq!(main_window.matches("output-refresh-requested => {").count(), 2);
+        assert!(include_str!("main.rs").contains("window.on_output_refresh_requested(move || player_for_refresh.refresh_devices());"));
     }
 
     /// `main.rs`'s Space handler and its OS media session ask `play_button_enabled` whether there is

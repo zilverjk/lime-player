@@ -705,7 +705,7 @@ impl ResamplingSource {
 }
 
 /// `round(frames * numerator / denominator)`.
-fn scaled_frames(frames: u64, numerator: u32, denominator: u32) -> u64 {
+pub(super) fn scaled_frames(frames: u64, numerator: u32, denominator: u32) -> u64 {
     let denominator = u128::from(denominator);
     ((u128::from(frames) * u128::from(numerator) + denominator / 2) / denominator) as u64
 }
